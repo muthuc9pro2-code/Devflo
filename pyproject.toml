@@ -1,0 +1,12 @@
+[project]
+name = "devflow"
+version = "0.1.0"
+description = "aahh just a random project poped in my head which is built with FastAPI."
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
