@@ -1,12 +1,37 @@
 [project]
-name = "devflow"
+name = "devflo"
 version = "0.1.0"
-description = "aahh just a random project poped in my head which is built with FastAPI."
+description = "aah random project poped in my mind, which is built with FastAPI."
 readme = "README.md"
 requires-python = ">=3.12"
-
-dependencies = []
+dependencies = [
+    "alembic>=1.18.5",
+    "email-validator>=2.3.0",
+    "fastapi>=0.141.1",
+    "passlib[bcrypt]>=1.7.4",
+    "pwdlib[argon2]>=0.3.0",
+    "pydantic-settings>=2.14.2",
+    "pyjwt>=2.13.0",
+    "pymysql>=1.2.0",
+    "python-jose>=3.5.0",
+    "python-multipart>=0.0.32",
+    "sqlalchemy>=2.0.51",
+    "uvicorn>=0.52.0",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["alembic*", "tests*"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.1",
+]
