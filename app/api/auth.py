@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from app.crud.user import create_user, get_user_by_email, authenticate_user, get_user_by_username
 from app.db.database import get_db
-from app.schemas.user import UserRegister, UserLogin, UserResponse
+from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse
 from app.core.security import (
     create_email_verification_token,
     decode_email_verification_token,
@@ -19,7 +19,7 @@ from app.api.dependencies import get_current_verified_user
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-@router.post("/register")
+@router.post("/register", response_model=RegisterResponse)
 def register(
     user: UserRegister,
     db: Session = Depends(get_db),
@@ -44,7 +44,12 @@ def register(
 
     send_verification_email(email=user.email, token=verification_token)
 
-    return create_user(db, user)
+    created_user = create_user(db, user)
+
+    return {
+        "message": "Resgistration successful. Please verify email.",
+        "email": created_user.email
+    }
 
 
 @router.get("/verify-email")
@@ -67,7 +72,7 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     return {"message": "Email verified successfully"}
 
 
-@router.post("/login")
+@router.post("/login", response_model=LoginResponse)
 def login(
     response: Response,
     user: UserLogin,
