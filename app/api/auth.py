@@ -47,7 +47,7 @@ def register(
     created_user = create_user(db, user)
 
     return {
-        "message": "Resgistration successful. Please verify email.",
+        "message": "Registration successful. Please verify email.",
         "email": created_user.email
     }
 
@@ -103,7 +103,7 @@ def login(
         max_age=7 * 24 * 60 * 60,
     )
 
-    return {"message": "Login successful", "user": authenticated_user}
+    return {"message": "Login successful"}
 
 
 @router.post("/refresh")
@@ -178,10 +178,7 @@ def logout (response: Response):
 def get_me(
     current_user: User = Depends(get_current_verified_user)
 ):
-    return {
-        "username": current_user.username,
-        "email": current_user.email
-    }
+    return current_user
 
 
 

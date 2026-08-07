@@ -6,6 +6,7 @@ from app.db.database import get_db
 from app.api.dependencies import get_current_verified_user
 from app.models.user import User
 from app.schemas.analysis import AnalysisResponse
+from app.tasks.analysis import process_analysis
 
 from pathlib import Path
 import shutil
@@ -37,6 +38,8 @@ def upload_file(
         filename=file.filename,
         saved_file_path=str(file_path)
     )
+
+    process_analysis.delay(analysis.id)
 
     return analysis
 
