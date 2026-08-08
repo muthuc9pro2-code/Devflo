@@ -43,7 +43,7 @@ def create_access_token(email: str) -> str:
     payload = {
         "sub": email,
         "type": "access",
-        "exp": datetime.now(UTC) + timedelta(hours=6)
+        "exp": datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     }
 
     return jwt.encode(
