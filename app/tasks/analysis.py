@@ -8,6 +8,10 @@ from app.services import (
     filter_important_events,
     group_events_by_identity,
     build_timeline,
+    build_exception_fingerprint,
+    create_batches,
+    persist_evidence_batch,
+    persist_resolved_identities
 )
 
 logger = logging.getLogger(__name__)
@@ -22,73 +26,85 @@ def process_analysis(analysis_id: int):
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
 
         if analysis is None:
-            print(f"processing analysis {analysis_id} not found")
+            logger.warning("Analysis %s not found", analysis_id)
             return
 
         analysis.status = "processing"
         db.commit()
 
-        line_count = 0
-        parsed_events = []
+        line_count = analysis.last_processed_line
+        parsed_event_count = 0
 
-        for line in stream_text_lines(analysis.saved_file_path):
-            line_count += 1
+        for batch in create_batches(
+            stream_text_lines(
+                analysis.saved_file_path,
+                start_line=analysis.last_processed_line,
+            )
+        ):
+            batch_events = []
 
-            event = parse_log_line(line=line, line_number=line_count)
+            for line, current_offset in batch:
+                line_count += 1
 
-            parsed_events.append(event)
+                event = parse_log_line(
+                    line=line,
+                    line_number=line_count,
+                )
+
+                event.fingerprint = build_exception_fingerprint(event)
+
+                batch_events.append(event)
+
+                logger.debug(
+                    "Analysis %s | line %s | %s",
+                    analysis_id,
+                    line_count,
+                    line,
+                )
+
+            parsed_event_count += len(batch_events)
 
             logger.debug(
-                "Analysis %s | line %s | %s",
+                "Analysis %s | processed batch | events=%s",
                 analysis_id,
-                line_count,
-                line,
+                len(batch_events),
             )
 
+            important_batch_events = filter_important_events(batch_events)
+
+            logger.debug(
+                "Analysis %s | important_events in batch=%s",
+                analysis_id,
+                len(important_batch_events),
+            )
+
+            persist_evidence_batch(
+                db=db,
+                analysis_id=analysis_id,
+                events=important_batch_events,
+            )
+
+            analysis.last_processed_line = line_count
+            analysis.processed_bytes = current_offset
+
+            db.commit()
+
         logger.info(
-            "Analysis %s parsed | total line=%s | parsed_events=%s",
+            "Analysis %s parsed | total_lines=%s | parsed_events=%s",
             analysis_id,
             line_count,
-            len(parsed_events),
+            parsed_event_count,
         )
 
-        important_events = filter_important_events(parsed_events)
+        persist_resolved_identities(
+            db=db,
+            analysis_id=analysis_id,
+        )
 
         logger.info(
-            "Analysis %s | important_events=%s",
+            "Analysis %s | evidence identities resolved",
             analysis_id,
-            len(important_events),
         )
-
-        identity_groups = group_events_by_identity(important_events)
-
-        logger.info(
-            "Analysis %s | identity_groups=%s", analysis_id, len(identity_groups)
-        )
-
-        for group in identity_groups:
-            logger.debug(
-                "Analysis %s | identity=%s | events=%s | match_type=%s | confidence=%s",
-                analysis_id,
-                group.identity,
-                len(events),
-                group.match_type,
-                group.confidence,
-            )
-
-        timelines = {}
-
-        for identity, events in identity_groups.items():
-            timelines[identity] = build_timeline(events)
-
-            logger.debug(
-                "Analysis %s | timeline=%s | events=%s",
-                analysis_id,
-                identity,
-                len(timelines[identity]),
-            )
-
-        logger.info("Analysis %s | timeline_build=%s", analysis_id, len(timelines))
 
         analysis.status = "completed"
         db.commit()

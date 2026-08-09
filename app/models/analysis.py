@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import DateTime, Enum, ForeignKey, String, func, BigInteger
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
@@ -43,3 +43,14 @@ class Analysis(Base):
         "User",
         back_populates="analyses"
     )
+    last_processed_line: Mapped[int] = mapped_column(
+    BigInteger,
+    nullable=False,
+    default=0,
+    )
+
+    processed_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+    )  

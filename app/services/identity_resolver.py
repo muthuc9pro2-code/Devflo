@@ -11,7 +11,7 @@ class IdentityGroups:
 
 def group_events_by_identity(
     events: list[ParsedEvent]
-) -> dict[str, list[ParsedEvent]]:
+) -> list[IdentityGroups]:
 
     groups = defaultdict(list)
 
@@ -30,14 +30,14 @@ def group_events_by_identity(
     for identity, grouped_events in groups.items():
         if identity.startswith("trace:"):
             confidence = 1.0
-            match_type = "request_id"
+            match_type = "trace_id"
 
-        elif identity.startswitch("request:"):
+        elif identity.startswith("request:"):
             confidence = 0.9
             match_type = "request_id"
 
         else: 
-            confidence = 0.0,
+            confidence = 0.0
             match_type = "unresolved"
 
         identity_groups.append(
@@ -49,7 +49,8 @@ def group_events_by_identity(
             )
         )
 
-    return dict(groups)
+    return identity_groups
+
 
 
 
