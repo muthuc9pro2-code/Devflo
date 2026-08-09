@@ -6,8 +6,6 @@ from app.utils.file_reader import stream_text_lines
 from app.services import (
     parse_log_line,
     filter_important_events,
-    group_events_by_identity,
-    build_timeline,
     build_exception_fingerprint,
     create_batches,
     persist_evidence_batch,
@@ -38,7 +36,7 @@ def process_analysis(analysis_id: int):
         for batch in create_batches(
             stream_text_lines(
                 analysis.saved_file_path,
-                start_line=analysis.last_processed_line,
+                start_offset=analysis.last_processed_line,
             )
         ):
             batch_events = []

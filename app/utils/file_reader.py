@@ -1,6 +1,3 @@
-from pathlib import Path
-from collections.abc import Iterator
-
 def stream_text_lines(
     file_path: str,
     start_offset: int = 0,
