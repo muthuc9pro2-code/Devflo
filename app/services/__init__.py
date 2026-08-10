@@ -6,5 +6,4 @@ from .evidence_store import persist_evidence_batch
 from .persistent_identity_resolver import resolve_evidence_identity
 from .identity_persister import persist_resolved_identities
 from .persistent_timeline import stream_timeline_evidence
-from .identity_reader import stream_resolved_identities
 from .timeline_processor import process_persisted_timelines
