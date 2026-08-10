@@ -2,27 +2,31 @@ from collections.abc import Iterator
 from sqlalchemy.orm import Session
 from app.models import Evidence
 
-TIMELINE_CHUNK_SIZE = 1000
+TIMELINE_PAGE_SIZE = 5000
 
-def stream_identity_timeline(
+def stream_timeline_evidence(
     db: Session,
     analysis_id: int,
-    resolved_identity: str,
 ) -> Iterator[Evidence]:
 
-    query = (
-        db.query(Evidence)
-        .filter(
-            Evidence.analysis_id == analysis_id,
-            Evidence.resolved_identity == resolved_identity,
-        )
-        .order_by(
-            Evidence.first_seen,
-            Evidence.id,
-        )
-        .yield_per(TIMELINE_CHUNK_SIZE)
-    )
+    last_id = 0
 
-    for evidence in query:
-        yield evidence
+    while True:
+        evidence_rows = (
+            db.query(Evidence)
+            .filter(
+                Evidence.analysis_id == analysis_id,
+                Evidence.id > last_id,
+            )
+            .order_by(Evidence.id)
+            .limit(TIMELINE_PAGE_SIZE)
+            .all()
+        )
 
+        if not evidence_rows:
+            break
+
+        for evidence in evidence_rows:
+            yield evidence
+
+        last_id = evidence_rows[-1].id
