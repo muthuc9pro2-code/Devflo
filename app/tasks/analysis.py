@@ -1,4 +1,5 @@
 import logging
+from time import perf_counter
 from app.core.celery_app import celery_app
 from app.db.database import sessionLocal
 from app.models import Analysis
@@ -9,11 +10,11 @@ from app.services import (
     build_exception_fingerprint,
     create_batches,
     persist_evidence_batch,
-    persist_resolved_identities
+    persist_resolved_identities,
+    process_persisted_timelines,
 )
 
 logger = logging.getLogger(__name__)
-
 
 @celery_app.task
 def process_analysis(analysis_id: int):
@@ -27,16 +28,20 @@ def process_analysis(analysis_id: int):
             logger.warning("Analysis %s not found", analysis_id)
             return
 
+        total_start = perf_counter()
+
         analysis.status = "processing"
         db.commit()
 
         line_count = analysis.last_processed_line
         parsed_event_count = 0
 
+        ingestion_start = perf_counter()
+
         for batch in create_batches(
             stream_text_lines(
                 analysis.saved_file_path,
-                start_offset=analysis.last_processed_line,
+                start_offset=analysis.processed_bytes,
             )
         ):
             batch_events = []
@@ -94,6 +99,14 @@ def process_analysis(analysis_id: int):
             parsed_event_count,
         )
 
+        logger.info(
+            "Analysis %s | ingestion completed in %.2fs",
+            analysis_id,
+            perf_counter() - ingestion_start,
+        )
+
+        identity_start = perf_counter()
+
         persist_resolved_identities(
             db=db,
             analysis_id=analysis_id,
@@ -104,8 +117,38 @@ def process_analysis(analysis_id: int):
             analysis_id,
         )
 
+        logger.info(
+            "Analysis %s | identity resolution completed in %.2fs",
+            analysis_id,
+            perf_counter() - identity_start,
+        )
+
+        timeline_start = perf_counter()
+
+        process_persisted_timelines(
+            db=db,
+            analysis_id=analysis_id,
+        )
+
+        logger.info(
+            "Analysis %s | persisted timelines processed",
+            analysis_id,
+        )
+
+        logger.info(
+            "Analysis %s | timeline processing completed in %.2fs",
+            analysis_id,
+            perf_counter() - timeline_start,
+        )
+
         analysis.status = "completed"
         db.commit()
+
+        logger.info(
+            "Analysis %s | TOTAL processing time %.2fs",
+            analysis_id,
+            perf_counter() - total_start,
+        )
 
     finally:
         db.close()

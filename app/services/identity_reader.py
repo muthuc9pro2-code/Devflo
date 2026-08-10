@@ -1,25 +1,34 @@
-from collections.abc import Iterator
 from sqlalchemy.orm import Session
-from app.models import Evidence
+
+from app.models.evidence import Evidence
+
 
 IDENTITY_CHUNK_SIZE = 500
+
 
 def stream_resolved_identities(
     db: Session,
     analysis_id: int,
-) -> Iterator[str]:
+):
+    last_id = 0
 
-    query = (
-        db.query(Evidence.resolved_identity)
-        .filter(
-            Evidence.analysis_id == analysis_id,
-            Evidence.resolved_identity.isnot(None),
+    while True:
+        evidence_rows = (
+            db.query(Evidence)
+            .filter(
+                Evidence.analysis_id == analysis_id,
+                Evidence.id > last_id,
+                Evidence.resolved_identity.isnot(None),
+            )
+            .order_by(Evidence.id)
+            .limit(IDENTITY_CHUNK_SIZE)
+            .all()
         )
-        .distinct()
-        .yield_per(IDENTITY_CHUNK_SIZE)
-    )
 
-    for (identity,) in query:
-        yield identity
+        if not evidence_rows:
+            break
 
-        
+        for evidence in evidence_rows:
+            yield evidence.resolved_identity
+
+        last_id = evidence_rows[-1].id

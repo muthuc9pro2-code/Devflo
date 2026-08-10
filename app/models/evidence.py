@@ -8,6 +8,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,6 +17,15 @@ from app.db.database import Base
 
 class Evidence(Base):
     __tablename__ = "evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "analysis_id",
+            "fingerprint",
+            "trace_id",
+            "request_id",
+            name="uq_evidence_analysis_fingerprint_identity",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer,

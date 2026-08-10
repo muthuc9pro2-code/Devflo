@@ -1,5 +1,4 @@
 from sqlalchemy.orm import Session
-
 from app.services.identity_reader import stream_resolved_identities
 from app.services.persistent_timeline import stream_identity_timeline
 
