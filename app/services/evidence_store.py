@@ -12,10 +12,13 @@ def persist_evidence_batch(
     grouped_events = defaultdict(list)
 
     for event in events:
+        trace_id = event.trace_id or "__none__"
+        request_id = event.request_id or "__none__"
+        
         key = (
             event.fingerprint,
-            event.trace_id,
-            event.request_id,
+            trace_id,
+            request_id,
         )
 
         grouped_events[key].append(event)
