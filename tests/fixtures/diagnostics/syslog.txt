@@ -1,0 +1,2 @@
+<11>1 2026-08-12T10:11:19Z edge-1 gateway 123 ID47 - upstream ConnectionError: refused
+<36>Aug 12 10:11:20 worker-1 scheduler[321]: queue depth warning

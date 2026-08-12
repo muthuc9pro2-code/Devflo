@@ -1,0 +1,68 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "catalog"}},
+          {"key": "host.name", "value": {"stringValue": "catalog-1"}}
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {"name": "catalog.logger"},
+          "logRecords": [
+            {
+              "timeUnixNano": "1786529481000000000",
+              "severityText": "ERROR",
+              "body": {"stringValue": "LookupError: product missing"},
+              "traceId": "trace-otel",
+              "spanId": "span-log",
+              "attributes": [
+                {"key": "exception.type", "value": {"stringValue": "LookupError"}},
+                {"key": "exception.message", "value": {"stringValue": "product missing"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "catalog"}},
+          {"key": "k8s.pod.name", "value": {"stringValue": "catalog-abc"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {"name": "catalog.http"},
+          "spans": [
+            {
+              "traceId": "trace-otel",
+              "spanId": "span-child",
+              "parentSpanId": "span-parent",
+              "name": "GET /products/{id}",
+              "startTimeUnixNano": "1786529482000000000",
+              "status": {"code": "STATUS_CODE_ERROR", "message": "request failed"},
+              "attributes": [
+                {"key": "http.route", "value": {"stringValue": "/products/{id}"}},
+                {"key": "http.response.status_code", "value": {"intValue": "500"}}
+              ],
+              "events": [
+                {
+                  "name": "exception",
+                  "attributes": [
+                    {"key": "exception.type", "value": {"stringValue": "TimeoutError"}},
+                    {"key": "exception.message", "value": {"stringValue": "database timeout"}}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

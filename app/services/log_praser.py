@@ -1,40 +1,39 @@
-import re
+"""Canonical Devflo event types and the compatible generic log entry point.
+
+The filename is intentionally retained as ``log_praser.py`` for import
+compatibility.
+"""
+
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime
+from typing import Any
 
-TIMESTAMP_PATTERN = re.compile(
-    r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
-)
-LOG_LEVEL_PATTERN = re.compile(
-    r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b",
-    re.IGNORECASE
-)
-TRACE_ID_PATTERN = re.compile(
-    r"\b(?:trace_id|trace-id|traceid)[=: ]+([A-Za-z0-9_-]+)",
-    re.IGNORECASE
-)
-REQUEST_ID_PATTERN = re.compile(
-    r"\b(?:request_id|request-id|requestid)[=: ]+([A-Za-z0-9_-]+)",
-    re.IGNORECASE
-)
-SERVICE_PATTERN = re.compile(
-    r"\b(?:service|service_name|app)[=: ]+([A-Za-z0-9_.-]+)",
-    re.IGNORECASE,
+_COMPAT_PATTERN_NAMES = (
+    "TIMESTAMP_PATTERN",
+    "LOG_LEVEL_PATTERN",
+    "TRACE_ID_PATTERN",
+    "REQUEST_ID_PATTERN",
+    "SERVICE_PATTERN",
+    "MODULE_PATTERN",
+    "HTTP_STATUS_PATTERN",
+    "EXCEPTION_PATTERN",
 )
 
-MODULE_PATTERN = re.compile(
-    r"\b(?:module|logger)[=: ]+([A-Za-z0-9_.-]+)",
-    re.IGNORECASE,
-)
+__all__ = [  # noqa: F822 - legacy names are resolved by module __getattr__.
+    "EXCEPTION_PATTERN",
+    "HTTP_STATUS_PATTERN",
+    "LOG_LEVEL_PATTERN",
+    "MODULE_PATTERN",
+    "REQUEST_ID_PATTERN",
+    "SERVICE_PATTERN",
+    "TIMESTAMP_PATTERN",
+    "TRACE_ID_PATTERN",
+    "ParsedEvent",
+    "StackFrame",
+    "estimate_parsed_event_size_bytes",
+    "parse_log_line",
+]
 
-HTTP_STATUS_PATTERN = re.compile(
-    r"\b(?:status|status_code|http_status)[=: ]+(\d{3})\b",
-    re.IGNORECASE,
-)
-
-EXCEPTION_PATTERN = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b(?::\s*(.*))?"
-)
 
 @dataclass
 class StackFrame:
@@ -42,44 +41,97 @@ class StackFrame:
     line: int | None = None
     function: str | None = None
 
+
 @dataclass
 class ParsedEvent:
     line_number: int
     raw_line: str
-    timestamp: Optional[str] = None
-    level: Optional[str] = None
-    trace_id: Optional[str] = None
-    request_id: Optional[str] = None
-    service: Optional[str] = None
-    module: Optional[str] = None
-    exception_type: Optional[str] = None
-    exception_message: Optional[str] = None
-    fingerprint: Optional[str] = None
+    timestamp: datetime | str | None = None
+    level: str | None = None
+    trace_id: str | None = None
+    request_id: str | None = None
+    service: str | None = None
+    module: str | None = None
+    exception_type: str | None = None
+    exception_message: str | None = None
+    fingerprint: str | None = None
     stack_frames: list[StackFrame] = field(default_factory=list)
-    endpoint: Optional[str] = None
-    http_status: Optional[int] = None
-    source_file: Optional[str] = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    source_file: str | None = None
+    span_id: str | None = None
+    parent_span_id: str | None = None
+    host: str | None = None
+    container: str | None = None
+    pod: str | None = None
+    source_format: str | None = None
+    artifact_id: int | None = None
 
-def parse_log_line(line: str,line_number: int) -> ParsedEvent:
-    timestamp_match = TIMESTAMP_PATTERN.search(line)
-    level_match = LOG_LEVEL_PATTERN.search(line)
-    trace_id_match = TRACE_ID_PATTERN.search(line)
-    request_id_match = REQUEST_ID_PATTERN.search(line)
-    service_match = SERVICE_PATTERN.search(line)
-    module_match = MODULE_PATTERN.search(line)
-    http_status_match = HTTP_STATUS_PATTERN.search(line)
-    exception_match = EXCEPTION_PATTERN.search(line)
 
-    return ParsedEvent(
-        line_number=line_number,
-        raw_line=line,
-        timestamp=timestamp_match.group(0) if timestamp_match else None,
-        level=level_match.group(1).upper() if level_match else None,
-        trace_id=trace_id_match.group(1) if trace_id_match else None,
-        request_id=request_id_match.group(1) if request_id_match else None,
-        service=service_match.group(1) if service_match else None,
-        module=module_match.group(1) if module_match else None,
-        exception_type=exception_match.group(1) if exception_match else None,
-        exception_message=exception_match.group(2) if exception_match else None,
-        http_status=int(http_status_match.group(1)) if http_status_match else None
+def estimate_parsed_event_size_bytes(event: ParsedEvent) -> int:
+    """Conservatively estimate canonical data retained until a batch flushes."""
+
+    values = (
+        event.raw_line,
+        event.level,
+        event.trace_id,
+        event.request_id,
+        event.service,
+        event.module,
+        event.exception_type,
+        event.exception_message,
+        event.fingerprint,
+        event.endpoint,
+        event.source_file,
+        event.span_id,
+        event.parent_span_id,
+        event.host,
+        event.container,
+        event.pod,
+        event.source_format,
     )
+    size = sum(
+        len(value.encode("utf-8", errors="replace"))
+        for value in values
+        if value is not None
+    )
+    size += sum(
+        len(value.encode("utf-8", errors="replace"))
+        for frame in event.stack_frames
+        for value in (frame.file, frame.function)
+        if value is not None
+    )
+    return max(size, 1)
+
+
+def parse_log_line(line: str, line_number: int) -> ParsedEvent:
+    """Parse an ordinary diagnostic line into the canonical event shape."""
+
+    # Imported lazily so this compatibility module remains the owner of the
+    # canonical dataclasses without creating a module import cycle.
+    from .diagnostic_parser import TIMESTAMP_PATTERN, normalize_text_event
+
+    event = normalize_text_event(
+        raw_text=line,
+        line_number=line_number,
+    )
+    timestamp_match = TIMESTAMP_PATTERN.search(line)
+    event.timestamp = timestamp_match.group(0) if timestamp_match else None
+    return event
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily preserve the original parser-pattern import surface."""
+
+    if name not in _COMPAT_PATTERN_NAMES:
+        raise AttributeError(name)
+
+    from . import diagnostic_parser
+
+    value = getattr(diagnostic_parser, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_COMPAT_PATTERN_NAMES))

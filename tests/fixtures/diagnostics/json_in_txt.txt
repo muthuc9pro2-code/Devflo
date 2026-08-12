@@ -1,0 +1,1 @@
+{"@timestamp":"2026-08-12T10:11:13Z","severity":"error","message":"inventory lookup failed","traceId":"trace-2","requestId":"req-2","service":{"name":"inventory"},"error":{"type":"LookupError","message":"sku missing"}}

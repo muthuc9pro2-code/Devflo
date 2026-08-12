@@ -1,0 +1,1 @@
+{"log":"2026-08-12 10:11:16 ERROR service=orders ConnectionError: database refused","stream":"stderr","time":"2026-08-12T10:11:16.123456Z","container_id":"container-1"}

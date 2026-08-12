@@ -1,0 +1,4 @@
+2026-08-12 10:11:14 ERROR service=worker Traceback (most recent call last):
+  File "/srv/worker.py", line 42, in run
+    raise RuntimeError("queue unavailable")
+RuntimeError: queue unavailable

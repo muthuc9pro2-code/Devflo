@@ -1,5 +1,7 @@
 from datetime import datetime
+
 from pydantic import BaseModel
+
 
 class AnalysisResponse(BaseModel):
     id: int
@@ -7,6 +9,4 @@ class AnalysisResponse(BaseModel):
     status: str
     created_at: datetime
 
-    model_config = {
-        "from_attribute": True
-    }
+    model_config = {"from_attributes": True}

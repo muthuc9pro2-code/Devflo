@@ -1,5 +1,7 @@
 from sqlalchemy.orm import Session
+
 from app.services.persistent_timeline import stream_timeline_evidence
+
 
 def process_persisted_timelines(
     db: Session,

@@ -1,0 +1,4 @@
+START RequestId: lambda-request-1 Version: $LATEST
+2026-08-12T10:15:00.123Z	lambda-request-1	ERROR	service=thumbnailer RuntimeError: resize failed
+END RequestId: lambda-request-1
+REPORT RequestId: lambda-request-1 Duration: 842.12 ms Billed Duration: 843 ms Memory Size: 256 MB Max Memory Used: 181 MB

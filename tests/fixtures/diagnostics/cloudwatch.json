@@ -1,0 +1,14 @@
+{
+  "logEvents": [
+    {
+      "id": "event-1",
+      "timestamp": 1786529483000,
+      "message": "ERROR service=thumbnailer request_id=lambda-1 RuntimeError: resize failed"
+    },
+    {
+      "id": "event-2",
+      "timestamp": 1786529484000,
+      "message": "WARN service=thumbnailer request_id=lambda-2 retrying"
+    }
+  ]
+}

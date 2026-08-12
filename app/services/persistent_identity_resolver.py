@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+
 from app.models import Evidence
+
 
 @dataclass(slots=True)
 class EvidenceIdentity:
@@ -7,9 +9,15 @@ class EvidenceIdentity:
     match_type: str
     strength: float
 
+
 def resolve_evidence_identity(
     evidence: Evidence,
 ) -> EvidenceIdentity:
+    """Compatibility helper for callers resolving a single loaded row.
+
+    Production ingestion uses the set-based identity persister and does not
+    invoke this helper per row.
+    """
 
     if evidence.trace_id and evidence.trace_id != "__none__":
         return EvidenceIdentity(

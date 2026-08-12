@@ -1,0 +1,2 @@
+203.0.113.9 - - [12/Aug/2026:10:11:15 +0000] "GET /api/orders HTTP/1.1" 502 173 "-" "curl/8"
+[Wed Aug 12 10:11:16.123456 2026] [core:error] [pid 123] RuntimeError: Apache worker failed

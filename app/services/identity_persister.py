@@ -1,12 +1,13 @@
 from sqlalchemy import String, and_, case, cast, func, update
 from sqlalchemy.orm import Session
+
 from app.models.evidence import Evidence
+
 
 def persist_resolved_identities(
     db: Session,
     analysis_id: int,
 ) -> None:
-
     has_trace_id = and_(
         Evidence.trace_id.is_not(None),
         Evidence.trace_id != "__none__",

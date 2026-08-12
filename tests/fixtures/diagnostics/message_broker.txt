@@ -1,0 +1,2 @@
+2026-08-12T10:14:00.123Z ERROR [KafkaConsumer clientId=orders-consumer, groupId=checkout] org.apache.kafka.clients.consumer.internals.ConsumerCoordinator - Offset commit failed request_id=broker-1
+2026-08-12T10:14:01.456Z WARN rabbitmq AMQP connection blocked while publishing queue=orders

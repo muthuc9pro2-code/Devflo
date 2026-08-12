@@ -1,0 +1,1 @@
+2026-08-12 10:11:12 ERROR service=checkout module=payments trace_id=trace-1 request_id=req-1 ValueError: card declined
