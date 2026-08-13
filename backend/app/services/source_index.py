@@ -1,0 +1,100 @@
+"""Deterministic stack-frame -> source-file correlation via one prebuilt index."""
+import os
+import posixpath
+from collections import namedtuple
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from app.core.processing_config import (
+    MAX_SOURCE_CONTEXT_FILE_BYTES,
+    SOURCE_CONTEXT_LINES,
+)
+
+IGNORED_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "coverage", "__pycache__"}
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".pdf", ".zip", ".tar", ".gz",
+    ".bz2", ".7z", ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".woff", ".woff2",
+    ".ttf", ".eot", ".mp4", ".mp3", ".wav", ".bin", ".lock", ".pyc",
+}
+
+SourceFile = namedtuple("SourceFile", "relative_path basename extension size")
+
+@dataclass(slots=True)
+class SourceIndex:
+    root: Path
+    by_path: dict[str, SourceFile] = field(default_factory=dict)
+    by_suffix: dict[str, list[str]] = field(default_factory=dict)
+    by_stem: dict[str, list[str]] = field(default_factory=dict)
+
+def build_index(root: Path) -> SourceIndex:
+    index = SourceIndex(root=root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in IGNORED_DIRS]
+        for filename in filenames:
+            extension = Path(filename).suffix.lower()
+            if extension in BINARY_EXTENSIONS:
+                continue
+            full_path = Path(dirpath) / filename
+            relative_path = full_path.relative_to(root).as_posix()
+            index.by_path[relative_path] = SourceFile(relative_path, filename, extension, full_path.stat().st_size)
+            index.by_stem.setdefault(Path(filename).stem, []).append(relative_path)
+            parts = relative_path.split("/")
+            for start in range(len(parts) - 1):
+                index.by_suffix.setdefault("/".join(parts[start + 1 :]), []).append(relative_path)
+    return index
+
+def _match_frame(frame, index: SourceIndex, module: str | None) -> dict | None:
+    normalized = posixpath.normpath(frame.file.replace("\\", "/")).lstrip("./") if frame.file else None
+    if normalized:
+        if normalized in index.by_path:
+            return _build_match(index, normalized, normalized, frame, "exact")
+        parts = normalized.split("/")
+        for start in range(1, len(parts)):
+            candidates = index.by_suffix.get("/".join(parts[start:]))
+            if candidates:
+                if len(candidates) != 1:
+                    return None  # ambiguous: never fabricate a source location
+                method = "basename" if start == len(parts) - 1 else "suffix"
+                return _build_match(index, candidates[0], normalized, frame, method)
+    stem = (module or "").rsplit(".", 1)[-1] or None
+    candidates = index.by_stem.get(stem) if stem else None
+    if candidates and len(candidates) == 1:
+        return _build_match(index, candidates[0], normalized or stem, frame, "module")
+    return None
+
+def _build_match(index: SourceIndex, relative_path: str, requested_path: str, frame, method: str) -> dict:
+    line_number = getattr(frame, "line", None)
+    snippet, start, end = _read_context(index.root / relative_path, line_number)
+    return {
+        "relative_path": relative_path,
+        "requested_path": requested_path,
+        "line_number": line_number,
+        "function": getattr(frame, "function", None),
+        "context_start": start,
+        "context_end": end,
+        "snippet": snippet,
+        "match_method": method,
+        "confidence": "high" if method == "exact" else "medium",
+    }
+
+def _read_context(path: Path, line_number: int | None) -> tuple[str | None, int | None, int | None]:
+    if not line_number or line_number < 1:
+        return None, None, None
+    try:
+        if path.stat().st_size > MAX_SOURCE_CONTEXT_FILE_BYTES:
+            return None, None, None
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None, None, None
+    start = max(line_number - SOURCE_CONTEXT_LINES, 1)
+    end = min(line_number + SOURCE_CONTEXT_LINES, len(lines))
+    if start > end:
+        return None, None, None
+    return "\n".join(lines[start - 1 : end]), start, end
+
+def correlate_event(event, index: SourceIndex | None) -> list[dict]:
+    if index is None:
+        return []
+    module = getattr(event, "module", None)
+    frames = getattr(event, "stack_frames", None) or []
+    return [match for frame in frames if (match := _match_frame(frame, index, module))]

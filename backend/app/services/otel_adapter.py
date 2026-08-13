@@ -7,7 +7,6 @@ from app.core.processing_config import JSON_STREAM_BUFFER_BYTES, MAX_DIAGNOSTIC_
 from app.utils.bounded_json import BoundedJsonStream
 from .artifact_detector import ArtifactFormat
 from .diagnostic_parser import normalize_otel_severity, normalize_text_event
-from .log_praser import estimate_parsed_event_size_bytes
 if TYPE_CHECKING:
     from .diagnostic_adapters import ArtifactEvent
 SCALAR_EVENTS = {'string', 'number', 'boolean', 'null'}
@@ -118,7 +117,7 @@ def stream_otlp_events(*, file_path: str, source_file: str, skip_records: int=0,
                     canonical_event = _normalize_log_record(completed, line_number=global_line, source_file=source_file, resource_attributes=log_resource, scope_name=log_scope)
                 else:
                     canonical_event = _normalize_span(completed, line_number=global_line, source_file=source_file, resource_attributes=span_resource, scope_name=span_scope)
-                retained_bytes = max(completed._captured_bytes, estimate_parsed_event_size_bytes(canonical_event))
+                retained_bytes = max(completed._captured_bytes, 1)
                 yield ArtifactEvent(event=canonical_event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=retained_bytes)
                 continue
             if event == 'start_map':

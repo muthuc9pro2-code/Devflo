@@ -11,7 +11,7 @@ from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
 from .diagnostic_parser import EXCEPTION_PATTERN, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp
-from .log_praser import ParsedEvent, estimate_parsed_event_size_bytes
+from .log_praser import ParsedEvent
 logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
@@ -99,7 +99,10 @@ def stream_artifact_events(*, file_path: str, artifact_format: ArtifactFormat, s
 def _stream_cloudfront_events(*, file_path: str, source_file: str, fields: list[str], start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
     global_line = global_line_number
+    previous_offset = start_offset
     for line, end_offset in stream_text_lines(file_path, start_offset=start_offset):
+        record_size = end_offset - previous_offset
+        previous_offset = end_offset
         local_line += 1
         global_line += 1
         stripped = line.removeprefix('\ufeff').strip()
@@ -113,7 +116,7 @@ def _stream_cloudfront_events(*, file_path: str, source_file: str, fields: list[
             values = line.split()
         data = {key.lower(): value for key, value in zip(fields, values, strict=False)}
         event = _normalize_cloudfront_event(line, global_line, source_file, data)
-        yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(len(line.encode('utf-8', errors='replace')), estimate_parsed_event_size_bytes(event), 1))
+        yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(record_size, 1))
 
 def _read_cloudfront_fields(file_path: str) -> list[str] | None:
     with open(file_path, 'rb') as stream:
@@ -136,23 +139,25 @@ def _cloudfront_fields_from_line(line: str) -> list[str] | None:
 def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
     global_line = global_line_number
+    previous_offset = start_offset
     pending: _PendingTextRecord | None = None
     for line, end_offset in stream_text_lines(file_path, start_offset=start_offset):
         local_line += 1
         global_line += 1
-        line_size = len(line.encode('utf-8'))
+        line_size = end_offset - previous_offset
+        previous_offset = end_offset
         cri_match = CRI_RE.search(line) if artifact_format == ArtifactFormat.CONTAINER else None
         if cri_match is not None:
             if pending is not None and pending.multiline_kind == 'cri_partial':
                 pending_match = CRI_RE.search(pending.lines[0])
                 same_stream = pending_match is not None and pending_match.group('stream') == cri_match.group('stream')
-                fits_record_bound = pending.size_bytes + line_size + 1 <= MAX_DIAGNOSTIC_RECORD_BYTES
+                fits_record_bound = pending.size_bytes + line_size <= MAX_DIAGNOSTIC_RECORD_BYTES
                 if same_stream and fits_record_bound:
                     pending.lines.append(cri_match.group('body'))
                     pending.end_global_line = global_line
                     pending.artifact_line_number = local_line
                     pending.end_offset = end_offset
-                    pending.size_bytes += line_size + 1
+                    pending.size_bytes += line_size
                     if cri_match.group('flag') == 'P':
                         continue
                     yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
@@ -173,12 +178,12 @@ def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, sour
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
             pending = None
         if pending is not None and _is_multiline_continuation(pending, line):
-            if pending.size_bytes + line_size + 1 <= MAX_DIAGNOSTIC_RECORD_BYTES:
+            if pending.size_bytes + line_size <= MAX_DIAGNOSTIC_RECORD_BYTES:
                 pending.lines.append(line)
                 pending.end_global_line = global_line
                 pending.artifact_line_number = local_line
                 pending.end_offset = end_offset
-                pending.size_bytes += line_size + 1
+                pending.size_bytes += line_size
                 continue
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
             pending = None
@@ -217,7 +222,7 @@ def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: A
         elif artifact_format == ArtifactFormat.STACK_TRACE and record.multiline_kind == 'crash_report':
             defaults['level'] = 'ERROR'
         event = normalize_text_event(raw_text, record.start_global_line, source_file=source_file, source_format=artifact_format.value, defaults=defaults)
-    return ArtifactEvent(event=event, end_offset=record.end_offset, artifact_line_number=record.artifact_line_number, global_end_line_number=record.end_global_line, batch_size_bytes=max(record.size_bytes, estimate_parsed_event_size_bytes(event)))
+    return ArtifactEvent(event=event, end_offset=record.end_offset, artifact_line_number=record.artifact_line_number, global_end_line_number=record.end_global_line, batch_size_bytes=max(record.size_bytes, 1))
 
 def _stream_json_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     if _is_json_lines(file_path, artifact_format):
@@ -228,12 +233,14 @@ def _stream_json_events(*, file_path: str, artifact_format: ArtifactFormat, sour
 def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
     global_line = global_line_number
+    previous_offset = start_offset
     for line, end_offset in stream_text_lines(file_path, start_offset=start_offset):
+        size_bytes = end_offset - previous_offset
+        previous_offset = end_offset
         local_line += 1
         global_line += 1
         if start_offset == 0 and local_line == 1:
             line = line.removeprefix('\ufeff')
-        size_bytes = max(len(line.encode('utf-8')), 1)
         try:
             value = json.loads(line)
         except (json.JSONDecodeError, TypeError):
@@ -241,7 +248,7 @@ def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, sourc
         else:
             data = value if isinstance(value, Mapping) else {'body': value}
             event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value)
-        yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(size_bytes, estimate_parsed_event_size_bytes(event)))
+        yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(size_bytes, 1))
 
 def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, skip_records: int, start_offset: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     target_prefix = _json_item_prefix(file_path, artifact_format)
@@ -278,7 +285,7 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                 global_line += 1
                 event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value)
                 emitted = True
-                yield ArtifactEvent(event=event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=max(retained_size_bytes, estimate_parsed_event_size_bytes(event)))
+                yield ArtifactEvent(event=event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=max(retained_size_bytes, 1))
     except ijson.JSONError:
         has_structured_checkpoint = skip_records > 0 and start_offset == 0
         if emitted or has_structured_checkpoint:

@@ -144,6 +144,10 @@ def persist_evidence_batch(
                     _first_present(fingerprint_events, "source_format"),
                     50,
                 ),
+                "source_matches": _first_truthy(
+                    fingerprint_events,
+                    "source_matches",
+                ),
                 "first_seen": first_seen,
                 "last_seen": last_seen,
                 "occurrence_count": len(fingerprint_events),
@@ -202,6 +206,10 @@ def persist_evidence_batch(
             Evidence.source_format,
             statement.inserted.source_format,
         ),
+        source_matches=func.coalesce(
+            Evidence.source_matches,
+            statement.inserted.source_matches,
+        ),
     )
 
     db.execute(statement, rows)
@@ -232,6 +240,13 @@ def _first_present(events, attribute: str):
     for event in events:
         value = getattr(event, attribute, None)
         if value is not None:
+            return value
+    return None
+
+
+def _first_truthy(events, attribute: str):
+    for event in events:
+        if value := getattr(event, attribute, None):
             return value
     return None
 

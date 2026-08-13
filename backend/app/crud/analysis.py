@@ -1,6 +1,8 @@
 from collections.abc import Mapping, Sequence
 from typing import Any
+
 from sqlalchemy.orm import Session
+
 from app.models.analysis import Analysis
 from app.models.analysis_artifact import AnalysisArtifact
 
@@ -11,9 +13,15 @@ def create_analysis(
     filename: str,
     saved_file_path: str,
     artifacts: Sequence[Mapping[str, Any]] | None = None,
+    source_kind: str | None = None,
+    source_reference: str | None = None,
 ) -> Analysis:
     analysis = Analysis(
-        user_id=user_id, original_filename=filename, saved_file_path=saved_file_path
+        user_id=user_id,
+        original_filename=filename,
+        saved_file_path=saved_file_path,
+        source_kind=source_kind,
+        source_reference=source_reference,
     )
 
     try:

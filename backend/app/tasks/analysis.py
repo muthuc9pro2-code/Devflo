@@ -1,7 +1,10 @@
 import logging
 from os.path import getsize
+from pathlib import Path
 from time import perf_counter
+
 from sqlalchemy.orm import Session
+
 from app.core.celery_app import celery_app
 from app.db.database import sessionLocal
 from app.models import Analysis, AnalysisArtifact
@@ -15,6 +18,8 @@ from app.services import (
 )
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import stream_artifact_events
+from app.services.source_archive import prepare_source
+from app.services.source_index import correlate_event
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,7 @@ def process_analysis(analysis_id: int):
                 f"Analysis {analysis_id} has no persisted diagnostic artifacts"
             )
 
+        source_index = _prepare_source_index(analysis)
         for artifact in artifacts:
             if artifact.status == "completed":
                 continue
@@ -62,6 +68,7 @@ def process_analysis(analysis_id: int):
                 db=db,
                 analysis=analysis,
                 artifact=artifact,
+                source_index=source_index,
             )
 
         logger.info(
@@ -116,6 +123,7 @@ def _process_artifact(
     db: Session,
     analysis: Analysis,
     artifact: AnalysisArtifact,
+    source_index=None,
 ) -> int:
     artifact_start = perf_counter()
     initial_size = getsize(artifact.saved_file_path)
@@ -166,6 +174,7 @@ def _process_artifact(
             analysis=analysis,
             artifact=artifact,
             batch=batch,
+            source_index=source_index,
         )
         checkpoint_offset = artifact.processed_bytes
 
@@ -198,13 +207,14 @@ def _persist_artifact_batch(
     analysis: Analysis,
     artifact: AnalysisArtifact,
     batch,
+    source_index=None,
 ) -> int:
-    batch_events = [record.event for record in batch]
-
-    for event in batch_events:
+    for record in batch:
+        event = record.event
         event.artifact_id = artifact.id
 
-    important_events = filter_important_events(batch_events)
+    important_events = filter_important_events(record.event for record in batch)
+    _correlate_source_events(important_events, source_index)
     _assign_batch_fingerprints(important_events)
     persist_evidence_batch(
         db=db,
@@ -226,10 +236,38 @@ def _persist_artifact_batch(
         "Analysis %s | artifact=%s | processed batch | events=%s | important=%s",
         analysis.id,
         artifact.id,
-        len(batch_events),
+        len(batch),
         len(important_events),
     )
-    return len(batch_events)
+    return len(batch)
+
+
+def _correlate_source_events(events, source_index) -> None:
+    if source_index is None:
+        return
+
+    for event in events:
+        event.source_matches = correlate_event(event, source_index)
+
+
+def _prepare_source_index(analysis: Analysis):
+    if not analysis.source_kind or not analysis.source_reference:
+        return None
+
+    index = prepare_source(
+        analysis.source_kind,
+        analysis.source_reference,
+        analysis.id,
+    )
+    if analysis.source_kind == "zip":
+        _remove_staged_source_archive(analysis.source_reference)
+    return index
+
+
+def _remove_staged_source_archive(reference: str) -> None:
+    path = Path(reference)
+    if path.resolve(strict=False).parent == Path("uploads").resolve():
+        path.unlink(missing_ok=True)
 
 
 def _artifact_format(artifact: AnalysisArtifact) -> ArtifactFormat:

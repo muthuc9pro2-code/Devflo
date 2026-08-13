@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     DateTime,
     Float,
@@ -122,6 +123,7 @@ class Evidence(Base):
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_file: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source_format: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_matches: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
 
     first_seen: Mapped[datetime | None] = mapped_column(
         DateTime,
@@ -169,5 +171,3 @@ class Evidence(Base):
         Float,
         nullable=True,
     )
-
-    

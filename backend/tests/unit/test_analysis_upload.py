@@ -71,6 +71,93 @@ def test_combined_upload_limit_cleans_partial_files(tmp_path, monkeypatch):
     create_analysis.assert_not_called()
 
 
+def test_optional_github_source_is_canonicalized_separately(tmp_path, monkeypatch):
+    create_analysis = Mock(return_value=SimpleNamespace(id=19))
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", Mock())
+    monkeypatch.setattr(
+        analysis_api,
+        "validate_github_url",
+        Mock(return_value="https://github.com/acme/project"),
+    )
+
+    analysis_api.upload_file(
+        file=_upload("diagnostic.log", b"ERROR failed"),
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+        github_url=" https://github.com/acme/project.git ",
+    )
+
+    kwargs = create_analysis.call_args.kwargs
+    assert kwargs["source_kind"] == "github"
+    assert kwargs["source_reference"] == "https://github.com/acme/project"
+    assert [row["original_filename"] for row in kwargs["artifacts"]] == [
+        "diagnostic.log"
+    ]
+
+
+def test_optional_source_zip_is_staged_but_not_a_diagnostic_artifact(
+    tmp_path, monkeypatch
+):
+    create_analysis = Mock(return_value=SimpleNamespace(id=20))
+    validate = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", Mock())
+    monkeypatch.setattr(analysis_api, "validate_source_zip", validate)
+
+    analysis_api.upload_file(
+        file=_upload("diagnostic.log", b"ERROR failed"),
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+        source_zip=_upload("source.zip", b"zip bytes"),
+    )
+
+    kwargs = create_analysis.call_args.kwargs
+    assert kwargs["source_kind"] == "zip"
+    assert len(kwargs["artifacts"]) == 1
+    assert kwargs["source_reference"].endswith("_source.zip")
+    validate.assert_called_once()
+
+
+def test_github_and_source_zip_are_mutually_exclusive(tmp_path, monkeypatch):
+    create_analysis = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.upload_file(
+            file=_upload("diagnostic.log", b"ERROR failed"),
+            db=Mock(),
+            current_user=SimpleNamespace(id=4),
+            github_url="https://github.com/acme/project",
+            source_zip=_upload("source.zip", b"zip bytes"),
+        )
+
+    assert error.value.status_code == 400
+    assert list(tmp_path.iterdir()) == []
+    create_analysis.assert_not_called()
+
+
+def test_source_zip_limit_cleans_all_staged_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "MAX_SOURCE_ARCHIVE_BYTES", 3)
+    monkeypatch.setattr(analysis_api, "UPLOAD_COPY_CHUNK_BYTES", 2)
+    monkeypatch.setattr(analysis_api, "create_analysis", Mock())
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.upload_file(
+            file=_upload("diagnostic.log", b"ERROR failed"),
+            db=Mock(),
+            current_user=SimpleNamespace(id=4),
+            source_zip=_upload("source.zip", b"1234"),
+        )
+
+    assert error.value.status_code == 413
+    assert list(tmp_path.iterdir()) == []
+
+
 def _upload(filename: str, content: bytes):
     return SimpleNamespace(
         filename=filename,

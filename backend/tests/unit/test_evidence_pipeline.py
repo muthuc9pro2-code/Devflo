@@ -134,6 +134,27 @@ def test_evidence_batch_normalizes_mixed_timestamp_inputs():
     assert rows[0]["last_seen"] == datetime(2026, 8, 12, 10, 0)  # noqa: DTZ001
 
 
+def test_evidence_batch_persists_first_truthy_source_matches():
+    db = Mock()
+    events = [
+        ParsedEvent(
+            line_number=number,
+            raw_line="ERROR correlated failure",
+            level="ERROR",
+            fingerprint="error:correlated",
+            artifact_id=7,
+        )
+        for number in (1, 2)
+    ]
+    events[0].source_matches = []
+    events[1].source_matches = [{"relative_path": "app/main.py", "line_number": 9}]
+
+    persist_evidence_batch(db=db, analysis_id=3, events=events, artifact_id=7)
+
+    _, rows = db.execute.call_args.args
+    assert rows[0]["source_matches"] == events[1].source_matches
+
+
 def test_timeline_keyset_pagination_handles_null_timestamps(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Evidence.__table__.create(engine)

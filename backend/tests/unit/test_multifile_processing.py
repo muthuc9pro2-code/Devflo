@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.log_praser import ParsedEvent
@@ -8,6 +9,7 @@ from app.tasks import analysis as analysis_task
 from app.tasks.analysis import _process_artifact
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
+
 
 def test_two_artifacts_accumulate_under_one_analysis_checkpoint():
     db = Mock()
@@ -67,6 +69,70 @@ def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
         artifact_id=artifact.id,
     )
     db.commit.assert_called_once()
+
+
+def test_artifact_batch_correlates_only_retained_events(monkeypatch):
+    db = Mock()
+    analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
+    artifact = SimpleNamespace(id=101, processed_bytes=0, last_processed_line=0)
+    discarded = ParsedEvent(line_number=1, raw_line="INFO routine", level="INFO")
+    retained = ParsedEvent(line_number=2, raw_line="ERROR failure", level="ERROR")
+    retained.stack_frames = [SimpleNamespace(file="app/main.py", line=9)]
+    batch = [
+        SimpleNamespace(event=discarded),
+        SimpleNamespace(
+            event=retained,
+            end_offset=20,
+            artifact_line_number=2,
+            global_end_line_number=2,
+        ),
+    ]
+    source_index = Mock()
+    correlate = Mock(return_value=[{"relative_path": "app/main.py"}])
+    monkeypatch.setattr(analysis_task, "correlate_event", correlate)
+    monkeypatch.setattr(analysis_task, "persist_evidence_batch", Mock())
+
+    analysis_task._persist_artifact_batch(
+        db=db,
+        analysis=analysis,
+        artifact=artifact,
+        batch=batch,
+        source_index=source_index,
+    )
+
+    correlate.assert_called_once_with(retained, source_index)
+    assert retained.source_matches == [{"relative_path": "app/main.py"}]
+    assert discarded.source_matches == []
+
+
+def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
+    analysis = SimpleNamespace(
+        id=9,
+        source_kind="zip",
+        source_reference="uploads/source.zip",
+    )
+    index = object()
+    prepare = Mock(return_value=index)
+    remove = Mock()
+    monkeypatch.setattr(analysis_task, "prepare_source", prepare)
+    monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", remove)
+
+    assert analysis_task._prepare_source_index(analysis) is index
+    prepare.assert_called_once_with("zip", "uploads/source.zip", 9)
+    remove.assert_called_once_with("uploads/source.zip")
+
+
+def test_log_only_analysis_does_not_prepare_source(monkeypatch):
+    prepare = Mock()
+    monkeypatch.setattr(analysis_task, "prepare_source", prepare)
+
+    assert (
+        analysis_task._prepare_source_index(
+            SimpleNamespace(id=9, source_kind=None, source_reference=None)
+        )
+        is None
+    )
+    prepare.assert_not_called()
 
 
 def test_line_stream_resume_starts_after_the_committed_record():

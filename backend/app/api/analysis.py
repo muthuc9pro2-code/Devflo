@@ -1,17 +1,26 @@
 import uuid
 from pathlib import Path
 from typing import Annotated
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
+
 from app.api.dependencies import get_current_verified_user
 from app.core.processing_config import (
     MAX_INVESTIGATION_UPLOAD_BYTES,
+    MAX_SOURCE_ARCHIVE_BYTES,
     UPLOAD_COPY_CHUNK_BYTES,
 )
 from app.crud.analysis import create_analysis
 from app.db.database import get_db
 from app.models.user import User
 from app.schemas.analysis import AnalysisResponse
+from app.services.source_archive import (
+    SourceInputError,
+    validate_github_url,
+    validate_source_zip,
+)
+from app.services.upload_staging import UploadTooLarge, copy_upload
 from app.tasks.analysis import process_analysis
 
 UPLOAD_DIR = Path("uploads")
@@ -28,6 +37,8 @@ def upload_file(
     file: Annotated[list[UploadFile], File()],
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_verified_user)],
+    github_url: Annotated[str | None, Form()] = None,
+    source_zip: Annotated[UploadFile | None, File()] = None,
 ):
     """Create one investigation from one or more repeated ``file`` parts."""
     uploads = file if isinstance(file, list) else [file]
@@ -38,12 +49,35 @@ def upload_file(
             detail="At least one diagnostic artifact is required",
         )
 
+    github_url = (github_url or "").strip() or None
+    if github_url and source_zip:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either github_url or source_zip, not both",
+        )
+
     upload_group = uuid.uuid4().hex
     staged_paths: list[Path] = []
     artifact_rows: list[dict[str, object]] = []
     total_bytes = 0
+    source_kind = source_reference = None
 
     try:
+        if github_url:
+            source_kind, source_reference = "github", validate_github_url(github_url)
+        elif source_zip:
+            source_path = UPLOAD_DIR / f"{upload_group}_source.zip"
+            staged_paths.append(source_path)
+            copy_upload(
+                source_zip,
+                source_path,
+                MAX_SOURCE_ARCHIVE_BYTES,
+                "Source ZIP exceeds the configured archive limit",
+                UPLOAD_COPY_CHUNK_BYTES,
+            )
+            validate_source_zip(source_path)
+            source_kind, source_reference = "zip", str(source_path)
+
         for position, upload in enumerate(uploads):
             original_filename = _safe_original_filename(
                 upload.filename,
@@ -51,25 +85,15 @@ def upload_file(
             )
             storage_filename = _safe_storage_filename(original_filename)
             saved_path = UPLOAD_DIR / (f"{upload_group}_{position}_{storage_filename}")
-            artifact_size = 0
-
-            with open(saved_path, "xb") as destination:
-                staged_paths.append(saved_path)
-
-                while True:
-                    chunk = upload.file.read(UPLOAD_COPY_CHUNK_BYTES)
-                    if not chunk:
-                        break
-
-                    if total_bytes + len(chunk) > MAX_INVESTIGATION_UPLOAD_BYTES:
-                        raise HTTPException(
-                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                            detail="Combined diagnostic upload exceeds 1 GiB",
-                        )
-
-                    destination.write(chunk)
-                    artifact_size += len(chunk)
-                    total_bytes += len(chunk)
+            staged_paths.append(saved_path)
+            artifact_size = copy_upload(
+                upload,
+                saved_path,
+                MAX_INVESTIGATION_UPLOAD_BYTES - total_bytes,
+                "Combined diagnostic upload exceeds 1 GiB",
+                UPLOAD_COPY_CHUNK_BYTES,
+            )
+            total_bytes += artifact_size
 
             artifact_rows.append(
                 {
@@ -87,7 +111,15 @@ def upload_file(
             filename=str(first_artifact["original_filename"]),
             saved_file_path=str(first_artifact["saved_file_path"]),
             artifacts=artifact_rows,
+            source_kind=source_kind,
+            source_reference=source_reference,
         )
+    except UploadTooLarge as error:
+        _remove_staged_uploads(staged_paths)
+        raise HTTPException(status_code=413, detail=str(error)) from error
+    except SourceInputError as error:
+        _remove_staged_uploads(staged_paths)
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception:
         _remove_staged_uploads(staged_paths)
         raise

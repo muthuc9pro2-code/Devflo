@@ -66,6 +66,7 @@ class ParsedEvent:
     pod: str | None = None
     source_format: str | None = None
     artifact_id: int | None = None
+    source_matches: list[dict[str, Any]] = field(default_factory=list)
 
 
 def estimate_parsed_event_size_bytes(event: ParsedEvent) -> int:

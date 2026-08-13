@@ -29,6 +29,7 @@ _TEXT_FIELDS = ('trace_id', 'request_id', 'service', 'module', 'endpoint', 'span
 _FIELD_MARKERS = ('trace', 'span', 'request', 'correlation', 'service', 'app', 'component', 'module', 'logger', 'host', 'node', 'container', 'pod', 'status', 'endpoint', 'route', 'path', 'url')
 _SPACE_FIELD_MARKERS = ('trace', 'span', 'request', 'correlation', 'service ', 'module ', 'logger ', 'host ', 'container ', 'pod ', 'status ', 'endpoint ')
 _LEVEL_MARKERS = ('trace', 'debug', 'info', 'notice', 'warn', 'error', 'err', 'severe', 'fatal', 'critical', 'alert', 'emerg')
+_FIELDS, _SPACE_FIELDS, _LEVEL, _EXCEPTION, _HTTP, _FATAL, _TIMESTAMP, _STACK, _SLOW = (1 << bit for bit in range(9))
 _NON_ALNUM_PATTERN = re.compile('[^a-z0-9]')
 
 def normalize_level(value: Any) -> str | None:
@@ -141,35 +142,50 @@ def _parse_stack_frames(raw_text: str) -> list[StackFrame]:
                 frames.append(StackFrame(file=file, line=int(line), function=function or None))
     return frames
 
+def _classify_text(raw_text: str) -> tuple[str, int]:
+    lowered = raw_text.lower()
+    features = (
+        (_FIELDS if any(marker in lowered for marker in _FIELD_MARKERS) else 0)
+        | (_SPACE_FIELDS if any(marker in lowered for marker in _SPACE_FIELD_MARKERS) else 0)
+        | (_LEVEL if any(marker in lowered for marker in _LEVEL_MARKERS) else 0)
+        | (_EXCEPTION if any(marker in lowered for marker in ('error', 'exception', 'failure')) else 0)
+        | (_HTTP if any(marker in lowered for marker in ('get ', 'post ', 'put ', 'patch ', 'delete ', 'head ', 'options ')) else 0)
+        | (_FATAL if any(marker in lowered for marker in ('traceback', 'panic:', 'segmentation fault', 'fatal:')) else 0)
+    )
+    if '-' in raw_text and ':' in raw_text: features |= _TIMESTAMP
+    if '\n' in raw_text or raw_text.lstrip().startswith(('at ', 'File ')): features |= _STACK
+    if 'slow query' in lowered: features |= _SLOW
+    return lowered, features
+
 def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None, defaults: Mapping[str, Any] | None=None) -> ParsedEvent:
     defaults = defaults or {}
-    lower_text = raw_text.lower()
+    lower_text, features = _classify_text(raw_text)
     text_defaults = {key: _as_text(defaults.get(key)) for key in _TEXT_FIELDS} if defaults else {}
     status = _safe_int(defaults.get('http_status'))
     missing = {key for key, value in text_defaults.items() if value is None} if defaults else None
     if missing is not None and status is None:
         missing.add('http_status')
-    fields = _extract_diagnostic_fields(raw_text, lower_text, missing)
-    timestamp_match = TIMESTAMP_PATTERN.search(raw_text) if not defaults.get('timestamp') and '-' in raw_text and ':' in raw_text else None
-    level_match = LOG_LEVEL_PATTERN.search(raw_text) if not defaults.get('level') and any(marker in lower_text for marker in _LEVEL_MARKERS) else None
+    fields = _extract_diagnostic_fields(raw_text, lower_text, missing, features)
+    timestamp_match = TIMESTAMP_PATTERN.search(raw_text) if not defaults.get('timestamp') and features & _TIMESTAMP else None
+    level_match = LOG_LEVEL_PATTERN.search(raw_text) if not defaults.get('level') and features & _LEVEL else None
     exception_type = _as_text(defaults.get('exception_type'))
     exception_message = _as_text(defaults.get('exception_message'))
     exception_match = None
-    if any(marker in lower_text for marker in ('error', 'exception', 'failure')) and (exception_type is None or exception_message is None or not defaults.get('level')):
+    if features & _EXCEPTION and (exception_type is None or exception_message is None or not defaults.get('level')):
         if '\n' in raw_text:
             for exception_match in EXCEPTION_PATTERN.finditer(raw_text):
                 pass
         else:
             exception_match = EXCEPTION_PATTERN.search(raw_text)
     endpoint = fields.get('endpoint')
-    if text_defaults.get('endpoint') is None and endpoint is None and any(marker in lower_text for marker in ('get ', 'post ', 'put ', 'patch ', 'delete ', 'head ', 'options ')):
+    if text_defaults.get('endpoint') is None and endpoint is None and features & _HTTP:
         endpoint = _match_group(HTTP_REQUEST_PATTERN, raw_text)
     if status is None:
         status = _safe_int(fields.get('http_status'))
     level = normalize_level(defaults.get('level') or (level_match.group(1) if level_match else None))
-    if level is None and (exception_match is not None or any((marker in lower_text for marker in ('traceback', 'panic:', 'segmentation fault', 'fatal:')))):
+    if level is None and (exception_match is not None or features & _FATAL):
         level = 'ERROR'
-    elif level is None and 'slow query' in lower_text:
+    elif level is None and features & _SLOW:
         level = 'WARNING'
     elif level is None:
         level = level_from_http_status(status)
@@ -177,7 +193,7 @@ def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | 
         exception_type = exception_type or exception_match.group(1).split('.')[-1]
         exception_message = exception_message or exception_match.group(2)
     stack_frames = []
-    if '\n' in raw_text or raw_text.lstrip().startswith(('at ', 'File ')):
+    if features & _STACK:
         stack_frames = _parse_stack_frames(raw_text)
     return ParsedEvent(line_number=line_number, raw_line=raw_text, timestamp=parse_timestamp(defaults.get('timestamp') or (timestamp_match.group(0) if timestamp_match else None)), level=level, trace_id=text_defaults.get('trace_id') or fields.get('trace_id'), request_id=text_defaults.get('request_id') or fields.get('request_id'), service=text_defaults.get('service') or fields.get('service'), module=text_defaults.get('module') or fields.get('module'), exception_type=exception_type, exception_message=exception_message, stack_frames=stack_frames, endpoint=text_defaults.get('endpoint') or endpoint, http_status=status, source_file=source_file, span_id=text_defaults.get('span_id') or fields.get('span_id'), parent_span_id=text_defaults.get('parent_span_id') or fields.get('parent_span_id'), host=text_defaults.get('host') or fields.get('host'), container=text_defaults.get('container') or fields.get('container'), pod=text_defaults.get('pod') or fields.get('pod'), source_format=source_format)
 
@@ -238,15 +254,16 @@ def _first_value(data: Mapping[str, Any], paths: tuple[tuple[str, ...], ...], ke
             return current
     return None
 
-def _extract_diagnostic_fields(raw_text: str, lowered: str | None=None, wanted: set[str] | None=None) -> dict[str, str]:
+def _extract_diagnostic_fields(raw_text: str, lowered: str | None=None, wanted: set[str] | None=None, features: int | None=None) -> dict[str, str]:
     fields: dict[str, str] = {}
-    lowered = lowered if lowered is not None else raw_text.lower()
+    if features is None:
+        _, features = _classify_text(raw_text)
     if wanted is not None and not wanted:
         return fields
-    if ('=' in raw_text or ':' in raw_text) and any(marker in lowered for marker in _FIELD_MARKERS):
+    if ('=' in raw_text or ':' in raw_text) and features & _FIELDS:
         for match in DIAGNOSTIC_FIELD_PATTERN.finditer(raw_text):
             _store_diagnostic_field(fields, match, wanted)
-    if any(marker in lowered for marker in _SPACE_FIELD_MARKERS):
+    if features & _SPACE_FIELDS:
         for match in SPACE_DIAGNOSTIC_FIELD_PATTERN.finditer(raw_text):
             _store_diagnostic_field(fields, match, wanted)
     return fields

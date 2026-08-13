@@ -1,7 +1,10 @@
 from datetime import datetime
+
 from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from app.db.database import Base
+
 
 class Analysis(Base):
     __tablename__ = "analyses"
@@ -10,6 +13,8 @@ class Analysis(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     saved_file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    source_reference: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(
         Enum("pending", "processing", "completed", "failed", name="analysis_status"),
         default="pending",

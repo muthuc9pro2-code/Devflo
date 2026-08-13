@@ -18,6 +18,8 @@ def test_create_analysis_bulk_adds_artifacts_in_one_transaction():
         user_id=2,
         filename="one.txt",
         saved_file_path="uploads/one.txt",
+        source_kind="zip",
+        source_reference="uploads/sources/source-1",
         artifacts=[
             {
                 "original_filename": "one.txt",
@@ -36,6 +38,8 @@ def test_create_analysis_bulk_adds_artifacts_in_one_transaction():
 
     rows = db.add_all.call_args.args[0]
     assert analysis.id == 13
+    assert analysis.source_kind == "zip"
+    assert analysis.source_reference == "uploads/sources/source-1"
     assert all(isinstance(row, AnalysisArtifact) for row in rows)
     assert [row.position for row in rows] == [0, 1]
     db.commit.assert_called_once()

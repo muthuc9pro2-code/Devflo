@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services import diagnostic_parser
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.diagnostic_parser import (
@@ -69,6 +70,29 @@ def test_generic_plain_application_log():
     assert event.service == "checkout"
     assert event.module == "payments"
     assert event.exception_type == "ValueError"
+
+
+def test_text_normalization_reuses_one_feature_classification(monkeypatch):
+    classify = diagnostic_parser._classify_text
+    calls = []
+
+    def counted(raw_text):
+        calls.append(raw_text)
+        return classify(raw_text)
+
+    monkeypatch.setattr(diagnostic_parser, "_classify_text", counted)
+    event = diagnostic_parser.normalize_text_event(
+        "2026-08-12T10:00:00Z ERROR service=api trace_id=trace-1 "
+        "GET /orders status=503 RuntimeError: failed",
+        1,
+    )
+
+    assert calls == [event.raw_line]
+    assert (event.trace_id, event.endpoint, event.http_status) == (
+        "trace-1",
+        "/orders",
+        503,
+    )
 
 
 def test_generic_parser_preserves_space_separated_identity_fields():

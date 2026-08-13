@@ -35,6 +35,36 @@ def test_newline_free_input_is_split_at_the_record_bound(tmp_path):
     assert [offset for _, offset in records] == [16, 32, 35]
 
 
+@pytest.mark.parametrize(
+    ("artifact_format", "payload", "expected_sizes"),
+    (
+        (ArtifactFormat.GENERIC, "ERROR café\r\nERROR tea\n".encode(), [13, 10]),
+        (ArtifactFormat.JSON, b'\xef\xbb\xbf{"level":"ERROR","message":"caf\xc3\xa9"}\r\n', [40]),
+        (
+            ArtifactFormat.STACK_TRACE,
+            "RuntimeError: café\r\n  at run (/srv/app.js:2:3)\r\n".encode(),
+            [49],
+        ),
+    ),
+)
+def test_artifact_batch_sizes_use_exact_captured_bytes(
+    tmp_path, artifact_format, payload, expected_sizes
+):
+    path = tmp_path / "records.log"
+    path.write_bytes(payload)
+
+    records = list(
+        stream_artifact_events(
+            file_path=str(path),
+            artifact_format=artifact_format,
+            source_file=path.name,
+        )
+    )
+
+    assert [record.batch_size_bytes for record in records] == expected_sizes
+    assert sum(expected_sizes) == len(payload)
+
+
 def test_centralized_batch_defaults_match_phase_one_targets():
     assert MAX_BATCH_BYTES == 10 * 1024 * 1024
     assert MAX_BATCH_ITEMS == 20_000
