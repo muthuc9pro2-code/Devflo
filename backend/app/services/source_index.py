@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.core.processing_config import (
     MAX_SOURCE_CONTEXT_FILE_BYTES,
+    SOURCE_CONTEXT_CACHE_BYTES,
     SOURCE_CONTEXT_LINES,
 )
 
@@ -25,6 +26,40 @@ class SourceIndex:
     by_path: dict[str, SourceFile] = field(default_factory=dict)
     by_suffix: dict[str, list[str]] = field(default_factory=dict)
     by_stem: dict[str, list[str]] = field(default_factory=dict)
+    # Many stack frames across many events routinely point at the same hot
+    # file; without this, each one re-reads and re-splits it from disk.
+    # Bounded by total cached bytes (not entry count) so a handful of large
+    # files can't blow memory even though there's no eviction.
+    _context_cache: dict[Path, list[str] | None] = field(
+        default_factory=dict, repr=False
+    )
+    _context_cache_bytes: int = field(default=0, repr=False)
+
+    def context_lines(self, path: Path) -> list[str] | None:
+        cached = self._context_cache.get(path, _MISSING)
+        if cached is not _MISSING:
+            return cached
+
+        lines: list[str] | None
+        try:
+            size = path.stat().st_size
+            if size > MAX_SOURCE_CONTEXT_FILE_BYTES:
+                lines = None
+            else:
+                lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            lines = None
+
+        if self._context_cache_bytes < SOURCE_CONTEXT_CACHE_BYTES:
+            self._context_cache[path] = lines
+            if lines is not None:
+                self._context_cache_bytes += sum(
+                    len(line.encode("utf-8", errors="replace")) for line in lines
+                )
+        return lines
+
+
+_MISSING = object()
 
 def build_index(root: Path) -> SourceIndex:
     index = SourceIndex(root=root)
@@ -64,7 +99,7 @@ def _match_frame(frame, index: SourceIndex, module: str | None) -> dict | None:
 
 def _build_match(index: SourceIndex, relative_path: str, requested_path: str, frame, method: str) -> dict:
     line_number = getattr(frame, "line", None)
-    snippet, start, end = _read_context(index.root / relative_path, line_number)
+    snippet, start, end = _read_context(index, index.root / relative_path, line_number)
     return {
         "relative_path": relative_path,
         "requested_path": requested_path,
@@ -77,14 +112,11 @@ def _build_match(index: SourceIndex, relative_path: str, requested_path: str, fr
         "confidence": "high" if method == "exact" else "medium",
     }
 
-def _read_context(path: Path, line_number: int | None) -> tuple[str | None, int | None, int | None]:
+def _read_context(index: SourceIndex, path: Path, line_number: int | None) -> tuple[str | None, int | None, int | None]:
     if not line_number or line_number < 1:
         return None, None, None
-    try:
-        if path.stat().st_size > MAX_SOURCE_CONTEXT_FILE_BYTES:
-            return None, None, None
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
+    lines = index.context_lines(path)
+    if lines is None:
         return None, None, None
     start = max(line_number - SOURCE_CONTEXT_LINES, 1)
     end = min(line_number + SOURCE_CONTEXT_LINES, len(lines))

@@ -31,6 +31,13 @@ _SPACE_FIELD_MARKERS = ('trace', 'span', 'request', 'correlation', 'service ', '
 _LEVEL_MARKERS = ('trace', 'debug', 'info', 'notice', 'warn', 'error', 'err', 'severe', 'fatal', 'critical', 'alert', 'emerg')
 _FIELDS, _SPACE_FIELDS, _LEVEL, _EXCEPTION, _HTTP, _FATAL, _TIMESTAMP, _STACK, _SLOW = (1 << bit for bit in range(9))
 _NON_ALNUM_PATTERN = re.compile('[^a-z0-9]')
+_ALL_CANONICAL_FIELD_KEYS = frozenset(FIELD_ALIASES.values())
+# Folds a matched key to the same form FIELD_ALIASES is keyed on (lowercase,
+# '_'/'-' stripped) in a single str.translate() pass instead of
+# .lower().replace('_', '').replace('-', '') (three full-string passes).
+_KEY_FOLD_TABLE = {ord(c): ord(c.lower()) for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'}
+_KEY_FOLD_TABLE[ord('_')] = None
+_KEY_FOLD_TABLE[ord('-')] = None
 
 def normalize_level(value: Any) -> str | None:
     if value is None:
@@ -136,7 +143,7 @@ def _parse_stack_frames(raw_text: str) -> list[StackFrame]:
     frames = []
     if 'File "' in raw_text:
         frames.extend(StackFrame(file=file, line=int(line), function=function) for file, line, function in PYTHON_FRAME_PATTERN.findall(raw_text))
-    if 'at' in raw_text:
+    if ' at ' in raw_text or raw_text.lstrip().startswith('at '):
         for pattern in (NODE_FRAME_PATTERN, JAVA_FRAME_PATTERN):
             for function, file, line in pattern.findall(raw_text):
                 frames.append(StackFrame(file=file, line=int(line), function=function or None))
@@ -152,10 +159,82 @@ def _classify_text(raw_text: str) -> tuple[str, int]:
         | (_HTTP if any(marker in lowered for marker in ('get ', 'post ', 'put ', 'patch ', 'delete ', 'head ', 'options ')) else 0)
         | (_FATAL if any(marker in lowered for marker in ('traceback', 'panic:', 'segmentation fault', 'fatal:')) else 0)
     )
-    if '-' in raw_text and ':' in raw_text: features |= _TIMESTAMP
+    newline_index = raw_text.find('\n')
+    head = raw_text if newline_index == -1 else raw_text[:newline_index]
+
+    if '-' in head and ':' in head:
+        features |= _TIMESTAMP
     if '\n' in raw_text or raw_text.lstrip().startswith(('at ', 'File ')): features |= _STACK
     if 'slow query' in lowered: features |= _SLOW
     return lowered, features
+
+def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None) -> ParsedEvent | None:
+    """Cheap recognizer for single-line 'TIMESTAMP LEVEL key=value ... message' records.
+
+    Structurally confirms the timestamp/level prefix with two short anchored
+    matches instead of the two full-text TIMESTAMP_PATTERN/LOG_LEVEL_PATTERN
+    searches normalize_text_event(..., defaults=None) always pays for, then
+    defers to the exact same field-extraction primitives for everything
+    else. Only ever called where defaults would be empty, so this only needs
+    to reproduce normalize_text_event(raw_text, line_number, defaults={}).
+
+    Returns None whenever equivalence isn't cheaply guaranteed; callers must
+    fall back to normalize_text_event in that case.
+    """
+    if '\n' in raw_text:
+        return None
+
+    ts_token, sep, remainder = raw_text.partition(' ')
+    if not sep:
+        return None
+    level_token, sep, _rest = remainder.partition(' ')
+    if not sep:
+        return None
+
+    ts_match = TIMESTAMP_PATTERN.match(ts_token)
+    if ts_match is None or ts_match.end() != len(ts_token):
+        return None
+
+    level_match = LOG_LEVEL_PATTERN.match(level_token)
+    if level_match is None or level_match.end() != len(level_token):
+        return None
+
+    lower_text, features = _classify_text(raw_text)
+    fields = _extract_diagnostic_fields(raw_text, lower_text, None, features)
+
+    exception_type = None
+    exception_message = None
+    exception_match = EXCEPTION_PATTERN.search(raw_text) if features & _EXCEPTION else None
+    if exception_match is not None:
+        exception_type = exception_match.group(1).split('.')[-1]
+        exception_message = exception_match.group(2)
+
+    endpoint = fields.get('endpoint')
+    if endpoint is None and features & _HTTP:
+        endpoint = _match_group(HTTP_REQUEST_PATTERN, raw_text)
+
+    return ParsedEvent(
+        line_number=line_number,
+        raw_line=raw_text,
+        timestamp=parse_timestamp(ts_token),
+        level=normalize_level(level_token),
+        trace_id=fields.get('trace_id'),
+        request_id=fields.get('request_id'),
+        service=fields.get('service'),
+        module=fields.get('module'),
+        exception_type=exception_type,
+        exception_message=exception_message,
+        stack_frames=[],
+        endpoint=endpoint,
+        http_status=_safe_int(fields.get('http_status')),
+        source_file=source_file,
+        span_id=fields.get('span_id'),
+        parent_span_id=fields.get('parent_span_id'),
+        host=fields.get('host'),
+        container=fields.get('container'),
+        pod=fields.get('pod'),
+        source_format=source_format,
+    )
 
 def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None, defaults: Mapping[str, Any] | None=None) -> ParsedEvent:
     defaults = defaults or {}
@@ -263,13 +342,19 @@ def _extract_diagnostic_fields(raw_text: str, lowered: str | None=None, wanted: 
     if ('=' in raw_text or ':' in raw_text) and features & _FIELDS:
         for match in DIAGNOSTIC_FIELD_PATTERN.finditer(raw_text):
             _store_diagnostic_field(fields, match, wanted)
+    # SPACE_DIAGNOSTIC_FIELD_PATTERN only ever contributes canonical keys the
+    # '='/':' pass above didn't already find (_store_diagnostic_field never
+    # overwrites an existing key), so once every key we could still want is
+    # already present there is nothing left for the second regex pass to add.
     if features & _SPACE_FIELDS:
-        for match in SPACE_DIAGNOSTIC_FIELD_PATTERN.finditer(raw_text):
-            _store_diagnostic_field(fields, match, wanted)
+        still_wanted = _ALL_CANONICAL_FIELD_KEYS if wanted is None else wanted
+        if not still_wanted <= fields.keys():
+            for match in SPACE_DIAGNOSTIC_FIELD_PATTERN.finditer(raw_text):
+                _store_diagnostic_field(fields, match, wanted)
     return fields
 
 def _store_diagnostic_field(fields: dict[str, str], match: re.Match[str], wanted=None) -> None:
-    normalized_key = match.group('key').lower().replace('_', '').replace('-', '')
+    normalized_key = match.group('key').translate(_KEY_FOLD_TABLE)
     canonical_key = FIELD_ALIASES.get(normalized_key)
     if canonical_key is not None and (wanted is None or canonical_key in wanted) and canonical_key not in fields:
         fields[canonical_key] = match.group('value').rstrip('.,;)')

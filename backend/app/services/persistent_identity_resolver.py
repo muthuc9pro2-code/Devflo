@@ -1,7 +1,5 @@
 from dataclasses import dataclass
-
 from app.models import Evidence
-
 
 @dataclass(slots=True)
 class EvidenceIdentity:

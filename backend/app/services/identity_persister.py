@@ -20,7 +20,14 @@ def persist_resolved_identities(
 
     statement = (
         update(Evidence)
-        .where(Evidence.analysis_id == analysis_id)
+        .where(
+            Evidence.analysis_id == analysis_id,
+            # persist_evidence_batch() already resolves identity at insert
+            # time for every row where trace_id/request_id is known; only
+            # rows it left NULL (resolved_identity needs the DB-assigned id,
+            # which doesn't exist before the insert) still need this pass.
+            Evidence.resolved_identity.is_(None),
+        )
         .values(
             resolved_identity=case(
                 (

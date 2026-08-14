@@ -35,14 +35,14 @@ __all__ = [  # noqa: F822 - legacy names are resolved by module __getattr__.
 ]
 
 
-@dataclass
+@dataclass(slots=True)
 class StackFrame:
     file: str | None = None
     line: int | None = None
     function: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class ParsedEvent:
     line_number: int
     raw_line: str

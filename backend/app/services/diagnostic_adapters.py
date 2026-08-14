@@ -10,13 +10,27 @@ from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, JSON_STR
 from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
-from .diagnostic_parser import EXCEPTION_PATTERN, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp
+from .diagnostic_parser import EXCEPTION_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp
 from .log_praser import ParsedEvent
 logger = logging.getLogger(__name__)
 
+if ijson.backend != "yajl2_c":
+    # ijson silently falls back to its pure-Python backend (order of
+    # magnitude slower for JSON/OTel/BROWSER artifacts) whenever the yajl2 C
+    # extension wasn't built at install time - e.g. libyajl2 dev headers
+    # missing from the image `pip install` ran in. That failure is otherwise
+    # invisible until someone notices JSON ingestion is unexpectedly slow.
+    logger.warning(
+        "ijson is using the %r backend instead of the C-accelerated "
+        "yajl2_c backend; JSON/OpenTelemetry/BROWSER artifact ingestion "
+        "will be substantially slower. Install libyajl2 development "
+        "headers before `pip install ijson` to fix this.",
+        ijson.backend,
+    )
+
 @dataclass(slots=True)
 class ArtifactEvent:
-    event: ParsedEvent
+    event: ParsedEvent | None
     end_offset: int
     artifact_line_number: int
     global_end_line_number: int
@@ -192,9 +206,49 @@ def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, sour
         pending = _PendingTextRecord(lines=[line], start_global_line=global_line, end_global_line=global_line, artifact_line_number=local_line, end_offset=end_offset, size_bytes=line_size, multiline_kind=_multiline_kind(artifact_format, line))
     if pending is not None:
         yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
-
+_GENERIC_IMPORTANT_MARKERS = (
+    "warn",
+    "error",
+    "err",
+    "severe",
+    "fatal",
+    "critical",
+    "alert",
+    "emerg",
+    "exception",
+    "failure",
+    "traceback",
+    "panic:",
+    "segmentation fault",
+    "slow query",
+)
+# "status" alone used to be in _GENERIC_IMPORTANT_MARKERS, but every HTTP
+# status code contains that word, so ordinary status=200 records paid for a
+# full normalize just to be discarded. level_from_http_status() only treats
+# >=400 as important, so gate on that same threshold cheaply up front instead
+# of on the word "status" itself.
+_GENERIC_IMPORTANT_STATUS_RE = re.compile(
+    r'(?:http[_-]?)?status(?:[_-]?code)?["\']?[^0-9A-Za-z]{0,3}[45]\d{2}\b',
+    re.IGNORECASE,
+)
+def _generic_text_may_be_important(raw_text: str) -> bool:
+    lowered = raw_text.lower()
+    return any(marker in lowered for marker in _GENERIC_IMPORTANT_MARKERS) or (
+        'status' in lowered and _GENERIC_IMPORTANT_STATUS_RE.search(raw_text) is not None
+    )
 def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: ArtifactFormat, source_file: str) -> ArtifactEvent:
     raw_text = ''.join(record.lines) if record.multiline_kind == 'cri_partial' else '\n'.join(record.lines)
+    if (
+    artifact_format == ArtifactFormat.GENERIC
+    and not _generic_text_may_be_important(raw_text)
+):
+        return ArtifactEvent(
+        event=None,
+        end_offset=record.end_offset,
+        artifact_line_number=record.artifact_line_number,
+        global_end_line_number=record.end_global_line,
+        batch_size_bytes=max(record.size_bytes, 1),
+    )
     if artifact_format == ArtifactFormat.WEB_SERVER:
         event = _normalize_web_event(raw_text, record.start_global_line, source_file)
     elif artifact_format == ArtifactFormat.SYSLOG:
@@ -208,20 +262,24 @@ def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: A
     elif artifact_format == ArtifactFormat.SERVERLESS:
         event = _normalize_serverless_text_event(raw_text, record.start_global_line, source_file)
     else:
-        defaults: dict[str, Any] = {}
-        if artifact_format == ArtifactFormat.CI_CD:
-            lowered = raw_text.lower()
-            if '##[error]' in lowered or 'build failed' in lowered or 'deployment failed' in lowered:
+        event = None
+        if artifact_format == ArtifactFormat.GENERIC:
+            event = fast_path_prefixed_event(raw_text, record.start_global_line, source_file=source_file, source_format=artifact_format.value)
+        if event is None:
+            defaults: dict[str, Any] = {}
+            if artifact_format == ArtifactFormat.CI_CD:
+                lowered = raw_text.lower()
+                if '##[error]' in lowered or 'build failed' in lowered or 'deployment failed' in lowered:
+                    defaults['level'] = 'ERROR'
+                elif '##[warning]' in lowered:
+                    defaults['level'] = 'WARNING'
+            elif artifact_format == ArtifactFormat.DATABASE:
+                lowered = raw_text.lower()
+                if 'slow query' in lowered or 'query_time:' in lowered:
+                    defaults['level'] = 'WARNING'
+            elif artifact_format == ArtifactFormat.STACK_TRACE and record.multiline_kind == 'crash_report':
                 defaults['level'] = 'ERROR'
-            elif '##[warning]' in lowered:
-                defaults['level'] = 'WARNING'
-        elif artifact_format == ArtifactFormat.DATABASE:
-            lowered = raw_text.lower()
-            if 'slow query' in lowered or 'query_time:' in lowered:
-                defaults['level'] = 'WARNING'
-        elif artifact_format == ArtifactFormat.STACK_TRACE and record.multiline_kind == 'crash_report':
-            defaults['level'] = 'ERROR'
-        event = normalize_text_event(raw_text, record.start_global_line, source_file=source_file, source_format=artifact_format.value, defaults=defaults)
+            event = normalize_text_event(raw_text, record.start_global_line, source_file=source_file, source_format=artifact_format.value, defaults=defaults)
     return ArtifactEvent(event=event, end_offset=record.end_offset, artifact_line_number=record.artifact_line_number, global_end_line_number=record.end_global_line, batch_size_bytes=max(record.size_bytes, 1))
 
 def _stream_json_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:

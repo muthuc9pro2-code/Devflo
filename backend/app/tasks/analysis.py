@@ -11,7 +11,6 @@ from app.models import Analysis, AnalysisArtifact
 from app.services import (
     build_exception_fingerprint,
     create_batches,
-    filter_important_events,
     persist_evidence_batch,
     persist_resolved_identities,
     process_persisted_timelines,
@@ -23,6 +22,7 @@ from app.services.source_index import correlate_event
 
 logger = logging.getLogger(__name__)
 
+_IMPORTANT_LEVELS = frozenset({'WARNING', 'WARN', 'ERROR', 'CRITICAL'})
 
 @celery_app.task
 def process_analysis(analysis_id: int):
@@ -209,11 +209,24 @@ def _persist_artifact_batch(
     batch,
     source_index=None,
 ) -> int:
+
+    important_events = []
+    important_append = important_events.append
+
     for record in batch:
         event = record.event
+
+        if event is None:
+            continue
+
         event.artifact_id = artifact.id
 
-    important_events = filter_important_events(record.event for record in batch)
+        if event.level in _IMPORTANT_LEVELS or (
+            event.source_format == "opentelemetry"
+            and (event.trace_id is not None or event.span_id is not None)
+        ):
+            important_append(event)
+        
     _correlate_source_events(important_events, source_index)
     _assign_batch_fingerprints(important_events)
     persist_evidence_batch(
@@ -232,7 +245,8 @@ def _persist_artifact_batch(
     analysis.last_processed_line = last_record.global_end_line_number
     db.commit()
 
-    logger.debug(
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
         "Analysis %s | artifact=%s | processed batch | events=%s | important=%s",
         analysis.id,
         artifact.id,
@@ -317,3 +331,4 @@ def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
     except Exception:
         db.rollback()
         logger.exception("Could not mark analysis %s as failed", analysis_id)
+

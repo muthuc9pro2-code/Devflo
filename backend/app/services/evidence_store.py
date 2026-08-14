@@ -1,10 +1,8 @@
 from collections import defaultdict
 from hashlib import sha256
-
 from sqlalchemy import case, func
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.orm import Session
-
 from app.core.processing_config import MAX_REPRESENTATIVE_LINE_BYTES
 from app.models import AnalysisArtifact, Evidence
 
@@ -68,6 +66,25 @@ def persist_evidence_batch(
 
     for key, fingerprint_events in grouped_events.items():
         fingerprint, trace_id, request_id, span_id, artifact_id = key
+
+        # Trace/request identity is fully determined by fields already in
+        # hand here (same precedence identity_persister.py applies), so
+        # resolve it once at insert time instead of in a second full-table
+        # UPDATE pass afterward. The only case that pass still has to handle
+        # is "neither id present", whose resolved_identity string embeds the
+        # DB-assigned row id and so can't be known before the insert.
+        if trace_id != "__none__":
+            resolved_identity = f"trace:{trace_id}"
+            identity_match_type = "trace_id"
+            identity_strength = 1.0
+        elif request_id != "__none__":
+            resolved_identity = f"request:{request_id}"
+            identity_match_type = "request_id"
+            identity_strength = 0.9
+        else:
+            resolved_identity = None
+            identity_match_type = "unresolved"
+            identity_strength = 0.0
 
         first_event = fingerprint_events[0]
         timestamps = [
@@ -148,6 +165,9 @@ def persist_evidence_batch(
                     fingerprint_events,
                     "source_matches",
                 ),
+                "resolved_identity": resolved_identity,
+                "identity_match_type": identity_match_type,
+                "identity_strength": identity_strength,
                 "first_seen": first_seen,
                 "last_seen": last_seen,
                 "occurrence_count": len(fingerprint_events),

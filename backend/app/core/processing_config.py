@@ -19,5 +19,9 @@ MAX_SOURCE_ARCHIVE_BYTES = 200 * MEBIBYTE
 MAX_SOURCE_TOTAL_BYTES = 500 * MEBIBYTE
 MAX_SOURCE_FILES = 20_000
 MAX_SOURCE_CONTEXT_FILE_BYTES = 5 * MEBIBYTE
+# Total bytes of source-file content correlate_event() will keep cached
+# across an analysis run, so repeated stack frames into the same hot file
+# don't re-read/re-split it from disk each time. Bounded, not evicted.
+SOURCE_CONTEXT_CACHE_BYTES = 32 * MEBIBYTE
 SOURCE_CONTEXT_LINES = 15
 GITHUB_CLONE_TIMEOUT_SECONDS = 30
