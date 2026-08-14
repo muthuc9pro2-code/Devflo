@@ -168,15 +168,30 @@ def _classify_text(raw_text: str) -> tuple[str, int]:
     if 'slow query' in lowered: features |= _SLOW
     return lowered, features
 
-def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None) -> ParsedEvent | None:
-    """Cheap recognizer for single-line 'TIMESTAMP LEVEL key=value ... message' records.
+_SPACED_OPERATOR_RE = re.compile('[=:]\\s|\\s[=:]')
+_HTTP_VERBS = frozenset({'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'})
 
-    Structurally confirms the timestamp/level prefix with two short anchored
+def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None) -> ParsedEvent | None:
+    """True single-pass tokenizer for single-line 'TIMESTAMP LEVEL key=value ...' records.
+
+    Recognizes the timestamp/level prefix structurally (two short anchored
     matches instead of the two full-text TIMESTAMP_PATTERN/LOG_LEVEL_PATTERN
-    searches normalize_text_event(..., defaults=None) always pays for, then
-    defers to the exact same field-extraction primitives for everything
-    else. Only ever called where defaults would be empty, so this only needs
-    to reproduce normalize_text_event(raw_text, line_number, defaults={}).
+    searches normalize_text_event() pays for), then walks the remainder
+    ONCE - split into whitespace-delimited tokens - extracting every field,
+    the exception marker, and the HTTP-verb-derived endpoint in that same
+    traversal. That replaces _classify_text() (a full-line .lower() plus
+    ~50 substring checks) and _extract_diagnostic_fields()'s two whole-line
+    regex passes entirely for this shape.
+
+    Each candidate token is still handed to the real
+    DIAGNOSTIC_FIELD_PATTERN/SPACE_DIAGNOSTIC_FIELD_PATTERN plus the shared
+    _store_diagnostic_field() helper - just scoped to that one short token
+    instead of the whole line - so the character-class-level extraction
+    semantics stay byte-for-byte identical to the full parser; only the
+    traversal that finds candidates changes.
+
+    Only ever called where defaults would be empty, so this only needs to
+    reproduce normalize_text_event(raw_text, line_number, defaults={}).
 
     Returns None whenever equivalence isn't cheaply guaranteed; callers must
     fall back to normalize_text_event in that case.
@@ -187,7 +202,7 @@ def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: st
     ts_token, sep, remainder = raw_text.partition(' ')
     if not sep:
         return None
-    level_token, sep, _rest = remainder.partition(' ')
+    level_token, sep, rest = remainder.partition(' ')
     if not sep:
         return None
 
@@ -199,19 +214,80 @@ def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: st
     if level_match is None or level_match.end() != len(level_token):
         return None
 
-    lower_text, features = _classify_text(raw_text)
-    fields = _extract_diagnostic_fields(raw_text, lower_text, None, features)
+    if _SPACED_OPERATOR_RE.search(rest) is not None:
+        # A '='/':' with whitespace on either side could let a field match
+        # span what we're about to treat as a token boundary (e.g.
+        # "key: value" or "key =value") - the per-token scan below can't see
+        # across that boundary, so hand the whole record to the full parser
+        # instead of risking a field that's there but goes unfound.
+        return None
+
+    tokens = rest.split()
+    n_tokens = len(tokens)
+    fields: dict[str, str] = {}
+    endpoint_from_http = None
+    has_exception_marker = False
+    consumed_as_value = -1
+    # _SPACE_FIELD_MARKERS (the real parser's gate for even attempting
+    # SPACE_DIAGNOSTIC_FIELD_PATTERN) doesn't cover every alias
+    # SPACE_DIAGNOSTIC_FIELD_PATTERN's own alternation supports - e.g. bare
+    # "route"/"path"/"url"/"app"/"component"/"node", or "servicename"/
+    # "containerid"-style compounds, never satisfy it on their own. Folding
+    # a token to a FIELD_ALIASES hit is a superset of that gate, so it's
+    # only a safe pre-filter once also checked against the real gate -
+    # computed at most once per record, only if a candidate token shows up.
+    space_fields_enabled: bool | None = None
+
+    for i, token in enumerate(tokens):
+        if not has_exception_marker:
+            lowered_token = token.lower()
+            if 'error' in lowered_token or 'exception' in lowered_token or 'failure' in lowered_token:
+                has_exception_marker = True
+
+        if i == consumed_as_value:
+            continue
+
+        if '=' in token or ':' in token:
+            for match in DIAGNOSTIC_FIELD_PATTERN.finditer(token):
+                _store_diagnostic_field(fields, match, None)
+            continue
+
+        # Bare "key value" form (no '='/':'): only worth an actual regex
+        # attempt when this token could plausibly BE one of the recognized
+        # field names at all - folding is a strict superset of what
+        # SPACE_DIAGNOSTIC_FIELD_PATTERN's alternation accepts, so this
+        # never skips an attempt the real pattern would have wanted.
+        normalized_key = token.translate(_KEY_FOLD_TABLE)
+        if normalized_key in FIELD_ALIASES and i + 1 < n_tokens:
+            if space_fields_enabled is None:
+                # level_token itself can coincidentally contain a marker
+                # (e.g. level "TRACE" contains the bare 'trace' marker) even
+                # though ts_token structurally never can, so it has to be
+                # included in what gets scanned here too.
+                lowered_scan = f'{level_token} {rest}'.lower()
+                space_fields_enabled = any(
+                    marker in lowered_scan for marker in _SPACE_FIELD_MARKERS
+                )
+            if space_fields_enabled:
+                combined = SPACE_DIAGNOSTIC_FIELD_PATTERN.match(f'{token} {tokens[i + 1]}')
+                if combined is not None:
+                    _store_diagnostic_field(fields, combined, None)
+                    consumed_as_value = i + 1
+                    continue
+
+        if endpoint_from_http is None and i + 1 < n_tokens and token.upper() in _HTTP_VERBS:
+            endpoint_from_http = tokens[i + 1]
 
     exception_type = None
     exception_message = None
-    exception_match = EXCEPTION_PATTERN.search(raw_text) if features & _EXCEPTION else None
+    exception_match = EXCEPTION_PATTERN.search(raw_text) if has_exception_marker else None
     if exception_match is not None:
         exception_type = exception_match.group(1).split('.')[-1]
         exception_message = exception_match.group(2)
 
     endpoint = fields.get('endpoint')
-    if endpoint is None and features & _HTTP:
-        endpoint = _match_group(HTTP_REQUEST_PATTERN, raw_text)
+    if endpoint is None:
+        endpoint = endpoint_from_http
 
     return ParsedEvent(
         line_number=line_number,
