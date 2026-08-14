@@ -2,6 +2,7 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
+from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent, StackFrame
 TIMESTAMP_PATTERN = re.compile('\\b\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:?\\d{2})?\\b')
 LOG_LEVEL_PATTERN = re.compile('(?<![A-Za-z])(TRACE|DEBUG|INFO|NOTICE|WARNING|WARN|ERROR|ERR|SEVERE|FATAL|CRITICAL|ALERT|EMERG(?:ENCY)?)(?![A-Za-z])', re.IGNORECASE)
@@ -312,14 +313,84 @@ def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: st
         source_format=source_format,
     )
 
+def _normalize_fully_defaulted_event(raw_text: str, line_number: int, *, source_file: str | None, source_format: str | None, text_defaults: dict[str, str | None], status: int | None, resolved_level: str, default_timestamp: Any, exception_type: str | None, exception_message: str | None) -> ParsedEvent:
+    if exception_type is None or exception_message is None:
+        lowered_text = raw_text.lower()
+        if 'error' in lowered_text or 'exception' in lowered_text or 'failure' in lowered_text:
+            if '\n' in raw_text:
+                exception_match = None
+                for exception_match in EXCEPTION_PATTERN.finditer(raw_text):
+                    pass
+            else:
+                exception_match = EXCEPTION_PATTERN.search(raw_text)
+            if exception_match is not None:
+                exception_type = exception_type or exception_match.group(1).split('.')[-1]
+                exception_message = exception_message or exception_match.group(2)
+
+    stack_frames = []
+    if '\n' in raw_text or raw_text.lstrip().startswith(('at ', 'File ')):
+        stack_frames = _parse_stack_frames(raw_text)
+
+    return ParsedEvent(
+        line_number=line_number,
+        raw_line=raw_text,
+        timestamp=parse_timestamp(default_timestamp),
+        level=resolved_level,
+        trace_id=text_defaults.get('trace_id'),
+        request_id=text_defaults.get('request_id'),
+        service=text_defaults.get('service'),
+        module=text_defaults.get('module'),
+        exception_type=exception_type,
+        exception_message=exception_message,
+        stack_frames=stack_frames,
+        endpoint=text_defaults.get('endpoint'),
+        http_status=status,
+        source_file=source_file,
+        span_id=text_defaults.get('span_id'),
+        parent_span_id=text_defaults.get('parent_span_id'),
+        host=text_defaults.get('host'),
+        container=text_defaults.get('container'),
+        pod=text_defaults.get('pod'),
+        source_format=source_format,
+    )
+
 def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None, defaults: Mapping[str, Any] | None=None) -> ParsedEvent:
     defaults = defaults or {}
-    lower_text, features = _classify_text(raw_text)
     text_defaults = {key: _as_text(defaults.get(key)) for key in _TEXT_FIELDS} if defaults else {}
     status = _safe_int(defaults.get('http_status'))
     missing = {key for key, value in text_defaults.items() if value is None} if defaults else None
     if missing is not None and status is None:
         missing.add('http_status')
+
+    if defaults and missing is not None and not missing:
+        resolved_level = normalize_level(defaults.get('level')) if defaults.get('level') else None
+        default_timestamp = defaults.get('timestamp')
+        if resolved_level is not None and default_timestamp:
+            # Every _TEXT_FIELDS/http_status value defaults already supplies,
+            # plus a settled timestamp and level: nothing
+            # _extract_diagnostic_fields() could still find is wanted, the
+            # timestamp/level searches are moot (defaults already won them),
+            # and the exception-match guard below is exactly
+            # `exception_type is None or exception_message is None` (its
+            # third clause, `not defaults.get('level')`, is already false) -
+            # so classify_text()'s full lower()+6-marker-group scan and both
+            # DIAGNOSTIC_FIELD_PATTERN passes are all guaranteed no-ops here.
+            # Only stack-frame detection doesn't depend on defaults at all,
+            # and is cheap to check directly without classify_text().
+            return _normalize_fully_defaulted_event(
+                raw_text,
+                line_number,
+                source_file=source_file,
+                source_format=source_format,
+                text_defaults=text_defaults,
+                status=status,
+                resolved_level=resolved_level,
+                default_timestamp=default_timestamp,
+                exception_type=_as_text(defaults.get('exception_type')),
+                exception_message=_as_text(defaults.get('exception_message')),
+            )
+
+    lower_text, features = _classify_text(raw_text)
     fields = _extract_diagnostic_fields(raw_text, lower_text, missing, features)
     timestamp_match = TIMESTAMP_PATTERN.search(raw_text) if not defaults.get('timestamp') and features & _TIMESTAMP else None
     level_match = LOG_LEVEL_PATTERN.search(raw_text) if not defaults.get('level') and features & _LEVEL else None
@@ -381,6 +452,54 @@ def normalize_structured_event(data: Mapping[str, Any], line_number: int, *, sou
     if event.level is None:
         event.level = level_from_http_status(status)
     return event
+
+def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Mapping[str, Any] | None=None) -> bool:
+    """Cheap pre-check mirroring normalize_structured_event()'s level
+    resolution, so a definitely-unimportant structured record (e.g. an
+    ordinary status=200 access-log-style JSON entry) doesn't have to pay for
+    building its full ~15-alias defaults dict and running normalize_text_event
+    on its message just to be discarded a moment later.
+
+    Only returns False when the record is PROVABLY unimportant: an explicit
+    level/severity field resolves to something non-important, or a status
+    code resolves to INFO *and* the message text carries no level word of
+    its own that normalize_text_event would otherwise have picked up instead
+    (the message text always wins over a status-derived level there). Any
+    other shape - no explicit level, no usable status, or an exception
+    already implying ERROR - returns True and the record gets fully parsed,
+    exactly like today.
+    """
+    inherited = inherited or {}
+    key_cache: dict[int, dict[str, Any]] = {}
+
+    def first(*paths: tuple[str, ...]) -> Any:
+        return _first_value(data, paths, key_cache)
+
+    level_value = first(('level',), ('severity',), ('severityText',), ('severity_text',), ('logLevel',), ('levelname',))
+    if level_value is not None:
+        return normalize_level(level_value) in IMPORTANT_LEVELS
+
+    exception_type = first(('exception_type',), ('exception', 'type'), ('error', 'type'), ('error', 'name'))
+    exception_message = first(('exception_message',), ('exceptionMessage',), ('exception', 'message'), ('error', 'message'), ('error',), ('exception',))
+    if _as_text(exception_type) is not None or _as_text(exception_message) is not None:
+        return True
+
+    if first(('stream',)) == 'stderr':
+        return True
+
+    status_text = first(('status',), ('state',))
+    if isinstance(status_text, str) and status_text.lower() in {'warn', 'warning', 'error', 'failed', 'failure', 'fatal', 'critical'}:
+        return True
+
+    status = _safe_int(first(('http_status',), ('status_code',), ('statusCode',), ('http', 'status_code'), ('http', 'response', 'status_code'), ('response', 'status'), ('response', 'statusCode'), ('elb_status_code',), ('target_status_code',), ('status',)))
+    if status is None:
+        return True  # nothing resolved at all - uncertain, fully parse
+    if level_from_http_status(status) in IMPORTANT_LEVELS:
+        return True
+
+    message_value = first(('message',), ('msg',), ('log',), ('@message',), ('body',), ('event', 'message'), ('error', 'message'), ('exception', 'message'))
+    message_text = (_value_text(message_value) or '').lower()
+    return any(marker in message_text for marker in _LEVEL_MARKERS)
 
 def _first_value(data: Mapping[str, Any], paths: tuple[tuple[str, ...], ...], key_cache: dict[int, dict[str, Any]] | None=None) -> Any:
     key_cache = key_cache if key_cache is not None else {}

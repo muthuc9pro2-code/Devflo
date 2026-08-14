@@ -10,7 +10,8 @@ from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, JSON_STR
 from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
-from .diagnostic_parser import EXCEPTION_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp
+from .diagnostic_parser import EXCEPTION_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
+from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ def _stream_cloudfront_events(*, file_path: str, source_file: str, fields: list[
         if len(values) == 1:
             values = line.split()
         data = {key.lower(): value for key, value in zip(fields, values, strict=False)}
-        event = _normalize_cloudfront_event(line, global_line, source_file, data)
+        event = _normalize_cloudfront_event(line, global_line, source_file, data) if _cloudfront_row_may_be_important(data) else None
         yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(record_size, 1))
 
 def _read_cloudfront_fields(file_path: str) -> list[str] | None:
@@ -236,12 +237,59 @@ def _generic_text_may_be_important(raw_text: str) -> bool:
     return any(marker in lowered for marker in _GENERIC_IMPORTANT_MARKERS) or (
         'status' in lowered and _GENERIC_IMPORTANT_STATUS_RE.search(raw_text) is not None
     )
+
+def _ci_cd_may_be_important(raw_text: str) -> bool:
+    lowered = raw_text.lower()
+    return (
+        '##[error]' in lowered
+        or 'build failed' in lowered
+        or 'deployment failed' in lowered
+        or '##[warning]' in lowered
+    )
+
+# Every non-GENERIC text format used to run the full normalize_text_event()
+# classify+extract machinery on 100% of records unconditionally, with no
+# early retention decision at all - GENERIC was the only format that got to
+# skip parsing a record proven unimportant. Phase-1 profiling on
+# representative 10 MiB fixtures per format showed exactly why the other
+# formats were 2-6x slower than GENERIC at equal size even after the
+# tokenizer work: SERVERLESS was ~3% important, CLOUD_GATEWAY ~7%,
+# CONTAINER ~17% (and CONTAINER was the single slowest format measured,
+# ~12.6s), CI_CD ~21%, BROWSER ~22%, WEB_SERVER ~25%, STACK_TRACE ~25%,
+# MESSAGE_BROKER ~29%, JSON ~33%, SYSLOG ~47%. Each gate below reuses the
+# SAME regex/threshold the format's own normalizer already uses to decide
+# level - it does not invent a new notion of "important", it just checks it
+# earlier and cheaper. DATABASE is intentionally excluded: its current
+# semantics mark every "# Time:" slow-query block WARNING unconditionally
+# (see _build_text_artifact_event below), so 100% of its records are already
+# important and a gate would filter nothing.
+def _may_be_important(artifact_format: ArtifactFormat, raw_text: str) -> bool:
+    if artifact_format == ArtifactFormat.GENERIC:
+        return _generic_text_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.WEB_SERVER:
+        return _web_server_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.SYSLOG:
+        return _syslog_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.CONTAINER:
+        return _container_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.CLOUD_GATEWAY:
+        return _cloud_gateway_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.MESSAGE_BROKER:
+        # defaults only ever sets 'service' (see _normalize_message_broker_event
+        # below) - level is always decided from the raw text, exactly like
+        # GENERIC, so the same gate semantics apply unchanged.
+        return _generic_text_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.SERVERLESS:
+        return _serverless_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.CI_CD:
+        return _ci_cd_may_be_important(raw_text)
+    if artifact_format == ArtifactFormat.STACK_TRACE:
+        return _stack_trace_may_be_important(raw_text)
+    return True
+
 def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: ArtifactFormat, source_file: str) -> ArtifactEvent:
     raw_text = ''.join(record.lines) if record.multiline_kind == 'cri_partial' else '\n'.join(record.lines)
-    if (
-    artifact_format == ArtifactFormat.GENERIC
-    and not _generic_text_may_be_important(raw_text)
-):
+    if not _may_be_important(artifact_format, raw_text):
         return ArtifactEvent(
         event=None,
         end_offset=record.end_offset,
@@ -302,10 +350,10 @@ def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, sourc
         try:
             value = json.loads(line)
         except (json.JSONDecodeError, TypeError):
-            event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value)
+            event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
         else:
             data = value if isinstance(value, Mapping) else {'body': value}
-            event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value)
+            event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value) if structured_event_may_be_important(data) else None
         yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(size_bytes, 1))
 
 def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, skip_records: int, start_offset: int, global_line_number: int) -> Iterator[ArtifactEvent]:
@@ -341,7 +389,7 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                 if local_record <= skip_records:
                     continue
                 global_line += 1
-                event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value)
+                event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value) if structured_event_may_be_important(data) else None
                 emitted = True
                 yield ArtifactEvent(event=event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=max(retained_size_bytes, 1))
     except ijson.JSONError:
@@ -376,7 +424,17 @@ def _is_json_lines(file_path: str, artifact_format: ArtifactFormat) -> bool:
     try:
         first_value = json.loads(first_nonempty)
     except json.JSONDecodeError:
-        return len(first_nonempty.encode('utf-8')) >= MAX_DIAGNOSTIC_RECORD_BYTES
+        # The bounded reader force-splits at MAX_DIAGNOSTIC_RECORD_BYTES when
+        # no newline shows up in time, so an unparseable "first line" here is
+        # ambiguous: it could be one truncated fragment of a much larger
+        # compact single JSON document (real HAR/CloudWatch exports commonly
+        # have zero newlines), or a genuinely oversized JSON-lines record.
+        # Guessing JSON-lines used to silently shred the former into garbage
+        # text records. Falling through to document mode instead handles
+        # both correctly: a real document parses as intended, and a single
+        # oversized JSON-lines record is still just one top-level object, so
+        # it's captured whole under ijson's '' top-level prefix.
+        return False
     if not isinstance(first_value, Mapping):
         return False
     if artifact_format == ArtifactFormat.BROWSER:
@@ -478,9 +536,28 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
     if record.multiline_kind == 'language_stack':
         return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')))
     return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')) or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.search(stripped))
+
+def _stack_trace_may_be_important(raw_text: str) -> bool:
+    lowered = raw_text.lower()
+    if 'crash report' in lowered or 'core dumped' in lowered:
+        # _multiline_kind() forces level='ERROR' for these blocks
+        # unconditionally, regardless of whether any other marker is
+        # present - the generic marker set alone isn't a safe proxy here.
+        return True
+    return _generic_text_may_be_important(raw_text)
+
 WEB_ACCESS_RE = re.compile('^(?P<host>\\S+)\\s+\\S+\\s+\\S+\\s+\\[(?P<time>[^\\]]+)\\]\\s+"(?P<method>\\S+)\\s+(?P<endpoint>\\S+)(?:\\s+HTTP/[^\\"]+)?"\\s+(?P<status>\\d{3})\\s+')
 WEB_ERROR_RE = re.compile('^(?P<time>\\d{4}/\\d{2}/\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+\\[(?P<level>[^\\]]+)\\]', re.IGNORECASE)
 APACHE_ERROR_RE = re.compile('^\\[(?P<time>[A-Z][a-z]{2}\\s+[A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?\\s+\\d{4})\\]\\s+\\[[^\\]]*:(?P<level>[^\\]]+)\\]', re.IGNORECASE)
+
+def _web_server_may_be_important(raw_text: str) -> bool:
+    access_match = WEB_ACCESS_RE.search(raw_text)
+    if access_match:
+        return level_from_http_status(int(access_match.group('status'))) in IMPORTANT_LEVELS
+    error_match = WEB_ERROR_RE.search(raw_text) or APACHE_ERROR_RE.search(raw_text)
+    if error_match:
+        return normalize_level(error_match.group('level')) in IMPORTANT_LEVELS
+    return _generic_text_may_be_important(raw_text)
 
 def _normalize_web_event(raw_text: str, line_number: int, source_file: str) -> ParsedEvent:
     access_match = WEB_ACCESS_RE.search(raw_text)
@@ -496,6 +573,12 @@ def _normalize_web_event(raw_text: str, line_number: int, source_file: str) -> P
     return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.WEB_SERVER.value, defaults=defaults)
 SYSLOG_5424_RE = re.compile('^<(?P<pri>\\d{1,3})>\\d+\\s+(?P<time>\\S+)\\s+(?P<host>\\S+)\\s+(?P<app>\\S+)\\s+(?P<proc>\\S+)\\s+(?P<msgid>\\S+)\\s+(?P<body>.*)$')
 SYSLOG_3164_RE = re.compile('^<(?P<pri>\\d{1,3})>(?P<time>[A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?P<host>\\S+)\\s+(?P<app>[^:\\[]+)(?:\\[\\d+\\])?:\\s*(?P<body>.*)$')
+
+def _syslog_may_be_important(raw_text: str) -> bool:
+    match = SYSLOG_5424_RE.search(raw_text) or SYSLOG_3164_RE.search(raw_text)
+    if match:
+        return _syslog_level(int(match.group('pri')) % 8) in IMPORTANT_LEVELS
+    return _generic_text_may_be_important(raw_text)
 
 def _normalize_syslog_event(raw_text: str, line_number: int, source_file: str) -> ParsedEvent:
     match = SYSLOG_5424_RE.search(raw_text) or SYSLOG_3164_RE.search(raw_text)
@@ -516,6 +599,16 @@ def _syslog_level(severity: int) -> str:
     return 'DEBUG'
 CRI_RE = re.compile('^(?P<time>\\S+)\\s+(?P<stream>stdout|stderr)\\s+(?P<flag>[FP])\\s+(?P<body>.*)$', re.DOTALL)
 
+def _container_may_be_important(raw_text: str) -> bool:
+    # CRI's own stream marker is always literally " stderr " between the
+    # timestamp and flag columns when present. _normalize_container_text_event
+    # only inherits level='ERROR' from the stream when the body doesn't
+    # already carry its own explicit level, so stderr isn't a guaranteed
+    # ERROR outcome by itself - just always worth fully parsing to find out.
+    if ' stderr ' in raw_text:
+        return True
+    return _generic_text_may_be_important(raw_text)
+
 def _normalize_container_text_event(raw_text: str, line_number: int, source_file: str) -> ParsedEvent:
     match = CRI_RE.search(raw_text)
     if not match:
@@ -528,6 +621,19 @@ def _normalize_container_text_event(raw_text: str, line_number: int, source_file
         return normalize_text_event(body, line_number, source_file=source_file, source_format=ArtifactFormat.CONTAINER.value, defaults=inherited)
     data = value if isinstance(value, Mapping) else {'body': value}
     return normalize_structured_event(data, line_number, source_file=source_file, source_format=ArtifactFormat.CONTAINER.value, inherited=inherited)
+
+def _cloud_gateway_may_be_important(raw_text: str) -> bool:
+    try:
+        fields = shlex.split(raw_text)
+    except ValueError:
+        fields = []
+    if len(fields) > 12 and fields[0].lower() in {'http', 'https', 'h2', 'grpc', 'grpcs'}:
+        try:
+            status = int(fields[8])
+        except (ValueError, IndexError):
+            return True  # uncertain shape - don't guess, fully parse
+        return level_from_http_status(status) in IMPORTANT_LEVELS
+    return _generic_text_may_be_important(raw_text)
 
 def _normalize_cloud_gateway_event(raw_text: str, line_number: int, source_file: str) -> ParsedEvent:
     defaults: dict[str, Any] = {}
@@ -547,6 +653,16 @@ def _normalize_cloud_gateway_event(raw_text: str, line_number: int, source_file:
         if len(request_parts) >= 2:
             defaults['endpoint'] = request_parts[1]
     return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.CLOUD_GATEWAY.value, defaults=defaults)
+
+def _cloudfront_row_may_be_important(data: Mapping[str, str]) -> bool:
+    status_text = _present_cloudfront_value(data.get('sc-status'))
+    if status_text is None:
+        return True  # no usable status column - uncertain, fully parse
+    try:
+        status = int(status_text)
+    except ValueError:
+        return True
+    return level_from_http_status(status) in IMPORTANT_LEVELS
 
 def _normalize_cloudfront_event(raw_text: str, line_number: int, source_file: str, data: Mapping[str, str]) -> ParsedEvent:
     date = _present_cloudfront_value(data.get('date'))
@@ -585,6 +701,14 @@ def _normalize_message_broker_event(raw_text: str, line_number: int, source_file
         else:
             defaults['service'] = 'message-broker'
     return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.MESSAGE_BROKER.value, defaults=defaults)
+
+def _serverless_may_be_important(raw_text: str) -> bool:
+    if LAMBDA_LIFECYCLE_RE.search(raw_text):
+        return False  # START/END/REPORT lines are always level='INFO'
+    application = LAMBDA_APPLICATION_RE.search(raw_text)
+    if application:
+        return normalize_level(application.group('level')) in IMPORTANT_LEVELS
+    return _generic_text_may_be_important(raw_text)
 
 def _normalize_serverless_text_event(raw_text: str, line_number: int, source_file: str) -> ParsedEvent:
     defaults: dict[str, Any] = {}

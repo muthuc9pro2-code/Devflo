@@ -3,6 +3,7 @@ import { useAuth } from '../context/useAuth'
 import { uploadFiles } from '../api/analysis'
 import { ApiError } from '../api/client'
 import FileDropzone from '../components/FileDropzone'
+import SourceCodeSection from '../components/SourceCodeSection'
 
 function fileKey(file) {
   return `${file.name}-${file.size}-${file.lastModified}`
@@ -11,6 +12,8 @@ function fileKey(file) {
 export default function DashboardPage() {
   const { user, logout } = useAuth()
   const [files, setFiles] = useState([])
+  const [sourceZip, setSourceZip] = useState(null)
+  const [githubUrl, setGithubUrl] = useState('')
   const [uploadState, setUploadState] = useState('idle') // idle | uploading | error | started
   const [errorMessage, setErrorMessage] = useState('')
   const [analysis, setAnalysis] = useState(null)
@@ -40,10 +43,12 @@ export default function DashboardPage() {
     setErrorMessage('')
 
     try {
-      const result = await uploadFiles(files)
+      const result = await uploadFiles(files, { githubUrl, sourceZip })
       setAnalysis(result)
       setUploadState('started')
       setFiles([])
+      setSourceZip(null)
+      setGithubUrl('')
     } catch (err) {
       setUploadState('error')
       setErrorMessage(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
@@ -67,6 +72,15 @@ export default function DashboardPage() {
         <p className="subtitle">Upload diagnostic artifacts to start an investigation.</p>
 
         <FileDropzone files={files} onAddFiles={addFiles} onRemoveFile={removeFile} />
+
+        {files.length > 0 && (
+          <SourceCodeSection
+            sourceZip={sourceZip}
+            onSourceZipChange={setSourceZip}
+            githubUrl={githubUrl}
+            onGithubUrlChange={setGithubUrl}
+          />
+        )}
 
         {errorMessage && <div className="alert-error">{errorMessage}</div>}
 

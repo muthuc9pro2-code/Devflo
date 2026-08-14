@@ -1,0 +1,53 @@
+"""Separate GitHub source acquisition into its two genuinely distinct costs:
+network clone time (not ours to optimize - bounded only by --depth 1 shallow
+clone, already in place) vs local CPU time (build_index, which we already
+optimized and which is the exact same code path ZIP-sourced analyses use).
+
+Usage:
+    .venv/bin/python scripts/bench_github_source.py <https-github-url>
+"""
+from __future__ import annotations
+
+import shutil
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.services.source_archive import _clone_github  # noqa: E402
+from app.services.source_index import build_index  # noqa: E402
+
+SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+DEST = SCRATCH / "github_bench_clone"
+
+
+def main() -> None:
+    url = sys.argv[1] if len(sys.argv) > 1 else "https://github.com/pallets/flask.git"
+
+    if DEST.exists():
+        shutil.rmtree(DEST)
+
+    t0 = time.perf_counter()
+    _clone_github(url, DEST)
+    clone_s = time.perf_counter() - t0
+
+    total_files = sum(1 for _ in DEST.rglob("*") if _.is_file())
+    total_bytes = sum(p.stat().st_size for p in DEST.rglob("*") if p.is_file())
+
+    t0 = time.perf_counter()
+    index = build_index(DEST)
+    index_s = time.perf_counter() - t0
+
+    print(f"url: {url}")
+    print(f"clone (network + git, --depth 1 shallow): {clone_s:.3f}s")
+    print(f"checked-out tree: {total_files} files, {total_bytes:,} bytes")
+    print(f"build_index (local CPU only, same code path as ZIP source): {index_s:.4f}s")
+    print(f"indexed: {len(index.by_path)} files")
+    print(f"local-CPU share of total prep time: {index_s / (clone_s + index_s) * 100:.2f}%")
+
+    shutil.rmtree(DEST)
+
+
+if __name__ == "__main__":
+    main()

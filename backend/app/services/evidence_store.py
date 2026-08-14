@@ -88,11 +88,10 @@ def persist_evidence_batch(
 
         first_event = fingerprint_events[0]
         timestamps = [
-            event.timestamp
+            parsed_timestamp
             for event in fingerprint_events
-            if  event.timestamp is not None
+            if (parsed_timestamp := parse_timestamp(event.timestamp)) is not None
         ]
-        
         first_seen = min(timestamps) if timestamps else None
         last_seen = max(timestamps) if timestamps else None
         first_line_number = min(event.line_number for event in fingerprint_events)

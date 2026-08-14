@@ -85,13 +85,37 @@ def _clone_github(url: str, dest: Path) -> None:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise SourceInputError(f"Could not clone repository: {url}") from error
 
+def _ready_marker(dest: Path) -> Path:
+    return dest.parent / f"{dest.name}.ready"
+
+
 def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
-    """Acquire source into investigation-scoped storage and build its index."""
+    """Acquire source into investigation-scoped storage and build its index.
+
+    Idempotent across a resumed process_analysis run: if this analysis's
+    source was already fully acquired by a prior invocation (ready marker
+    present), skip re-cloning/re-extracting and just rebuild the index.
+    Without this, resuming a GitHub-sourced analysis always fails outright
+    (`git clone` refuses a non-empty destination), and resuming a
+    ZIP-sourced one fails once the staged upload has been deleted after its
+    first successful use. The marker lives beside `dest`, not inside it, so
+    it is never picked up by build_index as a source file.
+    """
     dest = Path(SOURCE_STORAGE_ROOT) / str(analysis_id)
+    marker = _ready_marker(dest)
+    if marker.exists():
+        return build_index(dest)
+
+    if dest.exists():
+        shutil.rmtree(dest)  # stale/partial remnant of a crashed prior attempt
+
     if source_kind == "github":
         _clone_github(source_reference, dest)
     elif source_kind == "zip":
         _extract_zip(Path(source_reference), dest)
     else:
         raise SourceInputError(f"Unsupported source kind: {source_kind}")
+
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
     return build_index(dest)

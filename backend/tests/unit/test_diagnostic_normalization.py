@@ -57,8 +57,14 @@ def normalized_path(path: Path):
         )
     )
     for record in records:
-        assert isinstance(record.event, ParsedEvent)
-        assert CANONICAL_FIELDS <= {item.name for item in fields(record.event)}
+        # A retention gate may have already proven a record can't be
+        # important (e.g. a serverless START/END/REPORT lifecycle line,
+        # which is always level='INFO') and skipped constructing a
+        # ParsedEvent for it entirely - same mechanism GENERIC already used.
+        # Anything it DID construct must still be a real, fully-shaped event.
+        assert record.event is None or isinstance(record.event, ParsedEvent)
+        if record.event is not None:
+            assert CANONICAL_FIELDS <= {item.name for item in fields(record.event)}
     return [record.event for record in records]
 
 
@@ -271,8 +277,10 @@ def test_cloudfront_fields_tsv_normalization_and_safe_resume():
     assert first.event.host == "d111111abcdef8.cloudfront.net"
     assert first.event.endpoint == "/api/orders?order=123"
     assert first.event.timestamp is not None
-    assert second.event.level == "INFO"
-    assert second.event.endpoint == "/health"
+    # sc-status=200 -> level_from_http_status() gives INFO, which is never
+    # important, so the retention gate recognizes that from the sc-status
+    # column alone and skips constructing a ParsedEvent for it entirely.
+    assert second.event is None
 
     resumed = list(
         stream_artifact_events(
@@ -284,7 +292,7 @@ def test_cloudfront_fields_tsv_normalization_and_safe_resume():
             global_line_number=first.global_end_line_number,
         )
     )
-    assert [record.event.request_id for record in resumed] == ["edge-request-2"]
+    assert [record.event for record in resumed] == [None]
     assert resumed[0].artifact_line_number == second.artifact_line_number
     assert resumed[0].global_end_line_number == second.global_end_line_number
     assert resumed[0].end_offset == second.end_offset
@@ -305,16 +313,23 @@ def test_serverless_plain_text_preserves_lambda_request_relationships():
     events = normalized("serverless.txt")
 
     assert len(events) == 4
-    assert all(event.source_format == "serverless" for event in events)
-    assert all(event.request_id == "lambda-request-1" for event in events)
-    assert events[0].service == "aws-lambda"
-    assert events[0].level == "INFO"
+    # START/END/REPORT lifecycle lines are always level='INFO'
+    # (_normalize_serverless_text_event forces it), so the retention gate
+    # recognizes them as definitely unimportant up front and skips
+    # constructing a ParsedEvent for them entirely - the same class of
+    # optimization GENERIC already had for its own unimportant lines.
+    assert events[0] is None  # START RequestId: ...
+    assert events[2] is None  # END RequestId: ...
+    assert events[3] is None  # REPORT RequestId: ...
 
     failure = events[1]
+    assert failure is not None
+    assert failure.source_format == "serverless"
+    assert failure.request_id == "lambda-request-1"
     assert failure.level == "ERROR"
     assert failure.service == "thumbnailer"
     assert failure.exception_type == "RuntimeError"
-    assert filter_important_events(events) == [failure]
+    assert filter_important_events([failure]) == [failure]
 
 
 def test_cloudwatch_document_streams_individual_log_events():

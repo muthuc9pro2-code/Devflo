@@ -80,6 +80,102 @@ def test_zip_traversal_is_rejected(tmp_path, member_name):
         validate_source_zip(archive)
 
 
+def test_extract_zip_rejects_escape_via_preexisting_symlink(tmp_path):
+    """_safe_members() rejects '..'/absolute paths and symlink *entries* in
+    the zip itself, but _extract_zip() has its own realpath-based check for
+    a subtler case: an already-safe-looking relative path (no '..', no
+    leading '/') that walks through a symlink already sitting inside the
+    destination directory and escapes outside it. This is the exact
+    boundary the os.path.realpath() optimization in _extract_zip touches,
+    so it needs its own direct coverage rather than relying on the
+    unrelated validate_source_zip() tests above.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "escape_link").symlink_to(outside, target_is_directory=True)
+
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("escape_link/evil.txt", "payload")
+
+    with pytest.raises(SourceInputError, match="Unsafe path"):
+        source_archive._extract_zip(archive, dest)
+    assert not (outside / "evil.txt").exists()
+
+
+def test_prepare_source_skips_reclone_on_resume_for_github(tmp_path, monkeypatch):
+    """process_analysis can be re-invoked (e.g. after a Celery retry) for an
+    analysis that's still 'processing'. A naive prepare_source would call
+    git clone again on the second invocation, and git clone always refuses
+    a non-empty destination directory - so without idempotency, resuming a
+    GitHub-sourced analysis would fail every time. Simulate that: a clone
+    stub that raises if invoked more than once.
+    """
+    clone_calls = []
+
+    def fake_clone(url, dest):
+        if clone_calls:
+            raise AssertionError("git clone should not be re-invoked on resume")
+        clone_calls.append(url)
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "app").mkdir()
+        (dest / "app" / "main.py").write_text("print('hi')\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    first = prepare_source("github", "https://github.com/acme/project", 42)
+    second = prepare_source("github", "https://github.com/acme/project", 42)
+
+    assert len(clone_calls) == 1
+    assert set(first.by_path) == set(second.by_path) == {"app/main.py"}
+
+
+def test_prepare_source_skips_reextract_on_resume_for_zip_after_upload_deleted(tmp_path, monkeypatch):
+    """The staged upload ZIP is deleted after prepare_source's first
+    successful use (see _remove_staged_source_archive in app.tasks.analysis).
+    A resumed process_analysis run must not need that file to still exist.
+    """
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    archive = tmp_path / "upload.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("app/main.py", "print('hi')\n")
+
+    first = prepare_source("zip", str(archive), 7)
+    archive.unlink()  # simulates _remove_staged_source_archive already having run
+
+    second = prepare_source("zip", str(archive), 7)
+
+    assert set(first.by_path) == set(second.by_path) == {"app/main.py"}
+
+
+def test_prepare_source_discards_partial_dest_from_a_crashed_prior_attempt(tmp_path, monkeypatch):
+    """If a prior process_analysis run crashed mid-clone/mid-extract, dest
+    can be left populated but incomplete, with no ready marker written (the
+    marker is only written after a full success). That must be treated as
+    not-prepared and redone from scratch, not silently reused as if it were
+    the real, complete source tree.
+    """
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    dest = tmp_path / "sources" / "99"
+    dest.mkdir(parents=True)
+    (dest / "partial_garbage.py").write_text("this should not survive")
+
+    def fake_clone(url, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "real.py").write_text("print(1)\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+
+    index = prepare_source("github", "https://github.com/acme/project", 99)
+
+    assert set(index.by_path) == {"real.py"}
+
+
 def test_source_zip_and_github_source_share_one_index_path(tmp_path, monkeypatch):
     archive = tmp_path / "source.zip"
     with zipfile.ZipFile(archive, "w") as zf:

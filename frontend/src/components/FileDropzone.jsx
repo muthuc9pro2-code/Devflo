@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B'
@@ -37,6 +37,22 @@ export default function FileDropzone({ files, onAddFiles, onRemoveFile }) {
     [handleFiles],
   )
 
+  // Lets a user copy files in their OS file manager and paste (Ctrl/Cmd+V)
+  // them straight in, without needing to focus the dropzone first. Scoped to
+  // document so it works regardless of which element has focus, but it's a
+  // no-op unless the clipboard actually carries files - pasting text into
+  // another field (e.g. the GitHub URL input) is unaffected.
+  useEffect(() => {
+    const onPaste = (event) => {
+      const pastedFiles = event.clipboardData?.files
+      if (!pastedFiles || pastedFiles.length === 0) return
+      event.preventDefault()
+      handleFiles(pastedFiles)
+    }
+    document.addEventListener('paste', onPaste)
+    return () => document.removeEventListener('paste', onPaste)
+  }, [handleFiles])
+
   return (
     <div className="dropzone-wrapper">
       <div
@@ -57,7 +73,7 @@ export default function FileDropzone({ files, onAddFiles, onRemoveFile }) {
         <input ref={inputRef} type="file" multiple className="dropzone-input" onChange={onInputChange} />
         <p className="dropzone-title">Drop diagnostic files here</p>
         <p className="dropzone-subtitle">
-          or <span className="link-like">choose files</span>
+          or <span className="link-like">choose files</span>, or paste (Ctrl/Cmd+V)
         </p>
       </div>
 
