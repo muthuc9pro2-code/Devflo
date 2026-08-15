@@ -121,11 +121,11 @@ def stream_otlp_events(*, file_path: str, source_file: str, skip_records: int=0,
                 yield ArtifactEvent(event=canonical_event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=retained_bytes)
                 continue
             if event == 'start_map':
-                kind = _capture_kind(prefix)
+                normalized_prefix = prefix.replace('_', '').lower()
+                kind = _capture_kind(normalized_prefix)
                 if kind is not None:
                     capture = _OtelCapture(kind=kind, prefix=prefix)
                     continue
-                normalized_prefix = prefix.replace('_', '').lower()
                 if normalized_prefix.endswith('resourcelogs.item'):
                     log_resource = {}
                     log_scope = None
@@ -143,8 +143,7 @@ def stream_otlp_events(*, file_path: str, source_file: str, skip_records: int=0,
                 elif 'resourcespans.' in normalized_prefix:
                     span_scope = str(value)
 
-def _capture_kind(prefix: str) -> str | None:
-    normalized = prefix.replace('_', '').lower()
+def _capture_kind(normalized: str) -> str | None:
     if normalized.endswith('resourcelogs.item.resource'):
         return 'log_resource'
     if normalized.endswith('resourcespans.item.resource'):

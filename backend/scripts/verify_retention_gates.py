@@ -53,7 +53,7 @@ FORMAT_FIXTURES = {
 _real_may_be_important = da._may_be_important
 
 
-def _always_important(_artifact_format, _raw_text) -> bool:
+def _always_important(_artifact_format, _raw_text, **_kwargs) -> bool:
     return True
 
 

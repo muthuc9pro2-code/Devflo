@@ -263,7 +263,12 @@ def _ci_cd_may_be_important(raw_text: str) -> bool:
 # semantics mark every "# Time:" slow-query block WARNING unconditionally
 # (see _build_text_artifact_event below), so 100% of its records are already
 # important and a gate would filter nothing.
-def _may_be_important(artifact_format: ArtifactFormat, raw_text: str) -> bool:
+def _may_be_important(
+    artifact_format: ArtifactFormat,
+    raw_text: str,
+    *,
+    cloud_gateway_fields: list[str] | None = None,
+) -> bool:
     if artifact_format == ArtifactFormat.GENERIC:
         return _generic_text_may_be_important(raw_text)
     if artifact_format == ArtifactFormat.WEB_SERVER:
@@ -273,7 +278,10 @@ def _may_be_important(artifact_format: ArtifactFormat, raw_text: str) -> bool:
     if artifact_format == ArtifactFormat.CONTAINER:
         return _container_may_be_important(raw_text)
     if artifact_format == ArtifactFormat.CLOUD_GATEWAY:
-        return _cloud_gateway_may_be_important(raw_text)
+        return _cloud_gateway_may_be_important(
+        raw_text,
+        fields=cloud_gateway_fields,
+    )
     if artifact_format == ArtifactFormat.MESSAGE_BROKER:
         # defaults only ever sets 'service' (see _normalize_message_broker_event
         # below) - level is always decided from the raw text, exactly like
@@ -289,7 +297,16 @@ def _may_be_important(artifact_format: ArtifactFormat, raw_text: str) -> bool:
 
 def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: ArtifactFormat, source_file: str) -> ArtifactEvent:
     raw_text = ''.join(record.lines) if record.multiline_kind == 'cri_partial' else '\n'.join(record.lines)
-    if not _may_be_important(artifact_format, raw_text):
+    cloud_gateway_fields = (
+    _parse_cloud_gateway_fields(raw_text)
+    if artifact_format == ArtifactFormat.CLOUD_GATEWAY
+    else None
+)
+    if not _may_be_important(
+    artifact_format,
+    raw_text,
+    cloud_gateway_fields=cloud_gateway_fields,
+):
         return ArtifactEvent(
         event=None,
         end_offset=record.end_offset,
@@ -304,7 +321,7 @@ def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: A
     elif artifact_format == ArtifactFormat.CONTAINER:
         event = _normalize_container_text_event(raw_text, record.start_global_line, source_file)
     elif artifact_format == ArtifactFormat.CLOUD_GATEWAY:
-        event = _normalize_cloud_gateway_event(raw_text, record.start_global_line, source_file)
+        event = _normalize_cloud_gateway_event(raw_text, record.start_global_line, source_file, fields=cloud_gateway_fields)
     elif artifact_format == ArtifactFormat.MESSAGE_BROKER:
         event = _normalize_message_broker_event(raw_text, record.start_global_line, source_file)
     elif artifact_format == ArtifactFormat.SERVERLESS:
@@ -621,38 +638,72 @@ def _normalize_container_text_event(raw_text: str, line_number: int, source_file
         return normalize_text_event(body, line_number, source_file=source_file, source_format=ArtifactFormat.CONTAINER.value, defaults=inherited)
     data = value if isinstance(value, Mapping) else {'body': value}
     return normalize_structured_event(data, line_number, source_file=source_file, source_format=ArtifactFormat.CONTAINER.value, inherited=inherited)
-
-def _cloud_gateway_may_be_important(raw_text: str) -> bool:
+def _parse_cloud_gateway_fields(raw_text: str) -> list[str] | None:
     try:
         fields = shlex.split(raw_text)
     except ValueError:
-        fields = []
-    if len(fields) > 12 and fields[0].lower() in {'http', 'https', 'h2', 'grpc', 'grpcs'}:
-        try:
-            status = int(fields[8])
-        except (ValueError, IndexError):
-            return True  # uncertain shape - don't guess, fully parse
-        return level_from_http_status(status) in IMPORTANT_LEVELS
-    return _generic_text_may_be_important(raw_text)
+        return None
 
-def _normalize_cloud_gateway_event(raw_text: str, line_number: int, source_file: str) -> ParsedEvent:
+    if (
+        len(fields) > 12
+        and fields[0].lower() in {"http", "https", "h2", "grpc", "grpcs"}
+    ):
+        return fields
+
+    return None
+def _cloud_gateway_may_be_important(
+    raw_text: str,
+    *,
+    fields: list[str] | None = None,
+) -> bool:
+    if fields is None:
+        fields = _parse_cloud_gateway_fields(raw_text)
+
+    if fields is None:
+        return _generic_text_may_be_important(raw_text)
+
+    try:
+        status = int(fields[8])
+    except (ValueError, IndexError):
+        return True
+
+    return level_from_http_status(status) in IMPORTANT_LEVELS
+
+def _normalize_cloud_gateway_event(
+    raw_text: str,
+    line_number: int,
+    source_file: str,
+    *,
+    fields: list[str] | None = None,
+) -> ParsedEvent:
     defaults: dict[str, Any] = {}
-    try:
-        fields = shlex.split(raw_text)
-    except ValueError:
-        fields = []
-    if len(fields) > 12 and fields[0].lower() in {'http', 'https', 'h2', 'grpc', 'grpcs'}:
-        defaults['timestamp'] = fields[1]
+
+    if fields is None:
+        fields = _parse_cloud_gateway_fields(raw_text)
+
+    if fields is not None:
+        defaults["timestamp"] = fields[1]
+
         try:
             status = int(fields[8])
         except (ValueError, IndexError):
             status = None
-        defaults['http_status'] = status
-        defaults['level'] = level_from_http_status(status)
+
+        defaults["http_status"] = status
+        defaults["level"] = level_from_http_status(status)
+
         request_parts = fields[12].split()
+
         if len(request_parts) >= 2:
-            defaults['endpoint'] = request_parts[1]
-    return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.CLOUD_GATEWAY.value, defaults=defaults)
+            defaults["endpoint"] = request_parts[1]
+
+    return normalize_text_event(
+        raw_text,
+        line_number,
+        source_file=source_file,
+        source_format=ArtifactFormat.CLOUD_GATEWAY.value,
+        defaults=defaults,
+    )
 
 def _cloudfront_row_may_be_important(data: Mapping[str, str]) -> bool:
     status_text = _present_cloudfront_value(data.get('sc-status'))

@@ -59,7 +59,15 @@ def process_analysis(analysis_id: int):
                 f"Analysis {analysis_id} has no persisted diagnostic artifacts"
             )
 
+        source_prep_start = perf_counter()
         source_index = _prepare_source_index(analysis)
+        if analysis.source_kind:
+            logger.info(
+                "Analysis %s | source prep (%s) completed in %.2fs",
+                analysis_id,
+                analysis.source_kind,
+                perf_counter() - source_prep_start,
+            )
         for artifact in artifacts:
             if artifact.status == "completed":
                 continue
