@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from app.crud.user import create_user, get_user_by_email, authenticate_user, get_user_by_username
 from app.db.database import get_db
-from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse
+from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse, ForgotPasswordRequest, ResetPasswordRequest
 from app.core.security import (
     create_email_verification_token,
     decode_email_verification_token,
@@ -10,9 +10,10 @@ from app.core.security import (
     create_refresh_token,
 )
 from app.services.email import send_verification_email
+from app.services.email_service import send_ses_email
 from fastapi import Response, Request
 import jwt
-from app.core.security import ALGORITHM, SECRET_KEY
+from app.core.security import ALGORITHM, SECRET_KEY, create_password_reset_token, hash_password, decode_password_reset_token
 from app.models.user import User
 from app.api.dependencies import get_current_verified_user
 
@@ -27,10 +28,24 @@ def register(
     existing_email = get_user_by_email(db, user.email)
 
     if existing_email:
-        raise HTTPException(
+        if existing_email.is_verified:
+            raise HTTPException(
             status_code=409,
-            detail="Email already register",
+            detail="Email already registered"
         )
+
+        verification_token = create_email_verification_token(
+            existing_email.email
+            )
+        send_verification_email(
+            email=existing_email.email,
+            token=verification_token
+            )
+        
+        return {
+            "message": "Verification email resent. Please verify email.",
+            "email": existing_email.email
+            }
 
     existing_user = get_user_by_username(db, user.username)
 
@@ -165,6 +180,69 @@ def refresh_token(request: Request, response: Response, db: Session = Depends(ge
         "message": "Tokens refreshed successfully"
     }
 
+@router.post("/forgot-password")
+def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    user = get_user_by_email(db, request.email)
+
+    if user and user.is_verified:
+        reset_token = create_password_reset_token(user.email)
+
+        reset_url = (
+            f"http://localhost:3000/reset-password?token={reset_token}"
+        )
+
+        send_password_reset_email(
+            to_email=user.email,
+            reset_url=reset_url,
+        )
+
+    return {
+        "message": (
+            "If an account exists for this email, "
+            "a password reset link has been sent."
+        )
+    }
+
+@router.post("/reset-password")
+def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = decode_password_reset_token(request.token)
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired password reset token",
+        )
+
+    email = payload.get("sub")
+
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid password reset token",
+        )
+
+    user = get_user_by_email(db, email)
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid password reset token",
+        )
+
+    user.hashed_password = hash_password(request.new_password)
+
+    db.commit()
+
+    return {
+        "message": "Password reset successfully"
+    }
+
 @router.post("/logout")
 def logout (response: Response):
     response.delete_cookie("access_token")
@@ -179,6 +257,4 @@ def get_me(
     current_user: User = Depends(get_current_verified_user)
 ):
     return current_user
-
-
 

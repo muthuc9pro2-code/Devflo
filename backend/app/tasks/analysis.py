@@ -2,9 +2,7 @@ import logging
 from os.path import getsize
 from pathlib import Path
 from time import perf_counter
-
 from sqlalchemy.orm import Session
-
 from app.core.celery_app import celery_app
 from app.db.database import sessionLocal
 from app.models import Analysis, AnalysisArtifact
@@ -19,6 +17,7 @@ from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.source_archive import prepare_source
 from app.services.source_index import correlate_event
+from app.services.investigation_router import choose_investigation_path, InvestigationPath
 
 logger = logging.getLogger(__name__)
 
@@ -91,24 +90,32 @@ def process_analysis(analysis_id: int):
             analysis_id,
             perf_counter() - ingestion_start,
         )
-
-        identity_start = perf_counter()
-        persist_resolved_identities(db=db, analysis_id=analysis_id)
-        logger.info("Analysis %s | evidence identities resolved", analysis_id)
-        logger.info(
-            "Analysis %s | identity resolution completed in %.2fs",
-            analysis_id,
-            perf_counter() - identity_start,
+        investigation_path = choose_investigation_path(
+            db=db,
+            analysis_id=analysis_id,
         )
-
-        timeline_start = perf_counter()
-        process_persisted_timelines(db=db, analysis_id=analysis_id)
-        logger.info("Analysis %s | persisted timelines processed", analysis_id)
         logger.info(
-            "Analysis %s | timeline processing completed in %.2fs",
+            "Analysis %s | investigation_path=%s",
             analysis_id,
-            perf_counter() - timeline_start,
+            investigation_path.value,
         )
+        if investigation_path == InvestigationPath.CORRELATED:
+            identity_start = perf_counter()
+            persist_resolved_identities(db=db, analysis_id=analysis_id)
+            logger.info("Analysis %s | evidence identities resolved", analysis_id)
+            logger.info(
+                "Analysis %s | identity resolution completed in %.2fs",
+                analysis_id,
+                perf_counter() - identity_start,
+            )
+            timeline_start = perf_counter()
+            process_persisted_timelines(db=db, analysis_id=analysis_id)
+            logger.info("Analysis %s | persisted timelines processed", analysis_id)
+            logger.info(
+                "Analysis %s | timeline processing completed in %.2fs",
+                analysis_id,
+                perf_counter() - timeline_start,
+            )
 
         analysis.status = "completed"
         db.commit()

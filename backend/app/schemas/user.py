@@ -24,6 +24,13 @@ class RegisterResponse(BaseModel):
     message: str
     email: EmailStr
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
 
 
 

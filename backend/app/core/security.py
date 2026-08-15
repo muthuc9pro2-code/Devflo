@@ -1,13 +1,28 @@
 from pwdlib import PasswordHash
 from datetime import datetime, timedelta, UTC
 import jwt
+from app.core.config import Settings
 
 password_hash = PasswordHash.recommended()
 
-SECRET_KEY = "change_this_later"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-REFRESH_TOKEN_EXPIRE_DAYS = 7
+SECRET_KEY = Settings.SECRET_KEY
+ACCESS_TOKEN_EXPIRE_MINUTES = Settings.ACCESS_TOKEN_EXPIRE_MINUTES
+REFRESH_TOKEN_EXPIRE_DAYS = Settings.REFRESH_TOKEN_EXPIRE_DAYS
+
+def create_password_reset_token(email: str) -> str:
+    payload = {
+        "sub": email,
+        "type": "password_reset",
+        "exp": datetime.now(UTC)
+        + timedelta(minutes=Settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
 
 def create_email_verification_token(email: str) -> str:
     payload = {
@@ -64,4 +79,20 @@ def create_refresh_token(email: str) -> str:
         SECRET_KEY,
         algorithm=ALGORITHM
     )
+
+def decode_password_reset_token(token: str) -> dict:
+    payload = jwt.decode(
+        token,
+        SECRET_KEY,
+        algorithms=[ALGORITHM],
+    )
+
+    if payload.get("type") != "password_reset":
+        raise ValueError("Invalid token type")
+
+    return payload
+
+
+def hash_password(plain_password: str) -> str:
+    return password_hash.hash(plain_password)
 
