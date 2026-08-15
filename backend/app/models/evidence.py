@@ -1,5 +1,4 @@
 from datetime import datetime
-
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -14,9 +13,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
-
 from app.db.database import Base
-
 
 class Evidence(Base):
     __tablename__ = "evidence"

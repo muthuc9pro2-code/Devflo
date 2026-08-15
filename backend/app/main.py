@@ -16,9 +16,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("shutting down Devflo API")
 
-
 app = FastAPI(title=Settings.APP_NAME, version=Settings.APP_VERSION, lifespan=lifespan)
-
 app.include_router(health_router)
 app.include_router(auth.router)
 app.include_router(analysis.router)

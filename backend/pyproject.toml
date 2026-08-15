@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.18.5",
+    "boto3>=1.43.72",
     "celery>=5.6.3",
     "email-validator>=2.3.0",
     "fastapi>=0.141.1",
