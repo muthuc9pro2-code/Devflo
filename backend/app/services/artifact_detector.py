@@ -19,6 +19,7 @@ class ArtifactFormat(StrEnum):
     SERVERLESS = 'serverless'
     SYSLOG = 'syslog'
     OPENTELEMETRY = 'opentelemetry'
+    IMAGE = 'image'
 SYSLOG_PATTERN = re.compile('^<\\d{1,3}>(?:\\d+\\s+(?:\\d{4}-\\d{2}-\\d{2}T|-\\s+)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})', re.MULTILINE)
 WEB_ACCESS_PATTERN = re.compile('^\\S+\\s+\\S+\\s+\\S+\\s+\\[[^\\]]+\\]\\s+"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\\s+\\S+\\s+HTTP/\\d(?:\\.\\d)?"\\s+\\d{3}\\s+', re.MULTILINE)
 CRI_PATTERN = re.compile('^\\d{4}-\\d{2}-\\d{2}T\\S+\\s+(?:stdout|stderr)\\s+[FP]\\s+', re.MULTILINE)
@@ -30,6 +31,19 @@ def detect_artifact(file_path: str | Path, *, filename: str | None=None, mime_ty
 def detect_artifact_stream(stream: BinaryIO, *, filename: str | None=None, mime_type: str | None=None, sample_bytes: int=ARTIFACT_DETECTION_SAMPLE_BYTES) -> ArtifactFormat:
     if sample_bytes <= 0:
         raise ValueError('sample_bytes must be positive')
+    normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
+    suffix = Path(filename or "").suffix.lower()
+    if normalized_mime in {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+    } or suffix in {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+    }:
+        return ArtifactFormat.IMAGE
     original_position = stream.tell()
     try:
         sample = stream.read(sample_bytes)

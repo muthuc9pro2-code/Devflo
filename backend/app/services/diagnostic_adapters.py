@@ -13,6 +13,8 @@ from .artifact_detector import ArtifactFormat
 from .diagnostic_parser import EXCEPTION_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
+from app.services.image_text_extractor import extract_text_from_image
+from app.services.ocr_normalizer import normalize_ocr_text
 logger = logging.getLogger(__name__)
 
 if ijson.backend != "yajl2_c":
@@ -97,6 +99,13 @@ class _BoundedStructuredCapture:
         return max(self.captured_bytes, 1)
 
 def stream_artifact_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int=0, start_artifact_line: int=0, global_line_number: int=0) -> Iterator[ArtifactEvent]:
+    if artifact_format == ArtifactFormat.IMAGE:
+        yield from _stream_image_events(
+            file_path=file_path,
+            source_file=source_file,
+            global_line_number=global_line_number,
+        )
+        return
     if artifact_format == ArtifactFormat.OPENTELEMETRY:
         from .otel_adapter import stream_otlp_events
         yield from stream_otlp_events(file_path=file_path, source_file=source_file, skip_records=start_artifact_line, global_line_number=global_line_number)
@@ -110,7 +119,35 @@ def stream_artifact_events(*, file_path: str, artifact_format: ArtifactFormat, s
         yield from _stream_json_events(file_path=file_path, artifact_format=artifact_format, source_file=source_file, start_offset=start_offset, start_artifact_line=start_artifact_line, global_line_number=global_line_number)
         return
     yield from _stream_text_events(file_path=file_path, artifact_format=artifact_format, source_file=source_file, start_offset=start_offset, start_artifact_line=start_artifact_line, global_line_number=global_line_number)
+def _stream_image_events(
+    *,
+    file_path: str,
+    source_file: str,
+    global_line_number: int,
+) -> Iterator[ArtifactEvent]:
+    extracted_text = extract_text_from_image(file_path)
+    normalized_text = normalize_ocr_text(extracted_text)
 
+    if not normalized_text.strip():
+        return
+
+    event = normalize_text_event(
+        raw_text=normalized_text,
+        line_number=global_line_number + 1,
+        source_file=source_file,
+        source_format=ArtifactFormat.IMAGE.value,
+    )
+
+    yield ArtifactEvent(
+        event=event,
+        end_offset=1,
+        artifact_line_number=1,
+        global_end_line_number=global_line_number + 1,
+        batch_size_bytes=max(
+            len(normalized_text.encode("utf-8", errors="replace")),
+            1,
+        ),
+    )
 def _stream_cloudfront_events(*, file_path: str, source_file: str, fields: list[str], start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
     global_line = global_line_number

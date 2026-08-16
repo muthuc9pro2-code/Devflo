@@ -3,9 +3,11 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.evidence import Evidence
 
+
 class InvestigationPath(str, Enum):
     SIMPLE = "simple"
     CORRELATED = "correlated"
+
 
 def choose_investigation_path(
     db: Session,
@@ -35,19 +37,46 @@ def choose_investigation_path(
     if has_parent_child_span:
         return InvestigationPath.CORRELATED
 
-    shared_identity = (
-        db.query(Evidence.resolved_identity)
+    shared_trace = (
+        db.query(Evidence.trace_id)
         .filter(
             Evidence.analysis_id == analysis_id,
-            Evidence.resolved_identity.is_not(None),
-            Evidence.identity_strength > 0,
+            Evidence.trace_id.is_not(None),
         )
-        .group_by(Evidence.resolved_identity)
+        .group_by(Evidence.trace_id)
         .having(func.count(Evidence.id) > 1)
         .first()
     )
 
-    if shared_identity is not None:
+    if shared_trace is not None:
+        return InvestigationPath.CORRELATED
+
+    shared_request = (
+        db.query(Evidence.request_id)
+        .filter(
+            Evidence.analysis_id == analysis_id,
+            Evidence.request_id.is_not(None),
+        )
+        .group_by(Evidence.request_id)
+        .having(func.count(Evidence.id) > 1)
+        .first()
+    )
+
+    if shared_request is not None:
+        return InvestigationPath.CORRELATED
+
+    shared_correlation = (
+        db.query(Evidence.correlation_key)
+        .filter(
+            Evidence.analysis_id == analysis_id,
+            Evidence.correlation_key.is_not(None),
+        )
+        .group_by(Evidence.correlation_key)
+        .having(func.count(Evidence.id) > 1)
+        .first()
+    )
+
+    if shared_correlation is not None:
         return InvestigationPath.CORRELATED
 
     return InvestigationPath.SIMPLE

@@ -5,7 +5,7 @@ celery_app = Celery(
     broker="redis://localhost:6379/0",
     backend="redis://localhost:6379/1",
     include=["app.tasks.analysis",
-             "app.task.user_cleanup"
+             "app.tasks.user_cleanup"
              ]
 )
 
