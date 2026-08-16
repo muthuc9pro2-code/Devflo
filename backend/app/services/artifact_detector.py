@@ -20,6 +20,7 @@ class ArtifactFormat(StrEnum):
     SYSLOG = 'syslog'
     OPENTELEMETRY = 'opentelemetry'
     IMAGE = 'image'
+    UNSUPPORTED = 'unsupported'
 SYSLOG_PATTERN = re.compile('^<\\d{1,3}>(?:\\d+\\s+(?:\\d{4}-\\d{2}-\\d{2}T|-\\s+)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})', re.MULTILINE)
 WEB_ACCESS_PATTERN = re.compile('^\\S+\\s+\\S+\\s+\\S+\\s+\\[[^\\]]+\\]\\s+"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\\s+\\S+\\s+HTTP/\\d(?:\\.\\d)?"\\s+\\d{3}\\s+', re.MULTILINE)
 CRI_PATTERN = re.compile('^\\d{4}-\\d{2}-\\d{2}T\\S+\\s+(?:stdout|stderr)\\s+[FP]\\s+', re.MULTILINE)
@@ -50,6 +51,38 @@ def detect_artifact_stream(stream: BinaryIO, *, filename: str | None=None, mime_
     finally:
         stream.seek(original_position)
     return detect_artifact_sample(sample, filename=filename, mime_type=mime_type)
+
+def is_supported_diagnostic_sample(
+    sample: bytes,
+    *,
+    filename: str | None = None,
+    mime_type: str | None = None,
+) -> bool:
+    suffix = Path(filename or "").suffix.lower()
+    normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
+
+    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        return True
+
+    if normalized_mime in {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+    }:
+        return True
+
+    if not sample:
+        return False
+
+    if b"\x00" in sample:
+        return False
+
+    try:
+        sample.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+
+    return True
 
 def detect_artifact_sample(sample: bytes, *, filename: str | None=None, mime_type: str | None=None) -> ArtifactFormat:
     text = sample.decode('utf-8-sig', errors='replace')

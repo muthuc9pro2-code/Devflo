@@ -1,10 +1,8 @@
 import uuid
 from pathlib import Path
 from typing import Annotated
-
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
-
 from app.api.dependencies import get_current_verified_user
 from app.core.processing_config import (
     MAX_INVESTIGATION_UPLOAD_BYTES,
@@ -21,6 +19,10 @@ from app.services.source_archive import (
     validate_source_zip,
 )
 from app.services.upload_staging import UploadTooLarge, copy_upload
+from app.services.artifact_detector import (
+    detect_artifact_sample,
+    is_supported_diagnostic_sample
+)
 from app.tasks.analysis import process_analysis
 
 UPLOAD_DIR = Path("uploads")
@@ -86,13 +88,32 @@ def upload_file(
             storage_filename = _safe_storage_filename(original_filename)
             saved_path = UPLOAD_DIR / (f"{upload_group}_{position}_{storage_filename}")
             staged_paths.append(saved_path)
-            artifact_size = copy_upload(
+            artifact_size, sample = copy_upload(
                 upload,
                 saved_path,
                 MAX_INVESTIGATION_UPLOAD_BYTES - total_bytes,
                 "Combined diagnostic upload exceeds 1 GiB",
                 UPLOAD_COPY_CHUNK_BYTES,
             )
+
+            if not is_supported_diagnostic_sample(
+                sample,
+                filename=original_filename,
+                mime_type=upload.content_type,
+            ):
+                saved_path.unlink(missing_ok=True)
+
+                raise HTTPException(
+                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                    detail=f"Unsupported diagnostic artifact: {original_filename}",
+                )
+
+            artifact_format = detect_artifact_sample(
+                sample,
+                filename=original_filename,
+                mime_type=upload.content_type,
+            )
+
             total_bytes += artifact_size
 
             artifact_rows.append(
@@ -101,6 +122,7 @@ def upload_file(
                     "saved_file_path": str(saved_path),
                     "content_type": upload.content_type,
                     "size_bytes": artifact_size,
+                    "detected_format": artifact_format.value,
                 }
             )
 

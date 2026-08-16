@@ -1,11 +1,8 @@
 from collections.abc import Mapping, Sequence
 from typing import Any
-
 from sqlalchemy.orm import Session
-
 from app.models.analysis import Analysis
 from app.models.analysis_artifact import AnalysisArtifact
-
 
 def create_analysis(
     db: Session,
@@ -45,6 +42,7 @@ def create_analysis(
                     saved_file_path=str(item["saved_file_path"]),
                     content_type=item.get("content_type"),
                     size_bytes=int(item.get("size_bytes", 0)),
+                    detected_format=item.get("detected_format")
                 )
                 for position, item in enumerate(artifact_rows)
             ]
