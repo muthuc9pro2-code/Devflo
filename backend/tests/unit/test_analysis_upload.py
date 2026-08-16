@@ -158,6 +158,49 @@ def test_source_zip_limit_cleans_all_staged_files(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_unsupported_binary_artifact_is_rejected_before_celery(tmp_path, monkeypatch):
+    create_analysis = Mock()
+    task = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
+
+    binary_content = b"\x00\x01\x02\xffPK\x03\x04random binary payload"
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.upload_file(
+            file=_upload("payload.bin", binary_content),
+            db=Mock(),
+            current_user=SimpleNamespace(id=4),
+        )
+
+    assert error.value.status_code == 415
+    assert "payload.bin" in error.value.detail
+    create_analysis.assert_not_called()
+    task.delay.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_generic_log_with_no_error_in_first_bytes_is_accepted(tmp_path, monkeypatch):
+    create_analysis = Mock(return_value=SimpleNamespace(id=21))
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", Mock())
+
+    # Plenty of ordinary INFO/startup noise up front; the only failure would
+    # show up far later than a bounded detection sample could ever see.
+    content = ("INFO startup ok\n" * 5000).encode() + b"ERROR late failure\n"
+
+    result = analysis_api.upload_file(
+        file=_upload("app.log", content),
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+    )
+
+    assert result.id == 21
+    create_analysis.assert_called_once()
+
+
 def _upload(filename: str, content: bytes):
     return SimpleNamespace(
         filename=filename,
