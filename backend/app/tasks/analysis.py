@@ -19,6 +19,7 @@ from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.source_archive import prepare_source
 from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
+from app.services.correlation_engine import run_correlation
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,26 @@ def process_analysis(analysis_id: int):
                 "Analysis %s | timeline processing completed in %.2fs",
                 analysis_id,
                 perf_counter() - timeline_start,
+            )
+            correlation_start = perf_counter()
+
+            evidence_rows = (
+                db.query(Evidence)
+                .filter(Evidence.analysis_id == analysis_id)
+                .order_by(Evidence.first_seen, Evidence.id)
+                .all()
+            )
+
+            correlation_run = run_correlation(
+                analysis_id=analysis_id,
+                evidence_rows=evidence_rows,
+            )
+
+            logger.info(
+                "Analysis %s | correlation completed | components=%s | in %.2fs",
+                analysis_id,
+                len(correlation_run.result.components),
+                perf_counter() - correlation_start,
             )
 
         analysis.status = "completed"
