@@ -2,10 +2,11 @@ import logging
 from os.path import getsize
 from pathlib import Path
 from time import perf_counter
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.core.celery_app import celery_app
 from app.db.database import sessionLocal
-from app.models import Analysis, AnalysisArtifact
+from app.models import Analysis, AnalysisArtifact, Evidence
 from app.services import (
     build_exception_fingerprint,
     create_batches,
@@ -90,6 +91,28 @@ def process_analysis(analysis_id: int):
             analysis_id,
             perf_counter() - ingestion_start,
         )
+        evidence_count = (
+            db.query(func.count(Evidence.id))
+            .filter(Evidence.analysis_id == analysis_id)
+            .scalar()
+            or 0
+        )
+
+        if evidence_count == 0:
+            analysis.status = "completed"
+            db.commit()
+
+            logger.info(
+                "Analysis %s | no meaningful diagnostic evidence found",
+                analysis_id,
+            )
+            logger.info(
+                "Analysis %s | TOTAL processing time %.2fs",
+                analysis_id,
+                perf_counter() - total_start,
+            )
+            return
+        
         investigation_path = choose_investigation_path(
             db=db,
             analysis_id=analysis_id,

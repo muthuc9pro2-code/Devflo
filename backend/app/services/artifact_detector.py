@@ -21,6 +21,36 @@ class ArtifactFormat(StrEnum):
     OPENTELEMETRY = 'opentelemetry'
     IMAGE = 'image'
     UNSUPPORTED = 'unsupported'
+SUPPORTED_IMAGE_SUFFIXES = frozenset({
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+})
+
+SUPPORTED_TEXT_SUFFIXES = frozenset({
+    ".log",
+    ".txt",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+    ".har",
+    ".out",
+    ".err",
+})
+
+SUPPORTED_TEXT_MIME_TYPES = frozenset({
+    "text/plain",
+    "application/json",
+    "application/x-ndjson",
+    "application/jsonlines",
+})
+
+SUPPORTED_IMAGE_MIME_TYPES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+})
 SYSLOG_PATTERN = re.compile('^<\\d{1,3}>(?:\\d+\\s+(?:\\d{4}-\\d{2}-\\d{2}T|-\\s+)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})', re.MULTILINE)
 WEB_ACCESS_PATTERN = re.compile('^\\S+\\s+\\S+\\s+\\S+\\s+\\[[^\\]]+\\]\\s+"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\\s+\\S+\\s+HTTP/\\d(?:\\.\\d)?"\\s+\\d{3}\\s+', re.MULTILINE)
 CRI_PATTERN = re.compile('^\\d{4}-\\d{2}-\\d{2}T\\S+\\s+(?:stdout|stderr)\\s+[FP]\\s+', re.MULTILINE)
@@ -61,20 +91,19 @@ def is_supported_diagnostic_sample(
     suffix = Path(filename or "").suffix.lower()
     normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
 
-    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+    if (
+        suffix in SUPPORTED_IMAGE_SUFFIXES
+        or normalized_mime in SUPPORTED_IMAGE_MIME_TYPES
+    ):
         return True
 
-    if normalized_mime in {
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-    }:
-        return True
-
-    if not sample:
+    if (
+        suffix not in SUPPORTED_TEXT_SUFFIXES
+        and normalized_mime not in SUPPORTED_TEXT_MIME_TYPES
+    ):
         return False
 
-    if b"\x00" in sample:
+    if not sample or b"\x00" in sample:
         return False
 
     try:
