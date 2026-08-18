@@ -89,6 +89,7 @@ def process_analysis(analysis_id: int):
             analysis_id,
             "ingestion",
             "Diagnostic ingestion started",
+            progress=0,
         )
 
         artifact_ids = [
@@ -322,6 +323,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             analysis_id,
             "ingestion",
             "Evidence extraction completed",
+            progress=99,
         )
 
         evidence_count = (
@@ -349,6 +351,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 "completed",
                 "No meaningful diagnostic evidence found",
+                progress=99,
             )
 
             return
@@ -376,6 +379,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 "identity",
                 "Evidence identity resolution completed",
+                progress=99,
             )
 
             timeline_start = perf_counter()
@@ -390,12 +394,14 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 "timeline",
                 "Timeline reconstruction completed",
+                progress=99,
             )
 
             publish_progress(
                 analysis_id,
                 "correlation",
                 "Correlation analysis started",
+                progress=99,
             )
 
             correlation_start = perf_counter()
@@ -438,6 +444,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 "correlation",
                 "Deterministic correlation completed",
+                progress=99,
             )
 
         analysis.status = "completed"
@@ -496,6 +503,7 @@ def _process_artifact(
 
     parsed_count = 0
     checkpoint_offset = artifact.processed_bytes
+    last_published_progress = -1
 
     records = stream_artifact_events(
         file_path=artifact.saved_file_path,
@@ -515,6 +523,11 @@ def _process_artifact(
             source_index=source_index,
         )
         checkpoint_offset = artifact.processed_bytes
+        last_published_progress = _publish_ingestion_progress(
+            db=db,
+            analysis_id=analysis.id,
+            last_published=last_published_progress,
+        )
 
     actual_size = getsize(artifact.saved_file_path)
     if actual_size != artifact.size_bytes:
@@ -537,6 +550,70 @@ def _process_artifact(
         perf_counter() - artifact_start,
     )
     return parsed_count
+
+
+def _publish_ingestion_progress(
+    *,
+    db: Session,
+    analysis_id: int,
+    last_published: int,
+) -> int:
+    """Aggregate ingestion progress across every artifact of this analysis,
+    derived from the same persisted AnalysisArtifact.processed_bytes/
+    size_bytes checkpoint accounting each batch commit already maintains -
+    not a second, competing progress tracker.
+
+    Safe under Task 1's concurrent artifact tasks: this is a plain read
+    (SUM aggregate), and each concurrent task only ever writes its OWN
+    artifact row (see _persist_artifact_batch), so there is no shared-state
+    read-modify-write race to guard against here.
+
+    Deduplication is deliberately local to this one artifact's processing
+    loop (no new DB column or Redis key): only publishes when the computed
+    integer percentage is a genuine advance over what this call chain has
+    already published, so a single large artifact's many batch commits
+    don't flood the SSE stream with repeated identical percentages. Two
+    concurrently-running artifact tasks (bounded by worker_concurrency)
+    computing the same percentage independently can each publish it once -
+    at most a 2x duplicate, not the unbounded flooding this guards against.
+
+    Clamped to [0, 98]: 99 is reserved for the post-ingestion stage
+    (identity/timeline/correlation), published separately once ingestion
+    for the whole analysis is confirmed complete.
+    """
+    try:
+        totals = (
+            db.query(
+                func.sum(AnalysisArtifact.processed_bytes),
+                func.sum(AnalysisArtifact.size_bytes),
+            )
+            .filter(AnalysisArtifact.analysis_id == analysis_id)
+            .first()
+        )
+        processed_bytes, total_bytes = totals if totals is not None else (None, None)
+    except Exception:
+        logger.debug(
+            "Analysis %s | ingestion progress aggregate query failed",
+            analysis_id,
+            exc_info=True,
+        )
+        return last_published
+
+    if not total_bytes:
+        return last_published
+
+    percentage = min(98, max(0, int((processed_bytes or 0) * 100 // total_bytes)))
+
+    if percentage <= last_published:
+        return last_published
+
+    publish_progress(
+        analysis_id,
+        "ingestion",
+        "Diagnostic ingestion in progress",
+        progress=percentage,
+    )
+    return percentage
 
 
 def _persist_artifact_batch(

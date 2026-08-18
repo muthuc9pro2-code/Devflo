@@ -41,14 +41,20 @@ def publish_progress(
     analysis_id: int,
     stage: str,
     message: str,
+    progress: int | None = None,
 ) -> None:
+    data: dict[str, Any] = {
+        "stage": stage,
+        "message": message,
+    }
+
+    if progress is not None:
+        data["progress"] = progress
+
     publish_analysis_event(
         analysis_id=analysis_id,
         event="progress",
-        data={
-            "stage": stage,
-            "message": message,
-        },
+        data=data,
     )
 
 
