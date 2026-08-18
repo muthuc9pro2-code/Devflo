@@ -91,6 +91,26 @@ def build_correlation_payload(
         "components": components,
     }
 
+def build_simple_llm_context(
+    analysis_id: int,
+    evidence_rows: list[Evidence],
+) -> dict[str, Any]:
+    return {
+        "analysis_id": analysis_id,
+        "investigation_path": "simple",
+        "instruction": (
+            "Explain the available diagnostic evidence and suggest "
+            "debugging/investigation steps. Do not invent evidence "
+            "or claim a definitive fix."
+        ),
+        "evidence": [
+            _evidence_payload(
+                evidence,
+                compact=True,
+            )
+            for evidence in evidence_rows
+        ],
+    }
 
 def build_llm_context(
     correlation_run: CorrelationRun,

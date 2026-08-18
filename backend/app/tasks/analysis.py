@@ -20,6 +20,15 @@ from app.services.source_archive import prepare_source
 from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
 from app.services.correlation_engine import run_correlation
+from app.services.correlation_engine import run_correlation
+from app.services.investigation_context import (
+    build_correlation_payload,
+    build_llm_context,
+)
+from app.services.analysis_events import (
+    publish_correlation_result,
+    publish_progress,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,12 @@ def process_analysis(analysis_id: int):
         total_start = perf_counter()
         analysis.status = "processing"
         db.commit()
+
+        publish_progress(
+            analysis_id,
+            "ingestion",
+            "Diagnostic ingestion started",
+        )
 
         parsed_event_count = 0
         ingestion_start = perf_counter()
@@ -92,6 +107,13 @@ def process_analysis(analysis_id: int):
             analysis_id,
             perf_counter() - ingestion_start,
         )
+
+        publish_progress(
+            analysis_id,
+            "ingestion",
+            "Evidence extraction completed",
+        )
+
         evidence_count = (
             db.query(func.count(Evidence.id))
             .filter(Evidence.analysis_id == analysis_id)
@@ -112,6 +134,13 @@ def process_analysis(analysis_id: int):
                 analysis_id,
                 perf_counter() - total_start,
             )
+
+            publish_progress(
+                analysis_id,
+                "completed",
+                "No meaningful diagnostic evidence found",
+            )
+
             return
         
         investigation_path = choose_investigation_path(
@@ -132,6 +161,13 @@ def process_analysis(analysis_id: int):
                 analysis_id,
                 perf_counter() - identity_start,
             )
+
+            publish_progress(
+                analysis_id,
+                "identity",
+                "Evidence identity resolution completed",
+            )
+
             timeline_start = perf_counter()
             process_persisted_timelines(db=db, analysis_id=analysis_id)
             logger.info("Analysis %s | persisted timelines processed", analysis_id)
@@ -140,6 +176,18 @@ def process_analysis(analysis_id: int):
                 analysis_id,
                 perf_counter() - timeline_start,
             )
+            publish_progress(
+                analysis_id,
+                "timeline",
+                "Timeline reconstruction completed",
+            )
+
+            publish_progress(
+                analysis_id,
+                "correlation",
+                "Correlation analysis started",
+            )
+
             correlation_start = perf_counter()
 
             evidence_rows = (
@@ -154,11 +202,32 @@ def process_analysis(analysis_id: int):
                 evidence_rows=evidence_rows,
             )
 
+            correlation_payload = build_correlation_payload(
+                correlation_run,
+                evidence_rows,
+            )
+
+            llm_context = build_llm_context(
+                correlation_run,
+                evidence_rows,
+            )
+
+            publish_correlation_result(
+                analysis_id,
+                correlation_payload,
+            )
+
             logger.info(
                 "Analysis %s | correlation completed | components=%s | in %.2fs",
                 analysis_id,
                 len(correlation_run.result.components),
                 perf_counter() - correlation_start,
+            )
+
+            publish_progress(
+                analysis_id,
+                "correlation",
+                "Deterministic correlation completed",
             )
 
         analysis.status = "completed"

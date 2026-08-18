@@ -4,7 +4,7 @@ import logging
 from app.core.logger import setup_logging
 from contextlib import asynccontextmanager
 from app.api.v1.health import router as health_router
-from app.api import auth, analysis, image
+from app.api import auth, analysis, image, analysis_stream
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -21,8 +21,11 @@ app.include_router(health_router)
 app.include_router(auth.router)
 app.include_router(analysis.router)
 app.include_router(image.router)
+app.include_router(analysis_stream.router)
 
 @app.get("/")
 def root():
     logger.info("Root endpoint called")
     return {"app": Settings.APP_NAME, "version": Settings.APP_VERSION}
+
+
