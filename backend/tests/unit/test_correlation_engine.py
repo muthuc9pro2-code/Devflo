@@ -2,7 +2,10 @@ from datetime import datetime, timedelta, timezone
 
 from app.models.evidence import Evidence
 from app.services.correlation_engine import (
+    NodeGraphStats,
+    build_correlation_edges,
     build_correlation_indexes,
+    classify_node_role,
     match_correlation_signals,
     match_parent_span,
     run_correlation,
@@ -160,3 +163,173 @@ def test_run_correlation_builds_propagation_dag() -> None:
     assert len(component.nodes) == 3
     assert component.edges
     assert run.root_causes[0]
+
+    # Structural role: derived purely from graph position (incoming/
+    # outgoing edge counts already computed for scoring), not a new
+    # heuristic. database has no upstream edge but leads to payment/api ->
+    # root. api is a dead end everything else leads to -> victim. payment
+    # is both caused-by and a cause-of something else -> propagation.
+    roles = {candidate.node_id: candidate.role for candidate in run.root_causes[0]}
+    assert roles["evidence-1"] == "root"  # database
+    assert roles["evidence-2"] == "propagation"  # payment
+    assert roles["evidence-3"] == "victim"  # api
+
+
+# --- Regression tests: the "__none__" sentinel bug ---------------------
+#
+# evidence_store.py used to persist the literal string "__none__" into the
+# real trace_id/request_id columns for events with no such id (it already
+# converted the same sentinel back to a real NULL for span_id, just missed
+# trace_id/request_id). Since _shared_value() only treats `None` specially
+# ("left is not None and left == right"), two completely unrelated events
+# that both lacked an id would both store trace_id="__none__" and register
+# a perfect TRACE_ID/REQUEST_ID match - reproduced directly against
+# match_correlation_signals() before the fix (score 1.0 for two events
+# months apart, different services, different formats). These tests prove
+# the fix at the correlation-engine boundary: real NULL correctly yields no
+# match, matching real IDs still correlates exactly as before.
+
+
+def test_events_without_trace_id_do_not_trace_match() -> None:
+    left = _evidence(
+        1,
+        source_format="web_server",
+        service="checkout-service",
+        trace_id=None,
+    )
+    right = _evidence(
+        2,
+        source_format="database",
+        service="unrelated-batch-job",
+        trace_id=None,
+    )
+
+    matches = match_correlation_signals(left, right)
+
+    assert not any(match.signal.value == "trace_id" for match in matches)
+
+
+def test_events_without_request_id_do_not_request_match() -> None:
+    left = _evidence(
+        1,
+        source_format="cloud_gateway",
+        service="checkout-service",
+        request_id=None,
+    )
+    right = _evidence(
+        2,
+        source_format="serverless",
+        service="unrelated-batch-job",
+        request_id=None,
+    )
+
+    matches = match_correlation_signals(left, right)
+
+    assert not any(match.signal.value == "request_id" for match in matches)
+
+
+def test_sparse_unrelated_evidence_cannot_receive_a_perfect_correlation() -> None:
+    """Five events, no trace/request/span/resolved_identity anywhere,
+    different services, different formats, days apart (well outside the
+    5s temporal window) and no shared structural field either - the
+    engine must never merge these into one component just because none of
+    them happen to carry an identifier.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = [
+        _evidence(1, source_format="web_server", service="checkout-service", first_seen=base),
+        _evidence(
+            2,
+            source_format="database",
+            service="unrelated-batch-job",
+            first_seen=base + timedelta(hours=4, minutes=30),
+        ),
+        _evidence(
+            3,
+            source_format="syslog",
+            service="auth-service",
+            first_seen=base + timedelta(days=1, hours=3),
+        ),
+        _evidence(
+            4,
+            source_format="ci_cd",
+            service="ci-pipeline",
+            first_seen=base + timedelta(days=2, hours=9),
+        ),
+        _evidence(
+            5,
+            source_format="serverless",
+            service="image-resizer",
+            first_seen=base + timedelta(days=3, hours=22),
+        ),
+    ]
+
+    edges = build_correlation_edges(rows, build_correlation_indexes(rows))
+    assert edges == []
+
+    run = run_correlation(analysis_id=1, evidence_rows=rows)
+    assert len(run.result.components) == 5
+    assert all(len(component.edges) == 0 for component in run.result.components)
+    assert all(len(component.nodes) == 1 for component in run.result.components)
+
+
+def test_real_matching_trace_id_still_correlates_normally() -> None:
+    """The fix must not weaken genuine matching - only remove the false
+    sentinel-based one."""
+    left = _evidence(1, source_format="web_server", trace_id="trace-real-1")
+    right = _evidence(2, source_format="database", trace_id="trace-real-1")
+
+    matches = match_correlation_signals(left, right)
+
+    assert any(
+        match.signal.value == "trace_id" and match.strength.value == 1.0
+        for match in matches
+    )
+
+    edges = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
+    assert len(edges) == 1
+    assert edges[0].score > 0.0
+
+
+def test_classify_node_role_singleton_component_is_uncorrelated() -> None:
+    assert classify_node_role(NodeGraphStats(), component_size=1) == "uncorrelated"
+
+
+def test_classify_node_role_no_edges_in_a_larger_component_is_uncorrelated() -> None:
+    assert (
+        classify_node_role(
+            NodeGraphStats(incoming_count=0, outgoing_count=0),
+            component_size=3,
+        )
+        == "uncorrelated"
+    )
+
+
+def test_classify_node_role_root_has_no_incoming_but_has_outgoing() -> None:
+    assert (
+        classify_node_role(
+            NodeGraphStats(incoming_count=0, outgoing_count=2),
+            component_size=3,
+        )
+        == "root"
+    )
+
+
+def test_classify_node_role_victim_has_incoming_but_no_outgoing() -> None:
+    assert (
+        classify_node_role(
+            NodeGraphStats(incoming_count=2, outgoing_count=0),
+            component_size=3,
+        )
+        == "victim"
+    )
+
+
+def test_classify_node_role_propagation_has_both() -> None:
+    assert (
+        classify_node_role(
+            NodeGraphStats(incoming_count=1, outgoing_count=1),
+            component_size=3,
+        )
+        == "propagation"
+    )

@@ -40,6 +40,12 @@ class CorrelationNode:
     last_seen: datetime | None
     occurrence_count: int = 1
     evidence_ids: list[int] = field(default_factory=list)
+    # Provenance only - build_correlation_nodes() creates exactly one node
+    # per evidence row (evidence_ids is always a single-element list), so
+    # this is unambiguous. Never read by matching/scoring; not correlated
+    # on. Exists so payload/context consumers can show and explain which
+    # uploaded artifact a piece of evidence came from.
+    artifact_id: int | None = None
     trace_id: str | None = None
     request_id: str | None = None
     span_id: str | None = None
@@ -100,6 +106,15 @@ class RootCauseCandidate:
     node_id: str
     score: float
     graph_stats: NodeGraphStats
+    # Structural label derived directly from graph_stats/component size
+    # above - not a new heuristic, not a certainty claim about what "the"
+    # root cause is. score already ranks candidates; role is a
+    # human-readable summary of the same DAG position that ranking uses:
+    # no upstream edge but has downstream edges ("root"), has an upstream
+    # edge but no downstream edges ("victim"), both ("propagation"), or no
+    # edges connecting it to anything else in its component ("uncorrelated"
+    # - includes true singleton components).
+    role: str = "uncorrelated"
 
 @dataclass(slots=True)
 class CorrelationRun:
@@ -570,6 +585,7 @@ def build_correlation_nodes(
                 last_seen=evidence.last_seen,
                 occurrence_count=evidence.occurrence_count,
                 evidence_ids=[evidence.id],
+                artifact_id=evidence.artifact_id,
                 trace_id=evidence.trace_id,
                 request_id=evidence.request_id,
                 span_id=evidence.span_id,
@@ -901,6 +917,20 @@ def temporal_origin_score(
         1.0 - (offset_ms / total_ms),
     )
 
+def classify_node_role(
+    stats: NodeGraphStats,
+    component_size: int,
+) -> str:
+    if component_size <= 1:
+        return "uncorrelated"
+    if stats.incoming_count == 0 and stats.outgoing_count == 0:
+        return "uncorrelated"
+    if stats.incoming_count == 0:
+        return "root"
+    if stats.outgoing_count == 0:
+        return "victim"
+    return "propagation"
+
 def rank_root_causes(
     component: CorrelationComponent,
     evidence_by_id: dict[int, Evidence],
@@ -909,6 +939,7 @@ def rank_root_causes(
         component.nodes,
         component.edges,
     )
+    component_size = len(component.nodes)
 
     candidates = [
         RootCauseCandidate(
@@ -920,6 +951,7 @@ def rank_root_causes(
                 evidence_by_id,
             ),
             graph_stats=stats[node.id],
+            role=classify_node_role(stats[node.id], component_size),
         )
         for node in component.nodes
     ]

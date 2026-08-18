@@ -115,8 +115,25 @@ def persist_evidence_batch(
                     _first_present(fingerprint_events, "level"),
                     50,
                 ),
-                "trace_id": _bounded_text(trace_id, 255),
-                "request_id": _bounded_text(request_id, 255),
+                # "__none__" is a real value ONLY for the internal grouping
+                # key and correlation_key hash above (both need a stable,
+                # hashable placeholder distinguishing "genuinely missing"
+                # from an id that happens to collide across events). It must
+                # never reach the stored column: a real NULL means
+                # correlation_engine.py's index-building code
+                # (build_correlation_indexes/_shared_value) correctly skips
+                # it, whereas the literal string "__none__" is a non-None
+                # value that looks like a real shared identifier - it
+                # would trace-match/request-match any two otherwise-
+                # unrelated events that both lack an id.
+                "trace_id": _bounded_text(
+                    None if trace_id == "__none__" else trace_id,
+                    255,
+                ),
+                "request_id": _bounded_text(
+                    None if request_id == "__none__" else request_id,
+                    255,
+                ),
                 "span_id": _bounded_text(
                     None if span_id == "__none__" else span_id,
                     255,

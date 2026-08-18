@@ -68,8 +68,15 @@ def register(
 
 
 @router.get("/verify-email")
-def verify_email(token: str, db: Session = Depends(get_db)):
-    payload = decode_email_verification_token(token)
+def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
+    try:
+        payload = decode_email_verification_token(token)
+    except (jwt.PyJWTError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired verification link",
+        )
+
     email = payload["sub"]
 
     user = get_user_by_email(db, email)
@@ -77,12 +84,33 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if user.is_verified:
-        return {"message": "Email already verified"}
+    if not user.is_verified:
+        user.is_verified = True
+        db.commit()
 
-    user.is_verified = True
+    # Same cookie/token mechanism as /auth/login, so a successful
+    # verification leaves the user in the same authenticated state a normal
+    # login would - no separate auth system, no token in the redirect URL.
+    access_token = create_access_token(user.email)
+    refresh_token = create_refresh_token(user.email)
 
-    db.commit()
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=30 * 60,
+    )
+
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60,
+    )
 
     return {"message": "Email verified successfully"}
 

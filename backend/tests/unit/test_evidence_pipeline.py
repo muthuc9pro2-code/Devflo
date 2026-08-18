@@ -43,6 +43,83 @@ def test_evidence_batch_remains_one_bulk_upsert():
     assert len(rows) == 2
 
 
+def test_missing_trace_request_span_ids_persist_as_real_null_not_sentinel():
+    """Regression test: the internal "__none__" grouping/correlation_key
+    sentinel must never leak into the stored trace_id/request_id/span_id
+    columns - correlation_engine.py treats any non-None value as a real
+    shared identifier, so two unrelated events that both lack an id would
+    otherwise falsely trace-match/request-match each other.
+    """
+    db = Mock()
+    events = [
+        ParsedEvent(
+            line_number=1,
+            raw_line="ERROR unrelated failure A",
+            level="ERROR",
+            fingerprint="fp-a",
+            service="checkout-service",
+            artifact_id=7,
+        ),
+        ParsedEvent(
+            line_number=2,
+            raw_line="ERROR unrelated failure B",
+            level="ERROR",
+            fingerprint="fp-b",
+            service="unrelated-batch-job",
+            artifact_id=7,
+        ),
+    ]
+
+    persist_evidence_batch(db=db, analysis_id=3, events=events)
+
+    _, rows = db.execute.call_args.args
+    assert len(rows) == 2
+    for row in rows:
+        assert row["trace_id"] is None
+        assert row["request_id"] is None
+        assert row["span_id"] is None
+        # correlation_key is still a real, present hash - the sentinel is
+        # legitimately used internally for that, not stored as an id.
+        assert row["correlation_key"]
+
+
+def test_missing_ids_still_group_separately_by_fingerprint():
+    """The internal sentinel is still legitimately needed so that two
+    different-fingerprint, both-untraced events don't collapse into one
+    grouped row - only the stored id columns must be real NULL."""
+    db = Mock()
+    events = [
+        ParsedEvent(line_number=1, raw_line="ERROR A", level="ERROR", fingerprint="fp-a", artifact_id=7),
+        ParsedEvent(line_number=2, raw_line="ERROR B", level="ERROR", fingerprint="fp-b", artifact_id=7),
+    ]
+
+    persist_evidence_batch(db=db, analysis_id=3, events=events)
+
+    _, rows = db.execute.call_args.args
+    assert {row["fingerprint"] for row in rows} == {"fp-a", "fp-b"}
+    assert len(rows) == 2
+
+
+def test_real_trace_id_is_still_persisted_and_resolved():
+    db = Mock()
+    events = [
+        ParsedEvent(
+            line_number=1,
+            raw_line="ERROR real trace",
+            level="ERROR",
+            fingerprint="fp",
+            trace_id="trace-real-1",
+            artifact_id=7,
+        )
+    ]
+
+    persist_evidence_batch(db=db, analysis_id=3, events=events)
+
+    _, rows = db.execute.call_args.args
+    assert rows[0]["trace_id"] == "trace-real-1"
+    assert rows[0]["resolved_identity"] == "trace:trace-real-1"
+
+
 def test_evidence_artifact_foreign_key_is_scoped_to_the_analysis():
     foreign_keys = [
         constraint

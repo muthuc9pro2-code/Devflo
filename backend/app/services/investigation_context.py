@@ -34,6 +34,7 @@ def build_correlation_payload(
             nodes.append(
                 {
                     "id": node.id,
+                    "artifact_id": node.artifact_id,
                     "service": node.service,
                     "fingerprint": node.fingerprint,
                     "first_seen": (
@@ -66,6 +67,7 @@ def build_correlation_payload(
                     {
                         "node_id": candidate.node_id,
                         "score": round(candidate.score, 4),
+                        "role": candidate.role,
                     }
                     for candidate in root_candidates
                 ],
@@ -156,6 +158,7 @@ def build_llm_context(
                             candidate.score,
                             4,
                         ),
+                        "role": candidate.role,
                     }
                     for candidate in root_candidates
                 ],
@@ -201,6 +204,7 @@ def _evidence_payload(
 ) -> dict[str, Any]:
     payload = {
         "id": evidence.id,
+        "artifact_id": evidence.artifact_id,
         "event_type": evidence.event_type,
         "severity": evidence.severity,
         "service": evidence.service,
