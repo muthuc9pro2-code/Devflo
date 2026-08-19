@@ -415,6 +415,73 @@ def score_candidate_pair(
 
     return score, delta_ms, matches
 
+# Same structural-relatedness definition has_structural_match() already
+# uses downstream (deliberately excludes HTTP_STATUS - see that function -
+# and TRACE_ID/REQUEST_ID/RESOLVED_IDENTITY, which never reach this path at
+# all: iter_temporal_candidates() below excludes any pair already sharing
+# one of those before the adaptive window is even considered). Named once
+# here so the temporal-fallback window and has_structural_match's own
+# filter can never silently drift apart from each other.
+_STRUCTURAL_SIGNALS = frozenset({
+    CorrelationSignal.SERVICE,
+    CorrelationSignal.MODULE,
+    CorrelationSignal.HOST,
+    CorrelationSignal.CONTAINER,
+    CorrelationSignal.POD,
+    CorrelationSignal.ENDPOINT,
+    CorrelationSignal.EXCEPTION,
+    CorrelationSignal.FINGERPRINT,
+})
+
+# Small, explicit, deterministic tiers for the temporal FALLBACK window
+# only - identity-based matching (trace_id/request_id/resolved_identity/
+# parent_span) never goes through this path (see the exclusion checks in
+# iter_temporal_candidates below) and is completely unaffected. These reuse
+# the existing SignalStrength tier boundaries (FORMAT_SIGNAL_PRIORITY's own
+# VERY_HIGH/HIGH/MEDIUM/LOW, already format-calibrated by _pair_strength)
+# instead of inventing a second scoring scale - they just map the
+# strongest real structural signal a candidate pair shares onto a time
+# budget instead of a match-score multiplier. Not learned/tunable.
+_TEMPORAL_WINDOW_STRONG_MS = 5000.0  # VERY_HIGH/HIGH strongest structural signal
+_TEMPORAL_WINDOW_MEDIUM_MS = 2500.0  # MEDIUM strongest structural signal
+_TEMPORAL_WINDOW_WEAK_MS = 1000.0    # LOW strongest structural signal
+_TEMPORAL_WINDOW_NONE_MS = 0.0       # no structural signal at all - reject outright
+
+
+def _adaptive_temporal_window_ms(
+    candidate: Evidence,
+    evidence: Evidence,
+    max_window_ms: float,
+) -> float:
+    """How much timestamp separation this specific pair may tolerate as a
+    temporal-fallback candidate. Reuses match_correlation_signals() (the
+    same function has_structural_match()/score_candidate_pair() already
+    call) purely to read the strongest REAL structural signal strength the
+    pair already shares - it does not itself decide correlation, and its
+    result never exceeds max_window_ms (the existing absolute cap)."""
+    matches = match_correlation_signals(candidate, evidence)
+
+    strongest = max(
+        (
+            match.strength.value
+            for match in matches
+            if match.signal in _STRUCTURAL_SIGNALS
+        ),
+        default=None,
+    )
+
+    if strongest is None:
+        window_ms = _TEMPORAL_WINDOW_NONE_MS
+    elif strongest >= SignalStrength.HIGH.value:
+        window_ms = _TEMPORAL_WINDOW_STRONG_MS
+    elif strongest >= SignalStrength.MEDIUM.value:
+        window_ms = _TEMPORAL_WINDOW_MEDIUM_MS
+    else:
+        window_ms = _TEMPORAL_WINDOW_WEAK_MS
+
+    return min(window_ms, max_window_ms)
+
+
 def iter_temporal_candidates(
     evidence_rows: list[Evidence],
     window_ms: float = 5000.0,
@@ -441,6 +508,12 @@ def iter_temporal_candidates(
 
             left += 1
 
+        # left/right still bound the search space by the fixed,
+        # unmodified max window (unchanged two-pointer sliding-window
+        # behavior, still O(n) amortized - no all-pairs scan). Within that
+        # already-bounded range, each individual pair additionally has to
+        # clear its OWN adaptive window below - a strictly narrower,
+        # per-pair filter layered on top, never a wider one.
         for index in range(left, right):
             candidate = ordered[index]
 
@@ -463,27 +536,29 @@ def iter_temporal_candidates(
             ):
                 continue
 
+            pair_delta_ms = (
+                evidence.first_seen - candidate.first_seen
+            ).total_seconds() * 1000.0
+
+            adaptive_window_ms = _adaptive_temporal_window_ms(
+                candidate,
+                evidence,
+                window_ms,
+            )
+
+            if pair_delta_ms > adaptive_window_ms:
+                continue
+
             yield candidate, evidence
 
 def has_structural_match(
     left: Evidence,
     right: Evidence,
 ) -> bool:
-    structural_signals = {
-        CorrelationSignal.SERVICE,
-        CorrelationSignal.MODULE,
-        CorrelationSignal.HOST,
-        CorrelationSignal.CONTAINER,
-        CorrelationSignal.POD,
-        CorrelationSignal.ENDPOINT,
-        CorrelationSignal.EXCEPTION,
-        CorrelationSignal.FINGERPRINT,
-    }
-
     matches = match_correlation_signals(left, right)
 
     return any(
-        match.signal in structural_signals
+        match.signal in _STRUCTURAL_SIGNALS
         for match in matches
     )
 

@@ -11,6 +11,7 @@ _NO_EVIDENCE_MESSAGE = (
     "No meaningful diagnostic evidence was extracted from this artifact."
 )
 _NO_EVIDENCE_ANALYSIS_MESSAGE = "No meaningful diagnostic evidence found"
+_UNSUPPORTED_MESSAGE = "This file type is not supported for diagnostic analysis."
 
 
 def _count_evidence_by_artifact(evidence_rows: list[Evidence]) -> dict[int, int]:
@@ -24,10 +25,17 @@ def _artifacts_outcome_list(
     artifacts: list[Any],
     evidence_counts_by_artifact: dict[int, int],
 ) -> list[dict[str, Any]]:
+    # The same already-fetched artifacts list already contains the
+    # canonical artifact a duplicate points to, so its filename can be
+    # resolved here with no extra query.
+    filename_by_artifact_id = {
+        artifact.id: artifact.original_filename for artifact in artifacts
+    }
     return [
-        _artifact_outcome_payload(
+        build_artifact_outcome_payload(
             artifact,
             evidence_counts_by_artifact.get(artifact.id, 0),
+            filename_by_artifact_id,
         )
         for artifact in artifacts
     ]
@@ -386,7 +394,49 @@ def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
     }
 
 
-def _artifact_outcome_payload(artifact: Any, evidence_count: int) -> dict[str, Any]:
+def build_artifact_outcome_payload(
+    artifact: Any,
+    evidence_count: int,
+    filename_by_artifact_id: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    status = artifact.status
+
+    if status == "unsupported":
+        # Genuinely unsupported by the existing artifact-format policy
+        # (rejected before ingestion, at upload time) - distinct from a
+        # supported artifact that simply retained zero evidence.
+        return {
+            "artifact_id": artifact.id,
+            "source_file": artifact.original_filename,
+            "source_format": artifact.detected_format,
+            "evidence_count": 0,
+            "status": "unsupported",
+            "message": _UNSUPPORTED_MESSAGE,
+        }
+
+    duplicate_of_artifact_id = getattr(artifact, "duplicate_of_artifact_id", None)
+
+    if status == "duplicate" and duplicate_of_artifact_id is not None:
+        duplicate_of_source_file = (filename_by_artifact_id or {}).get(
+            duplicate_of_artifact_id
+        )
+        return {
+            "artifact_id": artifact.id,
+            "source_file": artifact.original_filename,
+            "source_format": artifact.detected_format,
+            "evidence_count": 0,
+            "status": "duplicate",
+            "duplicate_of_artifact_id": duplicate_of_artifact_id,
+            "duplicate_of_source_file": duplicate_of_source_file,
+            "message": (
+                f"Duplicate of {duplicate_of_source_file}; not processed "
+                "as independent evidence."
+                if duplicate_of_source_file
+                else "Duplicate of another uploaded artifact; not "
+                "processed as independent evidence."
+            ),
+        }
+
     payload: dict[str, Any] = {
         "artifact_id": artifact.id,
         "source_file": artifact.original_filename,
@@ -396,7 +446,7 @@ def _artifact_outcome_payload(artifact: Any, evidence_count: int) -> dict[str, A
         # (finalize only runs once all artifacts are "completed"); "processed"
         # names that outcome without leaking the internal ingestion-status
         # vocabulary into the frontend contract.
-        "status": "processed" if artifact.status == "completed" else artifact.status,
+        "status": "processed" if status == "completed" else status,
     }
 
     if evidence_count == 0:

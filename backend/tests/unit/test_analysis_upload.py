@@ -9,7 +9,7 @@ from app.api import analysis as analysis_api
 
 
 def test_multiple_files_are_streamed_into_one_analysis(tmp_path, monkeypatch):
-    create_analysis = Mock(return_value=SimpleNamespace(id=17))
+    create_analysis = Mock(return_value=SimpleNamespace(id=17, artifacts=[]))
     task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "UPLOAD_COPY_CHUNK_BYTES", 3)
@@ -34,7 +34,7 @@ def test_multiple_files_are_streamed_into_one_analysis(tmp_path, monkeypatch):
 
 
 def test_direct_single_file_call_remains_compatible(tmp_path, monkeypatch):
-    create_analysis = Mock(return_value=SimpleNamespace(id=18))
+    create_analysis = Mock(return_value=SimpleNamespace(id=18, artifacts=[]))
     task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
@@ -72,7 +72,7 @@ def test_combined_upload_limit_cleans_partial_files(tmp_path, monkeypatch):
 
 
 def test_optional_github_source_is_canonicalized_separately(tmp_path, monkeypatch):
-    create_analysis = Mock(return_value=SimpleNamespace(id=19))
+    create_analysis = Mock(return_value=SimpleNamespace(id=19, artifacts=[]))
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
     monkeypatch.setattr(analysis_api, "process_analysis", Mock())
@@ -100,7 +100,7 @@ def test_optional_github_source_is_canonicalized_separately(tmp_path, monkeypatc
 def test_optional_source_zip_is_staged_but_not_a_diagnostic_artifact(
     tmp_path, monkeypatch
 ):
-    create_analysis = Mock(return_value=SimpleNamespace(id=20))
+    create_analysis = Mock(return_value=SimpleNamespace(id=20, artifacts=[]))
     validate = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
@@ -181,8 +181,86 @@ def test_unsupported_binary_artifact_is_rejected_before_celery(tmp_path, monkeyp
     assert list(tmp_path.iterdir()) == []
 
 
+def test_mixed_batch_persists_unsupported_artifact_and_still_processes_the_rest(
+    tmp_path, monkeypatch
+):
+    """A batch with both a valid and an unsupported file must not lose the
+    valid one - the unsupported file is recorded (status="unsupported",
+    source_format None) so the frontend can report it, not silently
+    dropped and not aborting artifacts that ARE usable."""
+    create_analysis = Mock(return_value=SimpleNamespace(id=22, artifacts=[]))
+    task = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
+
+    binary_content = b"\x00\x01\x02\xffPK\x03\x04random binary payload"
+
+    result = analysis_api.upload_file(
+        file=[_upload("app.log", b"ERROR failed"), _upload("payload.bin", binary_content)],
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+    )
+
+    assert result.id == 22
+    rows = create_analysis.call_args.kwargs["artifacts"]
+    assert [row["original_filename"] for row in rows] == ["app.log", "payload.bin"]
+    assert rows[0]["detected_format"] is not None
+    assert rows[0].get("status", "pending") == "pending"
+    assert rows[1]["detected_format"] is None
+    assert rows[1]["status"] == "unsupported"
+    task.delay.assert_called_once_with(22)
+
+
+def test_all_unsupported_multi_file_batch_still_rejects_the_whole_request(
+    tmp_path, monkeypatch
+):
+    create_analysis = Mock()
+    task = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
+
+    binary_content = b"\x00\x01\x02\xffPK\x03\x04random binary payload"
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.upload_file(
+            file=[_upload("a.bin", binary_content), _upload("b.bin", binary_content)],
+            db=Mock(),
+            current_user=SimpleNamespace(id=4),
+        )
+
+    assert error.value.status_code == 415
+    assert "a.bin" in error.value.detail
+    assert "b.bin" in error.value.detail
+    create_analysis.assert_not_called()
+    task.delay.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_identical_content_different_filenames_share_the_same_content_hash(
+    tmp_path, monkeypatch
+):
+    create_analysis = Mock(return_value=SimpleNamespace(id=23, artifacts=[]))
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", Mock())
+
+    same_bytes = b"ERROR identical payload\n"
+
+    analysis_api.upload_file(
+        file=[_upload("original.log", same_bytes), _upload("copy.log", same_bytes)],
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+    )
+
+    rows = create_analysis.call_args.kwargs["artifacts"]
+    assert rows[0]["content_sha256"] == rows[1]["content_sha256"]
+    assert rows[0]["content_sha256"] is not None
+
+
 def test_generic_log_with_no_error_in_first_bytes_is_accepted(tmp_path, monkeypatch):
-    create_analysis = Mock(return_value=SimpleNamespace(id=21))
+    create_analysis = Mock(return_value=SimpleNamespace(id=21, artifacts=[]))
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
     monkeypatch.setattr(analysis_api, "process_analysis", Mock())

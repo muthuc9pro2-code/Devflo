@@ -84,3 +84,22 @@ def publish_investigation_result(
         event="investigation_result",
         data=payload,
     )
+
+
+def publish_artifact_outcome(
+    analysis_id: int,
+    payload: dict[str, Any],
+) -> None:
+    """One artifact's outcome (unsupported / duplicate / zero-evidence),
+    published as soon as it is deterministically known - so the frontend
+    does not have to wait for final correlation to learn that a specific
+    file needs no further processing. Purely additive: the final
+    investigation_result.artifacts[] built by
+    investigation_context.build_artifact_outcome_payload() remains the
+    authoritative, complete list; this only surfaces individual entries
+    from that same contract earlier."""
+    publish_analysis_event(
+        analysis_id=analysis_id,
+        event="artifact_outcome",
+        data=payload,
+    )

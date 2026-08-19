@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 from typing import BinaryIO
 from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES
@@ -14,9 +15,15 @@ def copy_upload(
     max_bytes: int,
     detail: str,
     chunk_bytes: int,
-) -> tuple[int, bytes]:
+) -> tuple[int, bytes, str]:
     size = 0
     sample = bytearray()
+    # Streaming digest over the same chunks already being read/written for
+    # size and sample-detection purposes - no second pass over the file, no
+    # whole-file buffering, bounded by chunk_bytes regardless of artifact
+    # size. Content-identity only (duplicate detection); never a
+    # diagnostic-content or correlation signal.
+    digest = hashlib.sha256()
 
     with open(target, "xb") as destination:
         while chunk := upload.file.read(chunk_bytes):
@@ -29,6 +36,7 @@ def copy_upload(
                 remaining = ARTIFACT_DETECTION_SAMPLE_BYTES - len(sample)
                 sample.extend(chunk[:remaining])
 
+            digest.update(chunk)
             destination.write(chunk)
 
-    return size, bytes(sample)
+    return size, bytes(sample), digest.hexdigest()

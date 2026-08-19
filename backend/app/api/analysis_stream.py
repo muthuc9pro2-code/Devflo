@@ -7,18 +7,31 @@ from app.services.analysis_events import (
     analysis_event_channel,
     redis_client,
 )
-from typing import Annotated
+from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_verified_user
 from app.db.database import get_db
 from app.models.analysis import Analysis
 from app.models.user import User
+from app.tasks.analysis import compute_current_analysis_state
 
 
 router = APIRouter()
 
-async def _analysis_event_stream(analysis_id: int):
+async def _analysis_event_stream(analysis_id: int, initial_state: dict[str, Any]):
+    # Reconnect correctness (no durable event replay needed): the very
+    # first thing a (re)connecting client receives is a snapshot of
+    # already-persisted state, computed once, before subscribing to the
+    # live channel - so it can render the current status/progress
+    # immediately instead of starting from 0 and waiting for the next live
+    # tick. Historical intermediate progress ticks (22%, 23%, 24%, ...) are
+    # deliberately NOT replayed; only future pubsub messages follow.
+    yield (
+        "event: state\n"
+        f"data: {json.dumps(initial_state, separators=(',', ':'), default=str)}\n\n"
+    )
+
     pubsub = redis_client.pubsub()
     pubsub.subscribe(analysis_event_channel(analysis_id))
 
@@ -68,8 +81,10 @@ async def stream_analysis_events(
             detail="Analysis not found",
         )
 
+    initial_state = compute_current_analysis_state(db, analysis)
+
     return StreamingResponse(
-        _analysis_event_stream(analysis_id),
+        _analysis_event_stream(analysis_id, initial_state),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

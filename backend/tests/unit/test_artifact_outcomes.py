@@ -21,7 +21,11 @@ from sqlalchemy.orm import sessionmaker
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.services.correlation_engine import run_correlation
-from app.services.investigation_context import build_correlation_payload
+from app.services.investigation_context import (
+    build_correlation_payload,
+    build_simple_payload,
+    build_zero_evidence_payload,
+)
 from app.tasks import analysis as analysis_task
 
 
@@ -45,12 +49,19 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     return Evidence(**defaults)
 
 
-def _artifact_row(artifact_id: int, filename: str, fmt: str, status: str = "completed"):
+def _artifact_row(
+    artifact_id: int,
+    filename: str,
+    fmt: str,
+    status: str = "completed",
+    duplicate_of_artifact_id: int | None = None,
+):
     return SimpleNamespace(
         id=artifact_id,
         original_filename=filename,
         detected_format=fmt,
         status=status,
+        duplicate_of_artifact_id=duplicate_of_artifact_id,
     )
 
 
@@ -385,3 +396,121 @@ def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
         assert analysis.status == "completed"
     finally:
         db.close()
+
+
+# --- unsupported/duplicate outcomes, all four distinguishable in one shape -
+
+
+def test_all_four_outcome_kinds_are_distinguishable_in_the_simple_payload():
+    """Part 3: processed-with-evidence, processed-zero-evidence, unsupported,
+    and duplicate must each carry the correct filename/message and be
+    unambiguously distinguishable by `status`."""
+    rows = [_evidence(1, artifact_id=1, source_format="web_server")]
+    artifacts = [
+        _artifact_row(1, "nginx.log", "web_server"),  # processed, has evidence
+        _artifact_row(2, "random.log", "generic"),  # processed, zero evidence
+        _artifact_row(3, "something.xyz", None, status="unsupported"),
+        _artifact_row(
+            4, "nginx-copy.log", "web_server", status="duplicate",
+            duplicate_of_artifact_id=1,
+        ),
+    ]
+
+    payload = build_simple_payload(1, rows, artifacts=artifacts)
+    outcome_by_id = {a["artifact_id"]: a for a in payload["artifacts"]}
+
+    processed = outcome_by_id[1]
+    assert processed["status"] == "processed"
+    assert processed["evidence_count"] == 1
+    assert "message" not in processed
+
+    zero_evidence = outcome_by_id[2]
+    assert zero_evidence["status"] == "processed"
+    assert zero_evidence["evidence_count"] == 0
+    assert "unrelated" not in zero_evidence["message"].lower()
+
+    unsupported = outcome_by_id[3]
+    assert unsupported["status"] == "unsupported"
+    assert unsupported["source_file"] == "something.xyz"
+    assert unsupported["source_format"] is None
+    assert unsupported["evidence_count"] == 0
+    assert "not supported" in unsupported["message"].lower()
+
+    duplicate = outcome_by_id[4]
+    assert duplicate["status"] == "duplicate"
+    assert duplicate["source_file"] == "nginx-copy.log"
+    assert duplicate["evidence_count"] == 0
+    assert duplicate["duplicate_of_artifact_id"] == 1
+    assert duplicate["duplicate_of_source_file"] == "nginx.log"
+    assert "nginx.log" in duplicate["message"]
+
+    # Every status is a distinct, unambiguous value.
+    assert {o["status"] for o in payload["artifacts"]} == {
+        "processed", "unsupported", "duplicate",
+    }
+
+
+def test_unsupported_and_duplicate_outcomes_available_in_correlated_payload():
+    base = datetime.now(timezone.utc)
+    rows = [
+        _evidence(1, artifact_id=101, trace_id="trace-1", service="api", first_seen=base),
+        _evidence(2, artifact_id=102, trace_id="trace-1", service="ui", first_seen=base + timedelta(milliseconds=5)),
+    ]
+    run = run_correlation(analysis_id=1, evidence_rows=rows)
+    artifacts = [
+        _artifact_row(101, "nginx.log", "web_server"),
+        _artifact_row(102, "otel.json", "opentelemetry"),
+        _artifact_row(103, "something.xyz", None, status="unsupported"),
+        _artifact_row(
+            104, "nginx-copy.log", "web_server", status="duplicate",
+            duplicate_of_artifact_id=101,
+        ),
+    ]
+
+    payload = build_correlation_payload(run, rows, artifacts=artifacts)
+    outcome_by_id = {a["artifact_id"]: a for a in payload["artifacts"]}
+
+    assert outcome_by_id[103]["status"] == "unsupported"
+    assert outcome_by_id[104]["status"] == "duplicate"
+    assert outcome_by_id[104]["duplicate_of_source_file"] == "nginx.log"
+    # Correlation itself is untouched by outcome bookkeeping.
+    assert payload["evidence_count"] == 2
+    assert payload["component_count"] == 1
+
+
+def test_unsupported_and_duplicate_outcomes_available_in_zero_evidence_payload():
+    artifacts = [
+        _artifact_row(1, "random.log", "generic"),
+        _artifact_row(2, "something.xyz", None, status="unsupported"),
+        _artifact_row(
+            3, "random-copy.log", "generic", status="duplicate",
+            duplicate_of_artifact_id=1,
+        ),
+    ]
+
+    payload = build_zero_evidence_payload(1, artifacts=artifacts)
+    outcome_by_id = {a["artifact_id"]: a for a in payload["artifacts"]}
+
+    assert outcome_by_id[2]["status"] == "unsupported"
+    assert outcome_by_id[3]["status"] == "duplicate"
+    assert outcome_by_id[3]["duplicate_of_source_file"] == "random.log"
+
+
+def test_duplicate_never_counts_as_evidence_or_strengthens_correlation():
+    """5. Even if a duplicate row's evidence_count were somehow non-zero
+    (it never is in production, since duplicates are never dispatched for
+    ingestion), the outcome payload hardcodes 0 for duplicates - they must
+    never be able to inflate evidence_count/correlation weight through
+    this contract."""
+    rows = [_evidence(1, artifact_id=1, source_format="web_server")]
+    artifacts = [
+        _artifact_row(1, "nginx.log", "web_server"),
+        _artifact_row(2, "nginx-copy.log", "web_server", status="duplicate", duplicate_of_artifact_id=1),
+    ]
+
+    payload = build_simple_payload(1, rows, artifacts=artifacts)
+
+    duplicate = next(a for a in payload["artifacts"] if a["artifact_id"] == 2)
+    assert duplicate["evidence_count"] == 0
+    assert payload["evidence_count"] == 1  # only the real, canonical evidence
+    assert payload["evidence_artifact_count"] == 1

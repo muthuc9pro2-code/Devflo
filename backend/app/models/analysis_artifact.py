@@ -47,6 +47,26 @@ class AnalysisArtifact(Base):
         nullable=False,
         default="pending",
     )
+    # Streaming SHA-256 of the artifact's raw bytes (see upload_staging.
+    # copy_upload), used only for content-identity duplicate detection
+    # within the same analysis - never a diagnostic-content signal, never
+    # consulted by correlation/scoring. Null for rows created before this
+    # column existed.
+    content_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+    # Set only when status == "duplicate": the canonical artifact (same
+    # analysis, identical content_sha256, uploaded first) this one is a
+    # duplicate of. That canonical artifact is the one actually processed;
+    # this row is never dispatched for ingestion and never gets its own
+    # Evidence set.
+    duplicate_of_artifact_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("analysis_artifacts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     last_processed_line: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,

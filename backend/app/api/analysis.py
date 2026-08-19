@@ -23,6 +23,8 @@ from app.services.artifact_detector import (
     detect_artifact_sample,
     is_supported_diagnostic_sample
 )
+from app.services.analysis_events import publish_artifact_outcome
+from app.services.investigation_context import build_artifact_outcome_payload
 from app.tasks.analysis import process_analysis
 
 UPLOAD_DIR = Path("uploads")
@@ -88,33 +90,46 @@ def upload_file(
             storage_filename = _safe_storage_filename(original_filename)
             saved_path = UPLOAD_DIR / (f"{upload_group}_{position}_{storage_filename}")
             staged_paths.append(saved_path)
-            artifact_size, sample = copy_upload(
+            artifact_size, sample, content_sha256 = copy_upload(
                 upload,
                 saved_path,
                 MAX_INVESTIGATION_UPLOAD_BYTES - total_bytes,
                 "Combined diagnostic upload exceeds 1 GiB",
                 UPLOAD_COPY_CHUNK_BYTES,
             )
+            total_bytes += artifact_size
 
             if not is_supported_diagnostic_sample(
                 sample,
                 filename=original_filename,
                 mime_type=upload.content_type,
             ):
+                # Unsupported artifacts are recorded (not silently dropped
+                # and not aborting a batch that has other, valid artifacts)
+                # so the frontend can report which file/why via the same
+                # investigation_result.artifacts[] contract as every other
+                # outcome - never dispatched for ingestion, so the bytes
+                # are removed immediately like before.
                 saved_path.unlink(missing_ok=True)
 
-                raise HTTPException(
-                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                    detail=f"Unsupported diagnostic artifact: {original_filename}",
+                artifact_rows.append(
+                    {
+                        "original_filename": original_filename,
+                        "saved_file_path": str(saved_path),
+                        "content_type": upload.content_type,
+                        "size_bytes": artifact_size,
+                        "detected_format": None,
+                        "content_sha256": content_sha256,
+                        "status": "unsupported",
+                    }
                 )
+                continue
 
             artifact_format = detect_artifact_sample(
                 sample,
                 filename=original_filename,
                 mime_type=upload.content_type,
             )
-
-            total_bytes += artifact_size
 
             artifact_rows.append(
                 {
@@ -123,10 +138,25 @@ def upload_file(
                     "content_type": upload.content_type,
                     "size_bytes": artifact_size,
                     "detected_format": artifact_format.value,
+                    "content_sha256": content_sha256,
                 }
             )
 
-        first_artifact = artifact_rows[0]
+        if not any(row["detected_format"] is not None for row in artifact_rows):
+            # Every uploaded file was unsupported - nothing to analyze at
+            # all, same outcome as today's single-unsupported-file case.
+            _remove_staged_uploads(staged_paths)
+            unsupported_names = ", ".join(
+                row["original_filename"] for row in artifact_rows
+            )
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail=f"Unsupported diagnostic artifact: {unsupported_names}",
+            )
+
+        first_artifact = next(
+            row for row in artifact_rows if row["detected_format"] is not None
+        )
         analysis = create_analysis(
             db=db,
             user_id=current_user.id,
@@ -145,6 +175,31 @@ def upload_file(
     except Exception:
         _remove_staged_uploads(staged_paths)
         raise
+
+    # unsupported/duplicate are already deterministically resolved at this
+    # point (staging classified unsupported; create_analysis's within-
+    # analysis content-hash grouping established the canonical artifact for
+    # any duplicate) - publish those outcomes now rather than making the
+    # frontend wait for final correlation. Reuses the exact same
+    # build_artifact_outcome_payload() the final investigation_result.
+    # artifacts[] uses, so there is only ever one status/message
+    # representation. Evidence-bearing artifacts are NOT published here -
+    # only once their ingestion actually completes (_process_artifact).
+    created_artifacts = list(analysis.artifacts)
+    filename_by_artifact_id = {
+        artifact.id: artifact.original_filename for artifact in created_artifacts
+    }
+    for artifact in created_artifacts:
+        if artifact.status in ("unsupported", "duplicate"):
+            publish_artifact_outcome(
+                analysis.id,
+                {
+                    "analysis_id": analysis.id,
+                    **build_artifact_outcome_payload(
+                        artifact, 0, filename_by_artifact_id
+                    ),
+                },
+            )
 
     process_analysis.delay(analysis.id)
     return analysis

@@ -143,7 +143,23 @@ def _match_group(pattern: re.Pattern[str], text: str) -> str | None:
 def _parse_stack_frames(raw_text: str) -> list[StackFrame]:
     frames = []
     if 'File "' in raw_text:
-        frames.extend(StackFrame(file=file, line=int(line), function=function) for file, line, function in PYTHON_FRAME_PATTERN.findall(raw_text))
+        for match in PYTHON_FRAME_PATTERN.finditer(raw_text):
+            # A well-formed Python traceback frame line ("File ..., line N,
+            # in FUNC") is always immediately followed by its source-code
+            # snippet line - that is how every real traceback (Python's own
+            # formatter, always) writes one. A frame with nothing at all
+            # after it in the record only happens when the record itself
+            # was cut short before that snippet line ever arrived (e.g. the
+            # underlying artifact's content ends mid-traceback) - the
+            # function name captured at that point cannot be trusted as
+            # complete, so it is dropped rather than persisted truncated.
+            # NODE_FRAME_PATTERN/JAVA_FRAME_PATTERN frames below are exempt:
+            # their one-line-per-frame convention has no such "next line"
+            # requirement, so being the record's last line is normal there.
+            if not raw_text[match.end():].strip():
+                continue
+            file, line, function = match.group(1), match.group(2), match.group(3)
+            frames.append(StackFrame(file=file, line=int(line), function=function))
     if ' at ' in raw_text or raw_text.lstrip().startswith('at '):
         for pattern in (NODE_FRAME_PATTERN, JAVA_FRAME_PATTERN):
             for function, file, line in pattern.findall(raw_text):

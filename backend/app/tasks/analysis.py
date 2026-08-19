@@ -23,6 +23,7 @@ from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
 from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import (
+    build_artifact_outcome_payload,
     build_correlation_payload,
     build_llm_context,
     build_simple_llm_context,
@@ -30,6 +31,7 @@ from app.services.investigation_context import (
     build_zero_evidence_payload,
 )
 from app.services.analysis_events import (
+    publish_artifact_outcome,
     publish_correlation_result,
     publish_investigation_result,
     publish_progress,
@@ -100,7 +102,14 @@ def process_analysis(analysis_id: int):
             row.id
             for row in (
                 db.query(AnalysisArtifact)
-                .filter(AnalysisArtifact.analysis_id == analysis_id)
+                .filter(
+                    AnalysisArtifact.analysis_id == analysis_id,
+                    # Unsupported/duplicate artifacts are already fully
+                    # resolved at upload time (create_analysis) - they are
+                    # never dispatched for ingestion and never produce their
+                    # own Evidence set.
+                    AnalysisArtifact.status.notin_(["unsupported", "duplicate"]),
+                )
                 .order_by(AnalysisArtifact.position, AnalysisArtifact.id)
                 .all()
             )
@@ -252,7 +261,13 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             db.query(AnalysisArtifact)
             .filter(
                 AnalysisArtifact.analysis_id == analysis_id,
-                AnalysisArtifact.status != "completed",
+                # "unsupported"/"duplicate" are terminal, already-resolved
+                # states set at upload time (create_analysis) - they are
+                # never dispatched and so never reach "completed", but they
+                # must not block finalize either.
+                AnalysisArtifact.status.notin_(
+                    ["completed", "unsupported", "duplicate"]
+                ),
             )
             .first()
         )
@@ -368,6 +383,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.original_filename,
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
+                    AnalysisArtifact.duplicate_of_artifact_id,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
@@ -456,6 +472,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.original_filename,
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
+                    AnalysisArtifact.duplicate_of_artifact_id,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
@@ -520,6 +537,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.original_filename,
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
+                    AnalysisArtifact.duplicate_of_artifact_id,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
@@ -654,7 +672,38 @@ def _process_artifact(
         parsed_count,
         perf_counter() - artifact_start,
     )
+
+    # This artifact's own ingestion is now fully done, so its retained
+    # evidence count is deterministically known - one bounded query, once,
+    # scoped to this single artifact (not per-batch). Only the zero-evidence
+    # outcome is published live here; a successful outcome still has to go
+    # through correlation before it means anything to the frontend, so it
+    # is only reported in the final investigation_result.
+    evidence_count = (
+        db.query(func.count(Evidence.id))
+        .filter(Evidence.artifact_id == artifact.id)
+        .scalar()
+        or 0
+    )
+    if evidence_count == 0:
+        publish_artifact_outcome(
+            analysis.id,
+            {
+                "analysis_id": analysis.id,
+                **build_artifact_outcome_payload(artifact, 0),
+            },
+        )
+
     return parsed_count
+
+
+def _ingestion_percentage(processed_bytes: int | None, total_bytes: int) -> int:
+    """The one formula both live SSE ingestion progress
+    (_publish_ingestion_progress) and current-state reconstruction
+    (compute_current_analysis_state) use - extracted so the two can never
+    drift apart. Caller is responsible for only calling this with a
+    truthy total_bytes; this only computes the clamped ratio."""
+    return min(98, max(0, int((processed_bytes or 0) * 100 // total_bytes)))
 
 
 def _publish_ingestion_progress(
@@ -707,7 +756,7 @@ def _publish_ingestion_progress(
     if not total_bytes:
         return last_published
 
-    percentage = min(98, max(0, int((processed_bytes or 0) * 100 // total_bytes)))
+    percentage = _ingestion_percentage(processed_bytes, total_bytes)
 
     if percentage <= last_published:
         return last_published
@@ -851,4 +900,122 @@ def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
     except Exception:
         db.rollback()
         logger.exception("Could not mark analysis %s as failed", analysis_id)
+
+
+def reconstruct_current_investigation_result(
+    db: Session,
+    analysis_id: int,
+) -> dict:
+    """Re-derives the same final investigation_result payload a client
+    would have received live via publish_investigation_result, purely from
+    already-persisted Evidence/AnalysisArtifact rows - for a client that
+    reconnects after the analysis already finished and missed the live
+    event. This deliberately does NOT touch _finalize_analysis_task's own
+    control flow (a small, separate, read-only function instead of a
+    refactor of it): it reuses the exact same builders and query shapes
+    that function already uses, just recomputed on demand rather than
+    persisted as a new JSON blob (no schema change).
+    """
+    evidence_count = (
+        db.query(func.count(Evidence.id))
+        .filter(Evidence.analysis_id == analysis_id)
+        .scalar()
+        or 0
+    )
+
+    artifacts = (
+        db.query(
+            AnalysisArtifact.id,
+            AnalysisArtifact.original_filename,
+            AnalysisArtifact.detected_format,
+            AnalysisArtifact.status,
+            AnalysisArtifact.duplicate_of_artifact_id,
+        )
+        .filter(AnalysisArtifact.analysis_id == analysis_id)
+        .all()
+    )
+
+    if evidence_count == 0:
+        return build_zero_evidence_payload(analysis_id, artifacts=artifacts)
+
+    investigation_path = choose_investigation_path(db=db, analysis_id=analysis_id)
+
+    evidence_rows = (
+        db.query(Evidence)
+        .filter(Evidence.analysis_id == analysis_id)
+        .order_by(Evidence.first_seen, Evidence.id)
+        .all()
+    )
+
+    if investigation_path == InvestigationPath.CORRELATED:
+        correlation_run = run_correlation(
+            analysis_id=analysis_id,
+            evidence_rows=evidence_rows,
+        )
+        return build_correlation_payload(correlation_run, evidence_rows, artifacts=artifacts)
+
+    return build_simple_payload(analysis_id, evidence_rows, artifacts=artifacts)
+
+
+def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
+    """What the frontend needs to render immediately on page load/SSE
+    (re)connect, derived only from already-persisted state - Analysis.
+    status and AnalysisArtifact.processed_bytes/size_bytes/status (the
+    same checkpoint columns ingestion already maintains). No Redis, no
+    in-memory global, no second progress-tracking system. Uses the exact
+    same percentage formula/caps as the live SSE stream
+    (_ingestion_percentage) and the exact same "past ingestion, into
+    identity/timeline/correlation" semantics that already publish 99 live.
+    """
+    if analysis.status == "failed":
+        return {"analysis_id": analysis.id, "status": "failed"}
+
+    if analysis.status == "completed":
+        return {
+            "analysis_id": analysis.id,
+            "status": "completed",
+            # Never 100 - matches the live stream's own contract. The
+            # frontend's transition to the final UI is driven by the
+            # investigation_result payload below (or the live event of the
+            # same shape), never by this number reaching some sentinel.
+            "progress": 99,
+            "investigation_result": reconstruct_current_investigation_result(
+                db, analysis.id
+            ),
+        }
+
+    rows = (
+        db.query(
+            AnalysisArtifact.processed_bytes,
+            AnalysisArtifact.size_bytes,
+            AnalysisArtifact.status,
+        )
+        .filter(AnalysisArtifact.analysis_id == analysis.id)
+        .all()
+    )
+
+    dispatchable = [
+        row for row in rows if row.status not in ("unsupported", "duplicate")
+    ]
+    ingestion_done = bool(dispatchable) and all(
+        row.status == "completed" for row in dispatchable
+    )
+
+    if ingestion_done:
+        # Every artifact that will ever be ingested already has been - this
+        # analysis is between ingestion and the finalize/investigation
+        # stages, exactly the window the live stream reports as 99 for
+        # (identity/timeline/correlation), before Analysis.status flips to
+        # "completed".
+        progress = 99
+    else:
+        total_bytes = sum(row.size_bytes for row in rows)
+        processed_bytes = sum(row.processed_bytes for row in rows)
+        progress = _ingestion_percentage(processed_bytes, total_bytes) if total_bytes else 0
+
+    return {
+        "analysis_id": analysis.id,
+        "status": analysis.status,  # "pending" or "processing"
+        "progress": progress,
+    }
 
