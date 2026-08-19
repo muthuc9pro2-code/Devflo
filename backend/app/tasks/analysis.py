@@ -418,9 +418,27 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 evidence_rows=evidence_rows,
             )
 
+            # Per-artifact outcome for the frontend (including artifacts that
+            # were fully processed but retained zero evidence, e.g. an
+            # unrelated-looking log with no diagnostic signal) - a single
+            # bounded query over this analysis's own artifacts, not repeated
+            # per artifact/batch. evidence_count per artifact is derived from
+            # evidence_rows already loaded above, not a second evidence query.
+            artifact_outcomes = (
+                db.query(
+                    AnalysisArtifact.id,
+                    AnalysisArtifact.original_filename,
+                    AnalysisArtifact.detected_format,
+                    AnalysisArtifact.status,
+                )
+                .filter(AnalysisArtifact.analysis_id == analysis_id)
+                .all()
+            )
+
             correlation_payload = build_correlation_payload(
                 correlation_run,
                 evidence_rows,
+                artifacts=artifact_outcomes,
             )
 
             llm_context = build_llm_context(
