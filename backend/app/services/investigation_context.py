@@ -4,11 +4,34 @@ from app.models.evidence import Evidence
 from app.services.correlation_engine import CorrelationRun
 
 # Zero retained evidence only proves Devflo did not extract meaningful
-# diagnostic evidence from that artifact under the existing evidence rules -
-# it must never be read as "this artifact/file is unrelated to the incident".
+# diagnostic evidence from that artifact/analysis under the existing
+# evidence rules - it must never be read as "this artifact/file is
+# unrelated to the incident", corrupted, unsupported, or invalid.
 _NO_EVIDENCE_MESSAGE = (
     "No meaningful diagnostic evidence was extracted from this artifact."
 )
+_NO_EVIDENCE_ANALYSIS_MESSAGE = "No meaningful diagnostic evidence found"
+
+
+def _count_evidence_by_artifact(evidence_rows: list[Evidence]) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for evidence in evidence_rows:
+        counts[evidence.artifact_id] = counts.get(evidence.artifact_id, 0) + 1
+    return counts
+
+
+def _artifacts_outcome_list(
+    artifacts: list[Any],
+    evidence_counts_by_artifact: dict[int, int],
+) -> list[dict[str, Any]]:
+    return [
+        _artifact_outcome_payload(
+            artifact,
+            evidence_counts_by_artifact.get(artifact.id, 0),
+        )
+        for artifact in artifacts
+    ]
+
 
 def build_correlation_payload(
     correlation_run: CorrelationRun,
@@ -19,11 +42,7 @@ def build_correlation_payload(
         evidence.id: evidence
         for evidence in evidence_rows
     }
-    evidence_counts_by_artifact: dict[int, int] = {}
-    for evidence in evidence_rows:
-        evidence_counts_by_artifact[evidence.artifact_id] = (
-            evidence_counts_by_artifact.get(evidence.artifact_id, 0) + 1
-        )
+    evidence_counts_by_artifact = _count_evidence_by_artifact(evidence_rows)
 
     components: list[dict[str, Any]] = []
 
@@ -138,21 +157,79 @@ def build_correlation_payload(
     }
 
     if artifacts is not None:
-        payload["artifacts"] = [
-            _artifact_outcome_payload(
-                artifact,
-                evidence_counts_by_artifact.get(artifact.id, 0),
-            )
-            for artifact in artifacts
-        ]
+        payload["artifacts"] = _artifacts_outcome_list(
+            artifacts,
+            evidence_counts_by_artifact,
+        )
 
     return payload
+
+
+def build_simple_payload(
+    analysis_id: int,
+    evidence_rows: list[Evidence],
+    *,
+    artifacts: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Final frontend result for the SIMPLE investigation path - real
+    retained evidence and (optionally) per-artifact outcomes only, never a
+    fabricated components/edges/correlation-strength graph (that shape only
+    exists where the deterministic correlation engine actually ran)."""
+    evidence_counts_by_artifact = _count_evidence_by_artifact(evidence_rows)
+
+    payload: dict[str, Any] = {
+        "analysis_id": analysis_id,
+        "investigation_path": "simple",
+        "evidence_count": len(evidence_rows),
+        "evidence_artifact_count": len(evidence_counts_by_artifact),
+        "evidence": [
+            _evidence_payload(evidence)
+            for evidence in evidence_rows
+        ],
+    }
+
+    if artifacts is not None:
+        payload["artifacts"] = _artifacts_outcome_list(
+            artifacts,
+            evidence_counts_by_artifact,
+        )
+
+    return payload
+
+
+def build_zero_evidence_payload(
+    analysis_id: int,
+    *,
+    artifacts: list[Any] | None = None,
+) -> dict[str, Any]:
+    """Final frontend result when the WHOLE analysis retained zero evidence:
+    processing completed successfully, it just found nothing meaningful -
+    never framed as failure/unsupported/unrelated. Every artifact here is
+    necessarily zero-evidence too (evidence_count for the whole analysis is
+    0), so each entry in `artifacts` (when provided) carries the same
+    neutral per-artifact message as build_correlation_payload/
+    build_simple_payload would for a zero-evidence artifact."""
+    payload: dict[str, Any] = {
+        "analysis_id": analysis_id,
+        "investigation_path": "zero_evidence",
+        "evidence_count": 0,
+        "evidence_artifact_count": 0,
+        "message": _NO_EVIDENCE_ANALYSIS_MESSAGE,
+    }
+
+    if artifacts is not None:
+        payload["artifacts"] = _artifacts_outcome_list(artifacts, {})
+
+    return payload
+
 
 def build_simple_llm_context(
     analysis_id: int,
     evidence_rows: list[Evidence],
+    *,
+    artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    context: dict[str, Any] = {
         "analysis_id": analysis_id,
         "investigation_path": "simple",
         "instruction": (
@@ -166,11 +243,20 @@ def build_simple_llm_context(
         ],
     }
 
+    if artifacts is not None:
+        context["artifacts"] = _artifacts_outcome_list(
+            artifacts,
+            _count_evidence_by_artifact(evidence_rows),
+        )
+
+    return context
+
 def build_llm_context(
     correlation_run: CorrelationRun,
     evidence_rows: list[Evidence],
     *,
     roots_per_component: int = 3,
+    artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     evidence_by_id = {
         evidence.id: evidence
@@ -235,7 +321,7 @@ def build_llm_context(
             }
         )
 
-    return {
+    context: dict[str, Any] = {
         "analysis_id": correlation_run.result.analysis_id,
         "investigation_path": "correlated",
         "instruction": (
@@ -245,6 +331,19 @@ def build_llm_context(
         ),
         "components": components,
     }
+
+    if artifacts is not None:
+        # Whole-analysis provenance summary ("nginx.log produced 8 evidence
+        # rows") so Gemini can refer to findings by their real source
+        # artifact - deliberately NOT scoped to just the selected root
+        # evidence above; this is a small, bounded, one-row-per-artifact
+        # list, not a raw-line dump.
+        context["artifacts"] = _artifacts_outcome_list(
+            artifacts,
+            _count_evidence_by_artifact(evidence_rows),
+        )
+
+    return context
 
 
 def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
@@ -281,6 +380,9 @@ def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
         "resolved_identity": evidence.resolved_identity,
         "identity_match_type": evidence.identity_match_type,
         "identity_strength": evidence.identity_strength,
+        # Real RapidOCR confidence, preserved as-is - None for anything
+        # that isn't source_format="image" evidence, never fabricated.
+        "ocr_confidence": evidence.ocr_confidence,
     }
 
 

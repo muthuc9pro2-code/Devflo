@@ -114,6 +114,10 @@ def is_supported_diagnostic_sample(
     return True
 
 def detect_artifact_sample(sample: bytes, *, filename: str | None=None, mime_type: str | None=None) -> ArtifactFormat:
+    sample_suffix = Path(filename or '').suffix.lower()
+    sample_mime = (mime_type or '').split(';', 1)[0].strip().lower()
+    if sample_suffix in SUPPORTED_IMAGE_SUFFIXES or sample_mime in SUPPORTED_IMAGE_MIME_TYPES:
+        return ArtifactFormat.IMAGE
     text = sample.decode('utf-8-sig', errors='replace')
     stripped = text.lstrip()
     lowered = text.lower()

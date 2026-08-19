@@ -1079,6 +1079,27 @@ FORMAT_SIGNAL_PRIORITY: dict[str, dict[CorrelationSignal, SignalStrength]] = {
         CorrelationSignal.FINGERPRINT: SignalStrength.MEDIUM,
         CorrelationSignal.TEMPORAL: SignalStrength.LOW,
     },
+    # OCR-derived evidence (diagnostic_adapters._stream_image_events) runs
+    # the extracted/normalized text through the exact same
+    # normalize_text_event() classification as "generic" text, so it is
+    # given the identical signal profile - not a new scoring rule, just
+    # registering the format so _pair_strength()'s existing min()-of-both-
+    # sides calibration (unchanged) can engage instead of unconditionally
+    # returning None for every signal. Without this entry, "image"-sourced
+    # evidence could never match any other evidence on ANY signal
+    # (including trace_id), regardless of genuine shared identity.
+    "image": {
+        CorrelationSignal.SPAN_ID: SignalStrength.VERY_HIGH,
+        CorrelationSignal.PARENT_SPAN: SignalStrength.VERY_HIGH,
+        CorrelationSignal.TRACE_ID: SignalStrength.VERY_HIGH,
+        CorrelationSignal.REQUEST_ID: SignalStrength.VERY_HIGH,
+        CorrelationSignal.RESOLVED_IDENTITY: SignalStrength.HIGH,
+        CorrelationSignal.MODULE: SignalStrength.MEDIUM,
+        CorrelationSignal.SERVICE: SignalStrength.MEDIUM,
+        CorrelationSignal.EXCEPTION: SignalStrength.MEDIUM,
+        CorrelationSignal.FINGERPRINT: SignalStrength.MEDIUM,
+        CorrelationSignal.TEMPORAL: SignalStrength.LOW,
+    },
 }
 
 def signal_strength(

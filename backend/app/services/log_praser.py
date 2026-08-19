@@ -67,6 +67,10 @@ class ParsedEvent:
     source_format: str | None = None
     artifact_id: int | None = None
     source_matches: list[dict[str, Any]] = field(default_factory=list)
+    # Real per-image RapidOCR confidence (0..1) - set only by
+    # diagnostic_adapters._stream_image_events for source_format="image"
+    # events; left at its default (None) everywhere else, never fabricated.
+    ocr_confidence: float | None = None
 
 
 def estimate_parsed_event_size_bytes(event: ParsedEvent) -> int:

@@ -67,3 +67,20 @@ def publish_correlation_result(
         event="correlation_result",
         data=payload,
     )
+
+
+def publish_investigation_result(
+    analysis_id: int,
+    payload: dict[str, Any],
+) -> None:
+    """Final investigation result, common to all three investigation
+    outcomes (correlated/simple/zero_evidence) - distinguished by the
+    payload's own `investigation_path` field. Published in addition to the
+    existing `correlation_result` event (still published, unchanged, for
+    the correlated path) rather than replacing it, so this is purely
+    additive to the existing SSE contract."""
+    publish_analysis_event(
+        analysis_id=analysis_id,
+        event="investigation_result",
+        data=payload,
+    )

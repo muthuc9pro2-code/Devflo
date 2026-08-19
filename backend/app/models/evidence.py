@@ -168,3 +168,12 @@ class Evidence(Base):
         Float,
         nullable=True,
     )
+
+    # Real per-image RapidOCR confidence (0..1), preserved verbatim for
+    # source_format="image" evidence only. Never fabricated: stays NULL for
+    # any evidence RapidOCR did not produce, and NULL when RapidOCR itself
+    # returned no usable score.
+    ocr_confidence: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )

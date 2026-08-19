@@ -13,7 +13,7 @@ from .artifact_detector import ArtifactFormat
 from .diagnostic_parser import EXCEPTION_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
-from app.services.image_text_extractor import extract_text_from_image
+from app.services.image_text_extractor import extract_text_from_image_with_confidence
 from app.services.ocr_normalizer import normalize_ocr_text
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def _stream_image_events(
     source_file: str,
     global_line_number: int,
 ) -> Iterator[ArtifactEvent]:
-    extracted_text = extract_text_from_image(file_path)
+    extracted_text, ocr_confidence = extract_text_from_image_with_confidence(file_path)
     normalized_text = normalize_ocr_text(extracted_text)
 
     if not normalized_text.strip():
@@ -137,6 +137,10 @@ def _stream_image_events(
         source_file=source_file,
         source_format=ArtifactFormat.IMAGE.value,
     )
+    # Real RapidOCR confidence for this image, never fabricated - set here
+    # rather than threaded through normalize_text_event() (shared by every
+    # non-image text format, which has no notion of OCR confidence at all).
+    event.ocr_confidence = ocr_confidence
 
     yield ArtifactEvent(
         event=event,

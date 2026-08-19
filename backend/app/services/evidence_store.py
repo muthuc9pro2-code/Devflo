@@ -182,6 +182,15 @@ def persist_evidence_batch(
                     fingerprint_events,
                     "source_matches",
                 ),
+                # Only ever non-None for source_format="image" events (see
+                # ParsedEvent.ocr_confidence / _stream_image_events) - every
+                # other format's events never set this attribute value away
+                # from its None default, so _first_present correctly leaves
+                # the column NULL for them instead of fabricating a score.
+                "ocr_confidence": _first_present(
+                    fingerprint_events,
+                    "ocr_confidence",
+                ),
                 "resolved_identity": resolved_identity,
                 "identity_match_type": identity_match_type,
                 "identity_strength": identity_strength,
@@ -246,6 +255,10 @@ def persist_evidence_batch(
         source_matches=func.coalesce(
             Evidence.source_matches,
             statement.inserted.source_matches,
+        ),
+        ocr_confidence=func.coalesce(
+            Evidence.ocr_confidence,
+            statement.inserted.ocr_confidence,
         ),
     )
 

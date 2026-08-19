@@ -25,9 +25,13 @@ from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import (
     build_correlation_payload,
     build_llm_context,
+    build_simple_llm_context,
+    build_simple_payload,
+    build_zero_evidence_payload,
 )
 from app.services.analysis_events import (
     publish_correlation_result,
+    publish_investigation_result,
     publish_progress,
 )
 
@@ -354,6 +358,28 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 progress=99,
             )
 
+            # Every artifact reaching finalize is "completed", and since the
+            # WHOLE analysis retained zero evidence, every one of them is
+            # necessarily a zero-evidence artifact - one bounded query, no
+            # Gemini call (there is no evidence to explain).
+            zero_evidence_artifacts = (
+                db.query(
+                    AnalysisArtifact.id,
+                    AnalysisArtifact.original_filename,
+                    AnalysisArtifact.detected_format,
+                    AnalysisArtifact.status,
+                )
+                .filter(AnalysisArtifact.analysis_id == analysis_id)
+                .all()
+            )
+            publish_investigation_result(
+                analysis_id,
+                build_zero_evidence_payload(
+                    analysis_id,
+                    artifacts=zero_evidence_artifacts,
+                ),
+            )
+
             return
 
         investigation_path = choose_investigation_path(
@@ -441,12 +467,28 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 artifacts=artifact_outcomes,
             )
 
+            # Prepared for the Gemini integration to be wired in next; no
+            # Gemini SDK/API call exists in this codebase yet. artifacts=
+            # gives Gemini the same "nginx.log produced 8 evidence rows"
+            # provenance summary as the frontend payload, without dumping
+            # raw lines - the deterministic engine remains the sole
+            # authority on correlation/root-cause, this context only adds
+            # explanatory provenance around it.
             llm_context = build_llm_context(
                 correlation_run,
                 evidence_rows,
+                artifacts=artifact_outcomes,
             )
 
             publish_correlation_result(
+                analysis_id,
+                correlation_payload,
+            )
+            # New unified final-result event (see build_correlation_payload's
+            # docstring context above) - same payload, published in addition
+            # to the pre-existing correlation_result event so any consumer
+            # relying on that event name keeps working unchanged.
+            publish_investigation_result(
                 analysis_id,
                 correlation_payload,
             )
@@ -462,6 +504,51 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 "correlation",
                 "Deterministic correlation completed",
+                progress=99,
+            )
+        else:
+            evidence_rows = (
+                db.query(Evidence)
+                .filter(Evidence.analysis_id == analysis_id)
+                .order_by(Evidence.first_seen, Evidence.id)
+                .all()
+            )
+
+            simple_artifacts = (
+                db.query(
+                    AnalysisArtifact.id,
+                    AnalysisArtifact.original_filename,
+                    AnalysisArtifact.detected_format,
+                    AnalysisArtifact.status,
+                )
+                .filter(AnalysisArtifact.analysis_id == analysis_id)
+                .all()
+            )
+
+            simple_payload = build_simple_payload(
+                analysis_id,
+                evidence_rows,
+                artifacts=simple_artifacts,
+            )
+
+            # Prepared for the Gemini integration to be wired in next -
+            # mirrors the CORRELATED branch's llm_context above; no Gemini
+            # SDK/API call exists in this codebase yet.
+            simple_llm_context = build_simple_llm_context(
+                analysis_id,
+                evidence_rows,
+                artifacts=simple_artifacts,
+            )
+
+            publish_investigation_result(
+                analysis_id,
+                simple_payload,
+            )
+
+            publish_progress(
+                analysis_id,
+                "completed",
+                "Evidence review completed",
                 progress=99,
             )
 
