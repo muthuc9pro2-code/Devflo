@@ -127,12 +127,20 @@ def test_end_to_end_normalize_text_event_never_persists_a_truncated_function_nam
 
 
 def test_truncated_frame_does_not_discard_the_rest_of_the_artifact(tmp_path):
-    """Confirms the fix is a targeted per-frame decision, not an artifact-
-    level one: a valid record BEFORE the truncated one, and a valid record
-    AFTER it (in a later, unrelated batch position within the same file),
-    are both still parsed and retained normally. Exercises the real
-    stream_artifact_events() entry point end to end, not just
-    _parse_stack_frames() in isolation."""
+    """Confirms the fix is a targeted per-record decision, not an
+    artifact-level one: a valid, complete record BEFORE the truncated tail
+    is still parsed and retained normally, and the artifact is not marked
+    unsupported/zero-evidence merely because its last record is incomplete.
+    Exercises the real stream_artifact_events() entry point end to end, not
+    just _parse_stack_frames() in isolation.
+
+    The file's last line here is never terminated (no trailing newline) and
+    ends mid-token ("incomple") - the same generic, format-agnostic
+    truncated-tail signature as real cut-off uploads - so it is now isolated
+    entirely (see _tail_record_is_truncated in diagnostic_adapters.py)
+    rather than surviving as a misleading bare ERROR record with no stack
+    frames. Everything before it is untouched.
+    """
     content = (
         "2026-01-01 10:00:00 ERROR service=svc-a "
         "Traceback (most recent call last):\n"
@@ -156,21 +164,23 @@ def test_truncated_frame_does_not_discard_the_rest_of_the_artifact(tmp_path):
     )
     events = [record.event for record in records if record.event is not None]
 
-    # The complete traceback, the plain INFO line (dropped as unimportant by
-    # existing retention rules - unrelated to this fix, unchanged), and the
-    # truncated traceback are ALL still streamed as records; nothing after
-    # the truncated one is skipped and the artifact keeps flowing to EOF.
-    assert len(records) == 3
+    # The complete traceback and the plain INFO line (dropped as unimportant
+    # by existing retention rules - unrelated to this fix) are streamed as
+    # records; the truncated tail is isolated entirely rather than streamed
+    # as a misleading bare ERROR record.
+    assert len(records) == 2
 
     complete = next(e for e in events if e.service == "svc-a" and e.level == "ERROR")
     assert len(complete.stack_frames) == 1
     assert complete.stack_frames[0].function == "foo"
     assert complete.exception_type == "RuntimeError"
 
-    truncated = next(e for e in events if e.service == "svc-b")
-    assert truncated.level == "ERROR"  # still a real, retained diagnostic event
-    assert truncated.stack_frames == []  # only the unreliable frame is dropped
+    # The truncated svc-b tail never became evidence at all - not even a
+    # bare ERROR with empty stack_frames - since it is indistinguishable
+    # from a genuinely incomplete cut-off write.
+    assert not any(e.service == "svc-b" for e in events)
 
     # Artifact-level outcome is unaffected: not marked unsupported/
-    # zero-evidence merely because one frame inside it was incomplete.
-    assert len(events) == 2  # the INFO line correctly has no event at all
+    # zero-evidence merely because its last record was incomplete - the
+    # earlier, complete traceback is still real, retained evidence.
+    assert len(events) == 1

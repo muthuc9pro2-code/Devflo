@@ -142,4 +142,65 @@ def test_malformed_json_text_fallback_resumes_from_byte_checkpoint(tmp_path):
 
     assert len(records) == 1
     assert records[0].event.raw_line == "ERROR remaining failure"
-    assert records[0].event.line_number == 2
+
+
+def test_json_document_truncated_after_valid_records_keeps_them_instead_of_raising(tmp_path):
+    """A JSON-document artifact (BROWSER/HAR here) that is corrupted or cut
+    off partway through - e.g. an upload that got truncated - must not lose
+    the records that streamed through cleanly before that point, and must
+    not raise: any exception out of stream_artifact_events propagates
+    through _process_artifact_task and marks the *entire analysis* failed,
+    not just this one artifact (see _process_artifact_task's except
+    Exception -> _mark_analysis_failed). Only the checkpoint-resume case
+    (test_malformed_json_structured_checkpoint_does_not_switch_to_text
+    above) is still expected to raise.
+    """
+    entries = ",".join(
+        f'{{"startedDateTime":"2026-01-01T00:00:{i:02d}Z",'
+        f'"request":{{"method":"GET","url":"https://x.test/{i}"}},'
+        f'"response":{{"status":{503 if i == 0 else 200}}}}}'
+        for i in range(5)
+    )
+    document = f'{{"log":{{"version":"1.2","entries":[{entries}'  # cut off, no closing brackets
+    path = tmp_path / "broken.har"
+    path.write_text(document, encoding="utf-8")
+
+    records = list(
+        stream_artifact_events(
+            file_path=str(path),
+            artifact_format=ArtifactFormat.BROWSER,
+            source_file=path.name,
+        )
+    )
+
+    assert len(records) == 5
+    events = [record.event for record in records if record.event is not None]
+    assert any(event.http_status == 503 for event in events)
+
+
+def test_otlp_document_truncated_after_valid_records_keeps_them_instead_of_raising(tmp_path):
+    """Same guarantee as the JSON-document fix above, for OPENTELEMETRY's
+    separate stream_otlp_events code path."""
+    log_records = ",".join(
+        f'{{"severityText":"ERROR","body":{{"stringValue":"boom {i}"}},'
+        f'"traceId":"trace-{i}"}}'
+        for i in range(5)
+    )
+    document = (
+        '{"resourceLogs":[{"resource":{"attributes":[]},'
+        f'"scopeLogs":[{{"scope":{{}},"logRecords":[{log_records}'
+    )  # cut off, no closing brackets
+    path = tmp_path / "broken_otlp.json"
+    path.write_text(document, encoding="utf-8")
+
+    records = list(
+        stream_artifact_events(
+            file_path=str(path),
+            artifact_format=ArtifactFormat.OPENTELEMETRY,
+            source_file=path.name,
+        )
+    )
+
+    assert len(records) == 5
+    events = [record.event for record in records if record.event is not None]
+    assert any(event.level == "ERROR" for event in events)

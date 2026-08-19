@@ -218,6 +218,113 @@ def test_source_matches_survive_with_original_structure():
     assert match["confidence"] == "high"
 
 
+def test_gemini_context_still_reaches_a_source_match_outside_top_roots():
+    """Reproduces the real gap: a component with more than roots_per_component
+    (3) candidates, where the node with a genuine deterministic source_match
+    ranks 4th. Root-cause ranking itself is untouched (root_causes is
+    supplied pre-ranked here, exactly as run_correlation would produce it) -
+    only build_llm_context()'s selection of what reaches Gemini is under
+    test, and it must not silently drop the 4th-ranked node's source_match.
+    """
+    from app.services.correlation_engine import (
+        CorrelationComponent,
+        CorrelationNode,
+        CorrelationResult,
+        CorrelationRun,
+        NodeGraphStats,
+        RootCauseCandidate,
+    )
+
+    evidence_rows = [
+        _evidence(1, service="svc-a", representative_line="ERROR one"),
+        _evidence(2, service="svc-b", representative_line="ERROR two"),
+        _evidence(3, service="svc-c", representative_line="ERROR three"),
+        _evidence(
+            4,
+            service="worker",
+            representative_line="ERROR RuntimeError: queue unavailable",
+            source_file="srv/worker.py",
+            source_matches=[
+                {
+                    "relative_path": "srv/worker.py",
+                    "line_number": 42,
+                    "function": "run",
+                    "match_method": "exact",
+                    "confidence": "high",
+                }
+            ],
+        ),
+    ]
+
+    nodes = [
+        CorrelationNode(id=f"evidence-{i}", service=evidence_rows[i - 1].service, fingerprint=None, first_seen=None, last_seen=None, evidence_ids=[i])
+        for i in range(1, 5)
+    ]
+    component = CorrelationComponent(nodes=nodes, edges=[])
+    stats = NodeGraphStats()
+    # Pre-ranked exactly as rank_root_causes() would produce: node-4 (the
+    # real source-matched candidate) is 4th, outside roots_per_component=3.
+    root_causes = {
+        0: [
+            RootCauseCandidate(node_id="evidence-1", score=0.9, graph_stats=stats, role="root"),
+            RootCauseCandidate(node_id="evidence-2", score=0.8, graph_stats=stats, role="propagation"),
+            RootCauseCandidate(node_id="evidence-3", score=0.7, graph_stats=stats, role="victim"),
+            RootCauseCandidate(node_id="evidence-4", score=0.6, graph_stats=stats, role="uncorrelated"),
+        ]
+    }
+    run = CorrelationRun(
+        result=CorrelationResult(analysis_id=1, components=[component]),
+        root_causes=root_causes,
+    )
+
+    context = build_llm_context(run, evidence_rows)
+
+    root_evidence_ids = {item["id"] for item in context["components"][0]["root_evidence"]}
+    assert root_evidence_ids == {1, 2, 3, 4}
+    source_matched = next(item for item in context["components"][0]["root_evidence"] if item["id"] == 4)
+    assert source_matched["source_matches"][0]["relative_path"] == "srv/worker.py"
+    assert source_matched["source_matches"][0]["line_number"] == 42
+
+    # Root-cause ranking/roles themselves are untouched by this widening.
+    assert [c["node_id"] for c in context["components"][0]["root_candidates"]] == [
+        "evidence-1", "evidence-2", "evidence-3",
+    ]
+
+
+def test_gemini_context_additional_source_matched_evidence_stays_bounded():
+    """The widening above is capped, not unbounded - even with many
+    source-matched nodes outside the top roots, only a small fixed number
+    are added (bounded context, never the whole component)."""
+    from app.services.correlation_engine import (
+        CorrelationComponent,
+        CorrelationNode,
+        CorrelationResult,
+        CorrelationRun,
+        NodeGraphStats,
+        RootCauseCandidate,
+    )
+
+    def _match(n):
+        return [{"relative_path": f"srv/mod_{n}.py", "line_number": n, "function": "f", "match_method": "exact", "confidence": "high"}]
+
+    evidence_rows = [_evidence(1, service="root")] + [
+        _evidence(n, service=f"svc-{n}", source_matches=_match(n)) for n in range(2, 8)
+    ]
+    nodes = [
+        CorrelationNode(id=f"evidence-{e.id}", service=e.service, fingerprint=None, first_seen=None, last_seen=None, evidence_ids=[e.id])
+        for e in evidence_rows
+    ]
+    component = CorrelationComponent(nodes=nodes, edges=[])
+    stats = NodeGraphStats()
+    root_causes = {0: [RootCauseCandidate(node_id="evidence-1", score=1.0, graph_stats=stats, role="root")]}
+    run = CorrelationRun(result=CorrelationResult(analysis_id=1, components=[component]), root_causes=root_causes)
+
+    context = build_llm_context(run, evidence_rows)
+
+    # 1 root + at most 3 additional source-matched entries, not all 6.
+    assert len(context["components"][0]["root_evidence"]) <= 4
+
+
 # --- 8: Gemini correlated context has what it needs -----------------------
 
 

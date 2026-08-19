@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import shlex
 from collections.abc import Iterator, Mapping
@@ -10,7 +11,7 @@ from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, JSON_STR
 from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
-from .diagnostic_parser import EXCEPTION_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
+from .diagnostic_parser import EXCEPTION_PATTERN, JAVA_FRAME_PATTERN, NODE_FRAME_PATTERN, PYTHON_FRAME_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
 from app.services.image_text_extractor import extract_text_from_image_with_confidence
@@ -125,32 +126,102 @@ def _stream_image_events(
     source_file: str,
     global_line_number: int,
 ) -> Iterator[ArtifactEvent]:
+    # OCR runs exactly once per image (single call into RapidOCR via
+    # extract_text_from_image_with_confidence) - everything below only
+    # restructures that one result in memory, no second OCR pass.
     extracted_text, ocr_confidence = extract_text_from_image_with_confidence(file_path)
     normalized_text = normalize_ocr_text(extracted_text)
 
     if not normalized_text.strip():
         return
 
-    event = normalize_text_event(
-        raw_text=normalized_text,
-        line_number=global_line_number + 1,
-        source_file=source_file,
-        source_format=ArtifactFormat.IMAGE.value,
-    )
-    # Real RapidOCR confidence for this image, never fabricated - set here
-    # rather than threaded through normalize_text_event() (shared by every
-    # non-image text format, which has no notion of OCR confidence at all).
-    event.ocr_confidence = ocr_confidence
+    # The whole image used to become ONE raw_text blob fed to
+    # normalize_text_event(). That silently loses real diagnostic content:
+    # normalize_text_event()'s level detection is "first level keyword found
+    # anywhere in raw_text wins", so a benign early line (e.g. an "INFO:"
+    # startup message) shadows a genuine ERROR-level traceback appearing
+    # later in the same image, and the whole record gets discarded as
+    # unimportant at retention time - exactly how a real ImportError
+    # traceback screenshot produced evidence_count=0.
+    #
+    # Instead, OCR text is split back into per-record units using the same
+    # multiline-aware grouping (_multiline_kind/_is_multiline_continuation)
+    # ordinary STACK_TRACE-format text artifacts already use, so each
+    # distinct log line/traceback is normalized and gated for importance on
+    # its own - the same common diagnostic parsing/evidence model, not a
+    # second one. STACK_TRACE is used only to select this grouping's
+    # classification rules; source_format stays "image" throughout.
+    local_line = 0
+    global_line = global_line_number
+    pending: _PendingTextRecord | None = None
 
-    yield ArtifactEvent(
+    for line in normalized_text.split("\n"):
+        local_line += 1
+        global_line += 1
+        line_bytes = len(line.encode("utf-8", errors="replace")) + 1
+
+        if pending is not None and _is_multiline_continuation(pending, line):
+            pending.lines.append(line)
+            pending.end_global_line = global_line
+            pending.artifact_line_number = local_line
+            pending.end_offset = local_line
+            pending.size_bytes += line_bytes
+            continue
+
+        if pending is not None:
+            yield _build_image_text_event(
+                pending, source_file=source_file, ocr_confidence=ocr_confidence
+            )
+
+        pending = _PendingTextRecord(
+            lines=[line],
+            start_global_line=global_line,
+            end_global_line=global_line,
+            artifact_line_number=local_line,
+            end_offset=local_line,
+            size_bytes=line_bytes,
+            multiline_kind=_multiline_kind(ArtifactFormat.STACK_TRACE, line),
+        )
+
+    if pending is not None:
+        yield _build_image_text_event(
+            pending, source_file=source_file, ocr_confidence=ocr_confidence
+        )
+
+
+def _build_image_text_event(
+    record: _PendingTextRecord,
+    *,
+    source_file: str,
+    ocr_confidence: float | None,
+) -> ArtifactEvent:
+    raw_text = "\n".join(record.lines)
+
+    event = None
+    if _stack_trace_may_be_important(raw_text):
+        defaults: dict[str, Any] = {}
+        if record.multiline_kind == "crash_report":
+            defaults["level"] = "ERROR"
+        event = normalize_text_event(
+            raw_text,
+            record.start_global_line,
+            source_file=source_file,
+            source_format=ArtifactFormat.IMAGE.value,
+            defaults=defaults,
+        )
+        _default_level_for_bare_stack_frame(event, raw_text)
+        # Real RapidOCR confidence for the image this record came from,
+        # never fabricated - set here rather than threaded through
+        # normalize_text_event() (shared by every non-image text format,
+        # which has no notion of OCR confidence at all).
+        event.ocr_confidence = ocr_confidence
+
+    return ArtifactEvent(
         event=event,
-        end_offset=1,
-        artifact_line_number=1,
-        global_end_line_number=global_line_number + 1,
-        batch_size_bytes=max(
-            len(normalized_text.encode("utf-8", errors="replace")),
-            1,
-        ),
+        end_offset=record.end_offset,
+        artifact_line_number=record.artifact_line_number,
+        global_end_line_number=record.end_global_line,
+        batch_size_bytes=max(record.size_bytes, 1),
     )
 def _stream_cloudfront_events(*, file_path: str, source_file: str, fields: list[str], start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
@@ -191,6 +262,51 @@ def _cloudfront_fields_from_line(line: str) -> list[str] | None:
     if not {'date', 'time', 'sc-status', 'cs-uri-stem'} <= lowered or not lowered.intersection({'x-edge-location', 'x-edge-request-id', 'x-edge-result-type'}):
         return None
     return fields
+
+def _ends_mid_token(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    last = stripped[-1]
+    return last.isalnum() or last == "_"
+
+
+def _file_ends_without_trailing_newline(file_path: str) -> bool:
+    size = os.path.getsize(file_path)
+    if size == 0:
+        return False
+    with open(file_path, "rb") as handle:
+        handle.seek(-1, os.SEEK_END)
+        return handle.read(1) != b"\n"
+
+
+def _tail_record_is_truncated(
+    file_path: str,
+    raw_text: str,
+    *,
+    record_start_offset: int,
+    record_end_offset: int,
+) -> bool:
+    """Generic, format-agnostic guard against a genuinely incomplete final
+    record (e.g. an upload cut off mid-write) being retained as normal
+    Evidence just because it happens to contain a marker word/field. Real
+    truncated tails observed in production ("Runt", "Kafk", "trace_id=4bf")
+    share three structural traits, checked here instead of any
+    fixture/format-specific string matching: they are the artifact's actual
+    last bytes, the file has no terminating newline, and the text ends
+    mid-token (no closing word boundary/punctuation). A lone single-record
+    artifact (record_start_offset == 0, i.e. nothing precedes it) is never
+    dropped this way - only a genuine tail fragment following real content
+    is ever isolated, never an artifact's only content.
+    """
+    if record_start_offset <= 0:
+        return False
+    if record_end_offset != os.path.getsize(file_path):
+        return False
+    if not _ends_mid_token(raw_text):
+        return False
+    return _file_ends_without_trailing_newline(file_path)
+
 
 def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
@@ -247,7 +363,22 @@ def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, sour
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
         pending = _PendingTextRecord(lines=[line], start_global_line=global_line, end_global_line=global_line, artifact_line_number=local_line, end_offset=end_offset, size_bytes=line_size, multiline_kind=_multiline_kind(artifact_format, line))
     if pending is not None:
-        yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
+        record_start_offset = pending.end_offset - pending.size_bytes
+        if pending.multiline_kind != 'cri_partial' and _tail_record_is_truncated(
+            file_path,
+            '\n'.join(pending.lines),
+            record_start_offset=record_start_offset,
+            record_end_offset=pending.end_offset,
+        ):
+            logger.info(
+                'Artifact %s | tail record at line %s appears truncated '
+                '(no trailing newline, ends mid-token); isolating only this '
+                'final record, earlier content preserved',
+                file_path,
+                pending.artifact_line_number,
+            )
+        else:
+            yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
 _GENERIC_IMPORTANT_MARKERS = (
     "warn",
     "error",
@@ -273,10 +404,59 @@ _GENERIC_IMPORTANT_STATUS_RE = re.compile(
     r'(?:http[_-]?)?status(?:[_-]?code)?["\']?[^0-9A-Za-z]{0,3}[45]\d{2}\b',
     re.IGNORECASE,
 )
+# Deliberately more whitespace-tolerant than PYTHON_FRAME_PATTERN/
+# JAVA_FRAME_PATTERN/NODE_FRAME_PATTERN (which stay exact, unchanged, and
+# remain the only patterns _parse_stack_frames extracts real file/line/
+# function fields from). This is gating-only - "does this look like it's
+# probably a stack frame" - never used to extract a field. OCR routinely
+# drops the single space after a comma (`",line 935,in foo`), which the
+# strict patterns correctly refuse to treat as a well-formed frame; that
+# same text is still overwhelmingly diagnostic and must not be invisible to
+# retention just because OCR lost a space character.
+_LOOSE_FRAME_MARKER_RE = re.compile(
+    r'File\s*"[^"]+"\s*,?\s*line\s+\d+|(?<![A-Za-z0-9_])at\s+\S+\([^()]*:\d+\)',
+    re.IGNORECASE,
+)
+
+
+def _default_level_for_bare_stack_frame(event: ParsedEvent | None, raw_text: str) -> None:
+    """Lowest-priority level fallback, applied only after normalize_text_event
+    has already had every normal chance to find a real level (defaults,
+    LOG_LEVEL_PATTERN, exception match, the _FATAL/_SLOW markers) and still
+    came back with none. A bare stack-frame line/block with no accompanying
+    level keyword - e.g. a cropped screenshot that captured "File ..., line
+    N, in func" but not the "Traceback"/"Error" line above it - is still
+    real diagnostic content and must not be silently downgraded to
+    unretained just because the keyword-based signal never fires. Mutates
+    in place (same established pattern as ocr_confidence below), never
+    overrides a level that was actually found.
+    """
+    if event is not None and event.level is None and _contains_stack_frame(raw_text):
+        event.level = 'ERROR'
+
+
+def _contains_stack_frame(raw_text: str) -> bool:
+    """A structurally-recognized stack frame line (Python/Java/Node - the
+    same three languages _parse_stack_frames already decodes; nothing new
+    here) is inherently diagnostic on its own. Frame chains only ever occur
+    in crash/exception output, even when the explicit ERROR/Traceback
+    keyword line that normally accompanies them is missing from what was
+    actually captured - e.g. a cropped terminal screenshot, or a log format
+    that omits the header word entirely."""
+    return bool(
+        PYTHON_FRAME_PATTERN.search(raw_text)
+        or JAVA_FRAME_PATTERN.search(raw_text)
+        or NODE_FRAME_PATTERN.search(raw_text)
+        or _LOOSE_FRAME_MARKER_RE.search(raw_text)
+    )
+
+
 def _generic_text_may_be_important(raw_text: str) -> bool:
     lowered = raw_text.lower()
-    return any(marker in lowered for marker in _GENERIC_IMPORTANT_MARKERS) or (
-        'status' in lowered and _GENERIC_IMPORTANT_STATUS_RE.search(raw_text) is not None
+    return (
+        any(marker in lowered for marker in _GENERIC_IMPORTANT_MARKERS)
+        or ('status' in lowered and _GENERIC_IMPORTANT_STATUS_RE.search(raw_text) is not None)
+        or _contains_stack_frame(raw_text)
     )
 
 def _ci_cd_may_be_important(raw_text: str) -> bool:
@@ -386,6 +566,7 @@ def _build_text_artifact_event(record: _PendingTextRecord, *, artifact_format: A
             elif artifact_format == ArtifactFormat.STACK_TRACE and record.multiline_kind == 'crash_report':
                 defaults['level'] = 'ERROR'
             event = normalize_text_event(raw_text, record.start_global_line, source_file=source_file, source_format=artifact_format.value, defaults=defaults)
+            _default_level_for_bare_stack_frame(event, raw_text)
     return ArtifactEvent(event=event, end_offset=record.end_offset, artifact_line_number=record.artifact_line_number, global_end_line_number=record.end_global_line, batch_size_bytes=max(record.size_bytes, 1))
 
 def _stream_json_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
@@ -408,7 +589,18 @@ def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, sourc
         try:
             value = json.loads(line)
         except (json.JSONDecodeError, TypeError):
-            event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
+            if _tail_record_is_truncated(
+                file_path, line, record_start_offset=end_offset - size_bytes, record_end_offset=end_offset,
+            ):
+                logger.info(
+                    'Artifact %s | tail JSON-line at line %s appears truncated; '
+                    'isolating only this final record, earlier content preserved',
+                    file_path,
+                    local_line,
+                )
+                event = None
+            else:
+                event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
         else:
             data = value if isinstance(value, Mapping) else {'body': value}
             event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value) if structured_event_may_be_important(data) else None
@@ -452,8 +644,28 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                 yield ArtifactEvent(event=event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=max(retained_size_bytes, 1))
     except ijson.JSONError:
         has_structured_checkpoint = skip_records > 0 and start_offset == 0
-        if emitted or has_structured_checkpoint:
+        if has_structured_checkpoint:
+            # A checkpoint from a prior structured-JSON pass exists but the
+            # byte offset never advanced (see is_migrated_checkpoint's sibling
+            # check above) - re-raising here is a resumability-safety net,
+            # not something a truncated document should route through.
             raise
+        if emitted:
+            # Records before the truncation/corruption point already streamed
+            # through and were persisted by the caller's per-batch commits -
+            # a malformed tail (e.g. an upload cut off mid-document) must not
+            # discard them, nor fail this artifact's *entire analysis* (see
+            # _process_artifact_task: any exception here marks the whole
+            # analysis failed, not just this one artifact). Stop cleanly
+            # instead, the same graceful-degradation behavior JSON-lines
+            # documents already get per malformed line.
+            logger.warning(
+                'Malformed/truncated JSON document %s after %s record(s) '
+                'already extracted; stopping here instead of discarding them',
+                file_path,
+                local_record,
+            )
+            return
         logger.warning('Malformed JSON document %s; using generic fallback', file_path)
         yield from _stream_text_events(file_path=file_path, artifact_format=ArtifactFormat.GENERIC, source_file=source_file, start_offset=start_offset, start_artifact_line=skip_records, global_line_number=global_line_number)
 

@@ -264,6 +264,7 @@ def build_llm_context(
     evidence_rows: list[Evidence],
     *,
     roots_per_component: int = 3,
+    max_additional_source_matched_evidence: int = 3,
     artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     evidence_by_id = {
@@ -293,6 +294,31 @@ def build_llm_context(
                 continue
 
             selected_evidence_ids.update(node.evidence_ids)
+
+        # Root-cause ranking itself is untouched above - this only widens
+        # what is allowed to reach Gemini's bounded context. A node with a
+        # genuine deterministic source-code match (evidence.source_matches)
+        # must not be silently invisible to Gemini merely because
+        # correlation/root-cause scoring ranked it outside the top
+        # roots_per_component candidates (e.g. a valid srv/worker.py:42
+        # match on a 4th-ranked node). Bounded to a small, fixed number of
+        # additional evidence rows per component - never the whole
+        # component/graph.
+        additional_selected = 0
+        if max_additional_source_matched_evidence > 0:
+            for node in component.nodes:
+                if node.id in selected_node_ids:
+                    continue
+                if additional_selected >= max_additional_source_matched_evidence:
+                    break
+                for evidence_id in node.evidence_ids:
+                    if evidence_id in selected_evidence_ids:
+                        continue
+                    evidence = evidence_by_id.get(evidence_id)
+                    if evidence is not None and evidence.source_matches:
+                        selected_evidence_ids.add(evidence_id)
+                        additional_selected += 1
+                        break
 
         components.append(
             {

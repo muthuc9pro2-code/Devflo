@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -9,6 +10,7 @@ from .artifact_detector import ArtifactFormat
 from .diagnostic_parser import normalize_otel_severity, normalize_text_event
 if TYPE_CHECKING:
     from .diagnostic_adapters import ArtifactEvent
+logger = logging.getLogger(__name__)
 SCALAR_EVENTS = {'string', 'number', 'boolean', 'null'}
 
 @dataclass(slots=True)
@@ -88,60 +90,83 @@ def stream_otlp_events(*, file_path: str, source_file: str, skip_records: int=0,
     capture: _OtelCapture | None = None
     local_record = 0
     global_line = global_line_number
-    with open(file_path, 'rb') as stream:
-        prefix = stream.read(3)
-        if prefix != b'\xef\xbb\xbf':
-            stream.seek(0)
-        for prefix, event, value in ijson.parse(BoundedJsonStream(stream), buf_size=JSON_STREAM_BUFFER_BYTES, use_float=True):
-            if capture is not None:
-                if event in {'start_map', 'start_array'}:
-                    capture.depth += 1
-                capture.consume(prefix, event, value)
-                if event in {'end_map', 'end_array'}:
-                    capture.depth -= 1
-                if capture.depth != 0:
+    emitted = False
+    try:
+        with open(file_path, 'rb') as stream:
+            prefix = stream.read(3)
+            if prefix != b'\xef\xbb\xbf':
+                stream.seek(0)
+            for prefix, event, value in ijson.parse(BoundedJsonStream(stream), buf_size=JSON_STREAM_BUFFER_BYTES, use_float=True):
+                if capture is not None:
+                    if event in {'start_map', 'start_array'}:
+                        capture.depth += 1
+                    capture.consume(prefix, event, value)
+                    if event in {'end_map', 'end_array'}:
+                        capture.depth -= 1
+                    if capture.depth != 0:
+                        continue
+                    completed = capture
+                    capture = None
+                    if completed.kind == 'log_resource':
+                        log_resource = completed.attributes
+                        continue
+                    if completed.kind == 'span_resource':
+                        span_resource = completed.attributes
+                        continue
+                    local_record += 1
+                    if local_record <= skip_records:
+                        continue
+                    global_line += 1
+                    if completed.kind == 'log_record':
+                        canonical_event = _normalize_log_record(completed, line_number=global_line, source_file=source_file, resource_attributes=log_resource, scope_name=log_scope)
+                    else:
+                        canonical_event = _normalize_span(completed, line_number=global_line, source_file=source_file, resource_attributes=span_resource, scope_name=span_scope)
+                    retained_bytes = max(completed._captured_bytes, 1)
+                    emitted = True
+                    yield ArtifactEvent(event=canonical_event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=retained_bytes)
                     continue
-                completed = capture
-                capture = None
-                if completed.kind == 'log_resource':
-                    log_resource = completed.attributes
-                    continue
-                if completed.kind == 'span_resource':
-                    span_resource = completed.attributes
-                    continue
-                local_record += 1
-                if local_record <= skip_records:
-                    continue
-                global_line += 1
-                if completed.kind == 'log_record':
-                    canonical_event = _normalize_log_record(completed, line_number=global_line, source_file=source_file, resource_attributes=log_resource, scope_name=log_scope)
-                else:
-                    canonical_event = _normalize_span(completed, line_number=global_line, source_file=source_file, resource_attributes=span_resource, scope_name=span_scope)
-                retained_bytes = max(completed._captured_bytes, 1)
-                yield ArtifactEvent(event=canonical_event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=retained_bytes)
-                continue
-            if event == 'start_map':
-                normalized_prefix = prefix.replace('_', '').lower()
-                kind = _capture_kind(normalized_prefix)
-                if kind is not None:
-                    capture = _OtelCapture(kind=kind, prefix=prefix)
-                    continue
-                if normalized_prefix.endswith('resourcelogs.item'):
-                    log_resource = {}
-                    log_scope = None
-                elif normalized_prefix.endswith('resourcespans.item'):
-                    span_resource = {}
-                    span_scope = None
-                elif normalized_prefix.endswith('scopelogs.item'):
-                    log_scope = None
-                elif normalized_prefix.endswith('scopespans.item'):
-                    span_scope = None
-            if event == 'string' and prefix.endswith('scope.name'):
-                normalized_prefix = prefix.replace('_', '').lower()
-                if 'resourcelogs.' in normalized_prefix:
-                    log_scope = str(value)
-                elif 'resourcespans.' in normalized_prefix:
-                    span_scope = str(value)
+                if event == 'start_map':
+                    normalized_prefix = prefix.replace('_', '').lower()
+                    kind = _capture_kind(normalized_prefix)
+                    if kind is not None:
+                        capture = _OtelCapture(kind=kind, prefix=prefix)
+                        continue
+                    if normalized_prefix.endswith('resourcelogs.item'):
+                        log_resource = {}
+                        log_scope = None
+                    elif normalized_prefix.endswith('resourcespans.item'):
+                        span_resource = {}
+                        span_scope = None
+                    elif normalized_prefix.endswith('scopelogs.item'):
+                        log_scope = None
+                    elif normalized_prefix.endswith('scopespans.item'):
+                        span_scope = None
+                if event == 'string' and prefix.endswith('scope.name'):
+                    normalized_prefix = prefix.replace('_', '').lower()
+                    if 'resourcelogs.' in normalized_prefix:
+                        log_scope = str(value)
+                    elif 'resourcespans.' in normalized_prefix:
+                        span_scope = str(value)
+    except ijson.JSONError:
+        if not emitted:
+            # Nothing was ever successfully extracted - preserve the
+            # existing behavior of surfacing the error (same as before this
+            # fix; no established generic-text fallback exists for OTLP).
+            raise
+        # Records before the truncation/corruption point already streamed
+        # through and were persisted by the caller's per-batch commits - a
+        # malformed tail (e.g. an upload cut off mid-document) must not
+        # discard them, nor fail this artifact's *entire analysis* (any
+        # exception here propagates out of _process_artifact_task and marks
+        # the whole analysis failed, not just this one artifact). Stop
+        # cleanly instead, mirroring _stream_json_document's same fix.
+        logger.warning(
+            'Malformed/truncated OTLP document %s after %s record(s) '
+            'already extracted; stopping here instead of discarding them',
+            file_path,
+            local_record,
+        )
+        return
 
 def _capture_kind(normalized: str) -> str | None:
     if normalized.endswith('resourcelogs.item.resource'):

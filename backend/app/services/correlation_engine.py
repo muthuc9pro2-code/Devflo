@@ -1,8 +1,11 @@
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from app.models.evidence import Evidence
 from time import perf_counter
+
+logger = logging.getLogger(__name__)
 
 class CorrelationSignal(str, Enum):
     PARENT_SPAN = "parent_span"
@@ -1250,19 +1253,22 @@ def run_correlation(
     ranking_seconds = perf_counter() - ranking_start
     total_seconds = perf_counter() - total_start
 
-    print(
+    logger.info(
         "Correlation performance | "
-        f"evidence={len(evidence_rows)} | "
-        f"edges={len(edges)} | "
-        f"dag_edges={len(dag_edges)} | "
-        f"components={len(components)} | "
-        f"index={index_seconds:.4f}s | "
-        f"edges={edge_seconds:.4f}s | "
-        f"dag={dag_seconds:.4f}s | "
-        f"nodes={node_seconds:.4f}s | "
-        f"components={component_seconds:.4f}s | "
-        f"ranking={ranking_seconds:.4f}s | "
-        f"total={total_seconds:.4f}s"
+        "evidence=%s | edges=%s | dag_edges=%s | components=%s | "
+        "index=%.4fs | edges=%.4fs | dag=%.4fs | nodes=%.4fs | "
+        "components=%.4fs | ranking=%.4fs | total=%.4fs",
+        len(evidence_rows),
+        len(edges),
+        len(dag_edges),
+        len(components),
+        index_seconds,
+        edge_seconds,
+        dag_seconds,
+        node_seconds,
+        component_seconds,
+        ranking_seconds,
+        total_seconds,
     )
 
     return CorrelationRun(

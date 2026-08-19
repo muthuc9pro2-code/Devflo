@@ -36,6 +36,8 @@ from app.services.analysis_events import (
     publish_investigation_result,
     publish_progress,
 )
+from app.services.gemini_service import generate_investigation_explanation
+
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +499,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 artifacts=artifact_outcomes,
             )
 
+            gemini_result = generate_investigation_explanation(llm_context)
+            correlation_payload["ai_analysis"] = gemini_result.model_dump()
+
             publish_correlation_result(
                 analysis_id,
                 correlation_payload,
@@ -557,6 +562,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 evidence_rows,
                 artifacts=simple_artifacts,
             )
+
+            gemini_result = generate_investigation_explanation(simple_llm_context)
+            simple_payload["ai_analysis"] = gemini_result.model_dump()
 
             publish_investigation_result(
                 analysis_id,
