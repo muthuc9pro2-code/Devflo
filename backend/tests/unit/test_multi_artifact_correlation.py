@@ -56,12 +56,13 @@ def test_same_format_different_artifacts_correlate_on_real_shared_evidence():
         first_seen=base + timedelta(milliseconds=50),
     )
 
-    edges = build_correlation_edges(
+    causal_edges, associations = build_correlation_edges(
         [server_1, server_2], build_correlation_indexes([server_1, server_2])
     )
 
-    assert len(edges) == 1
-    assert any(s.value == "request_id" for s in edges[0].signals)
+    assert len(causal_edges) == 1
+    assert associations == []
+    assert any(s.value == "request_id" for s in causal_edges[0].signals)
 
 
 def test_same_format_different_artifacts_do_not_artificially_correlate():
@@ -77,11 +78,12 @@ def test_same_format_different_artifacts_do_not_artificially_correlate():
         first_seen=base + timedelta(hours=3),
     )
 
-    edges = build_correlation_edges(
+    causal_edges, associations = build_correlation_edges(
         [server_1, server_2], build_correlation_indexes([server_1, server_2])
     )
 
-    assert edges == []
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_artifact_id_is_never_itself_a_matching_signal():
@@ -147,9 +149,10 @@ def test_shared_host_alone_across_formats_is_not_sufficient_far_apart():
         first_seen=base + timedelta(hours=6),
     )
 
-    edges = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
+    causal_edges, associations = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
 
-    assert edges == []
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_same_http_status_alone_is_never_a_structural_match():
@@ -166,8 +169,9 @@ def test_same_http_status_alone_is_never_a_structural_match():
 
     assert has_structural_match(left, right) is False
 
-    edges = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
-    assert edges == []
+    causal_edges, associations = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_close_timestamps_without_structural_evidence_do_not_correlate_cross_format():
@@ -178,9 +182,10 @@ def test_close_timestamps_without_structural_evidence_do_not_correlate_cross_for
         first_seen=base + timedelta(seconds=1),
     )
 
-    edges = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
+    causal_edges, associations = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
 
-    assert edges == []
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_signal_priority_gating_uses_the_weaker_side_not_just_one():

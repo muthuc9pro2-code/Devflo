@@ -9,8 +9,7 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
 )
-from app.services.email import send_verification_email
-from app.services.email_service import send_ses_email
+from app.services.email import send_verification_email, send_password_reset_email
 from fastapi import Response, Request
 import jwt
 from app.core.security import ALGORITHM, SECRET_KEY, create_password_reset_token, hash_password, decode_password_reset_token
@@ -218,13 +217,9 @@ def forgot_password(
     if user and user.is_verified:
         reset_token = create_password_reset_token(user.email)
 
-        reset_url = (
-            f"http://localhost:3000/reset-password?token={reset_token}"
-        )
-
         send_password_reset_email(
-            to_email=user.email,
-            reset_url=reset_url,
+            email=user.email,
+            token=reset_token,
         )
 
     return {

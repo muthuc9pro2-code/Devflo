@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -45,3 +45,12 @@ class Analysis(Base):
         nullable=False,
         default=0,
     )
+
+    # The structured GeminiInvestigationResponse.model_dump() result
+    # persisted only after Gemini returns a valid schema result (see
+    # _finalize_analysis_task) - lets a client reconnecting after
+    # completion see the exact same AI explanation the live SSE event
+    # delivered, without a second Gemini call. Null for zero-evidence
+    # investigations (no Gemini call is ever made for those) and for any
+    # analysis finalized before this field existed.
+    ai_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)

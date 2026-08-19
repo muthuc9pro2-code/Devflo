@@ -191,10 +191,11 @@ def test_delta_ms_on_the_edge_is_the_real_measured_difference_not_the_window():
         first_seen=base + timedelta(milliseconds=3000),
     )
 
-    edges = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
+    causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
 
-    assert len(edges) == 1
-    assert edges[0].delta_ms == 3000.0  # the real gap, not 5000/2500/1000/0
+    assert len(causal_edges) == 1
+    assert associations == []
+    assert causal_edges[0].delta_ms == 3000.0  # the real gap, not 5000/2500/1000/0
 
 
 # --- 1: strong identity behavior is unaffected/bypasses this path --------
@@ -251,11 +252,12 @@ def test_cross_artifact_strong_signal_pair_still_correlates():
         first_seen=base + timedelta(milliseconds=4000),
     )
 
-    edges = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
+    causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
 
-    assert len(edges) == 1
-    assert edges[0].source_id == "evidence-1"
-    assert edges[0].target_id == "evidence-2"
+    assert len(causal_edges) == 1
+    assert associations == []
+    assert causal_edges[0].source_id == "evidence-1"
+    assert causal_edges[0].target_id == "evidence-2"
 
 
 # --- 9: two nearby unsupported incidents are not incorrectly collapsed ---

@@ -99,10 +99,11 @@ def test_repeated_same_failure_in_a_burst_correlates_via_fingerprint():
         for i in range(1, 4)
     ]
 
-    edges = build_correlation_edges(rows, build_correlation_indexes(rows))
+    causal_edges, associations = build_correlation_edges(rows, build_correlation_indexes(rows))
 
-    assert len(edges) > 0
-    assert all("fingerprint" in [s.value for s in edge.signals] for edge in edges)
+    assert len(causal_edges) > 0
+    assert all("fingerprint" in [s.value for s in edge.signals] for edge in causal_edges)
+    assert associations == []
 
 
 def test_KNOWN_GAP_same_fingerprint_beyond_the_temporal_window_gets_no_edge():
@@ -129,9 +130,11 @@ def test_KNOWN_GAP_same_fingerprint_beyond_the_temporal_window_gets_no_edge():
         for i in range(1, 4)
     ]
 
-    edges = build_correlation_edges(rows, build_correlation_indexes(rows))
+    causal_edges, associations = build_correlation_edges(rows, build_correlation_indexes(rows))
 
-    assert edges == []  # current, known, documented behavior - not asserting this is desirable
+    # current, known, documented behavior - not asserting this is desirable
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_unrelated_errors_close_in_time_do_not_correlate_without_structural_evidence():
@@ -145,9 +148,10 @@ def test_unrelated_errors_close_in_time_do_not_correlate_without_structural_evid
         first_seen=base + timedelta(seconds=2),
     )
 
-    edges = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
+    causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
 
-    assert edges == []
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_same_exception_type_but_unrelated_identities_and_time_do_not_correlate():
@@ -160,9 +164,10 @@ def test_same_exception_type_but_unrelated_identities_and_time_do_not_correlate(
         first_seen=base + timedelta(hours=6),
     )
 
-    edges = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
+    causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
 
-    assert edges == []
+    assert causal_edges == []
+    assert associations == []
 
 
 def test_same_exception_type_close_in_time_is_a_defensible_heuristic_link():
@@ -177,11 +182,12 @@ def test_same_exception_type_close_in_time_is_a_defensible_heuristic_link():
         first_seen=base + timedelta(seconds=1),
     )
 
-    edges = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
+    causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
 
-    assert len(edges) == 1
-    assert "exception" in [s.value for s in edges[0].signals] or "service" in [
-        s.value for s in edges[0].signals
+    assert len(causal_edges) == 1
+    assert associations == []
+    assert "exception" in [s.value for s in causal_edges[0].signals] or "service" in [
+        s.value for s in causal_edges[0].signals
     ]
 
 
@@ -198,9 +204,12 @@ def test_upstream_root_followed_by_downstream_victim_preserves_direction():
         first_seen=base + timedelta(milliseconds=800),
     )
 
-    edges = build_correlation_edges([root, victim], build_correlation_indexes([root, victim]))
+    causal_edges, associations = build_correlation_edges(
+        [root, victim], build_correlation_indexes([root, victim])
+    )
 
-    assert len(edges) == 1
-    assert edges[0].source_id == "evidence-1"
-    assert edges[0].target_id == "evidence-2"
-    assert edges[0].delta_ms == 800.0
+    assert len(causal_edges) == 1
+    assert associations == []
+    assert causal_edges[0].source_id == "evidence-1"
+    assert causal_edges[0].target_id == "evidence-2"
+    assert causal_edges[0].delta_ms == 800.0

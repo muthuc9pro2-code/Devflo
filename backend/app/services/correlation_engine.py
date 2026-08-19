@@ -87,7 +87,22 @@ class CorrelationEdge:
 @dataclass(slots=True)
 class CorrelationComponent:
     nodes: list[CorrelationNode] = field(default_factory=list)
+    # Directed, causal relationships only (a genuine parent-span match, or a
+    # real strictly-positive time delta between two otherwise-correlated
+    # records) - the ONLY edges build_graph_stats/root_cause_score/
+    # classify_node_role ever read, so incoming/outgoing/downstream counts
+    # and root/propagation/victim roles are always derived from real
+    # directed causal structure, never from association order.
     edges: list[CorrelationEdge] = field(default_factory=list)
+    # Non-directional "same incident" relationships: two records correlate
+    # (shared trace/request/resolved identity, or a structural+temporal
+    # match) but no real signal establishes which one came first/caused the
+    # other - equal timestamps, or a timestamp missing on either side. Used
+    # only for component membership (see build_correlation_components) and
+    # for a bounded LLM context - never for graph stats/roles/root-cause
+    # ranking, so association-only evidence can never masquerade as a
+    # causal root/propagation/victim.
+    associations: list[CorrelationEdge] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -598,55 +613,130 @@ def build_correlation_edge(
         signals=[match.signal for match in matches],
     )
 
-def _edge_key(
-    source: Evidence,
-    target: Evidence,
-) -> tuple[int, int]:
-    return source.id, target.id
+def _pair_key(
+    left: Evidence,
+    right: Evidence,
+) -> frozenset[int]:
+    # Unordered: the same relationship encountered from either iteration
+    # direction (source=A,target=B or source=B,target=A - both happen,
+    # since identity/temporal candidate search is symmetric) is one
+    # relationship, resolved exactly once.
+    return frozenset((left.id, right.id))
+
+def _causal_direction_delta(delta_ms: float | None) -> bool:
+    """True only when there is a real, strictly positive time separation.
+    Equal timestamps (delta_ms == 0.0) or unknown timestamps (delta_ms is
+    None, i.e. first_seen missing on either side) establish no direction on
+    their own and must never be assigned one by iteration/evidence-ID/
+    artifact/database order - see build_correlation_edges."""
+    return delta_ms is not None and delta_ms > 0.0
+
+def _canonical_pair_order(
+    left: Evidence,
+    right: Evidence,
+) -> tuple[Evidence, Evidence]:
+    """Deterministic (earlier, later) ordering for a correlated pair, used
+    only to decide which side is scored as "source" for
+    evidence_delta_ms()/temporal support in score_candidate_pair() - this
+    is bookkeeping for a stable, reproducible score/delta_ms, never itself
+    a claim of causality (see _causal_direction_delta, which is what
+    actually decides causal-vs-association). Falls back to evidence.id when
+    timestamps tie or are missing so the SAME unordered pair always
+    canonicalizes to the SAME order regardless of which iteration
+    direction - or which shuffled input order - encounters it first;
+    required for correlation to stay invariant to evidence input order.
+    """
+    left_ts, right_ts = left.first_seen, right.first_seen
+
+    if left_ts is not None and right_ts is not None and left_ts != right_ts:
+        return (left, right) if left_ts < right_ts else (right, left)
+
+    return (left, right) if left.id < right.id else (right, left)
 
 def build_correlation_edges(
     evidence_rows: list[Evidence],
     indexes: CorrelationIndexes,
     temporal_window_ms: float = 5000.0,
-) -> list[CorrelationEdge]:
-    edges: list[CorrelationEdge] = []
-    seen_pairs: set[tuple[int, int]] = set()
+) -> tuple[list[CorrelationEdge], list[CorrelationEdge]]:
+    """Returns (causal_edges, associations).
 
-    def add_edge(source: Evidence, target: Evidence) -> None:
-        key = _edge_key(source, target)
+    Causal edges carry real directional evidence - either a genuine
+    parent-span relationship (always directional, even at equal
+    timestamps: an exact parent.span_id == child.parent_span_id match with
+    compatible trace identity), or a strictly positive time delta between
+    two otherwise-correlated records. These alone feed
+    build_graph_stats/root_cause_score/classify_node_role (all read
+    component.edges only).
 
-        if key in seen_pairs:
-            return
-
-        edge = build_correlation_edge(source, target)
-
-        if edge is None:
-            return
-
-        seen_pairs.add(key)
-        edges.append(edge)
+    Associations record the same underlying correlating signal (shared
+    trace_id/request_id/resolved_identity/fingerprint/service/exception/
+    endpoint, or a structural+temporal match) for pairs where no real
+    direction is established: equal timestamps, or a timestamp missing on
+    either side. This is "same incident" evidence, not "A caused B" -
+    Devflo underclaims rather than fabricates causality. Both kinds still
+    connect nodes into the same component (build_correlation_components).
+    """
+    causal_edges: list[CorrelationEdge] = []
+    associations: list[CorrelationEdge] = []
+    seen_pairs: set[frozenset[int]] = set()
 
     for child in evidence_rows:
         parent = find_parent_span_candidate(child, indexes)
 
-        if parent is not None:
-            add_edge(parent, child)
+        if parent is None:
+            continue
+
+        key = _pair_key(parent, child)
+
+        if key in seen_pairs:
+            continue
+
+        edge = build_correlation_edge(parent, child)
+
+        if edge is None:
+            continue
+
+        seen_pairs.add(key)
+        causal_edges.append(edge)
+
+    def resolve_pair(a: Evidence, b: Evidence) -> None:
+        key = _pair_key(a, b)
+
+        if key in seen_pairs:
+            return
+
+        seen_pairs.add(key)
+
+        source, target = _canonical_pair_order(a, b)
+        score, delta_ms, matches = score_candidate_pair(source, target)
+
+        if not matches or score <= 0.0:
+            return
+
+        relationship = CorrelationEdge(
+            source_id=f"evidence-{source.id}",
+            target_id=f"evidence-{target.id}",
+            score=score,
+            delta_ms=delta_ms,
+            signals=[match.signal for match in matches],
+        )
+
+        if _causal_direction_delta(delta_ms):
+            causal_edges.append(relationship)
+        else:
+            associations.append(relationship)
 
     for source in evidence_rows:
         for target in iter_identity_candidates(source, indexes):
-            if source.first_seen is not None and target.first_seen is not None:
-                if source.first_seen > target.first_seen:
-                    continue
-
-            add_edge(source, target)
+            resolve_pair(source, target)
 
     for source, target in iter_valid_temporal_candidates(
         evidence_rows,
         temporal_window_ms,
     ):
-        add_edge(source, target)
+        resolve_pair(source, target)
 
-    return edges
+    return causal_edges, associations
 
 def build_correlation_nodes(
     evidence_rows: list[Evidence],
@@ -693,7 +783,16 @@ def build_correlation_nodes(
 def build_correlation_components(
     nodes: list[CorrelationNode],
     edges: list[CorrelationEdge],
+    associations: list[CorrelationEdge] | None = None,
 ) -> list[CorrelationComponent]:
+    """Connectivity (which nodes end up grouped into the same component) is
+    determined by BOTH causal edges and associations - two records that
+    correlate but establish no direction (e.g. equal timestamps) must still
+    be recognized as part of the same incident. Only `edges` (causal) is
+    ever used for graph stats/roles/root-cause ranking; `associations` is
+    carried on each resulting component purely for display/LLM context.
+    """
+    associations = associations or []
     node_by_id = {node.id: node for node in nodes}
     adjacency: dict[str, set[str]] = {
         node.id: set()
@@ -703,6 +802,10 @@ def build_correlation_components(
     for edge in edges:
         adjacency[edge.source_id].add(edge.target_id)
         adjacency[edge.target_id].add(edge.source_id)
+
+    for association in associations:
+        adjacency[association.source_id].add(association.target_id)
+        adjacency[association.target_id].add(association.source_id)
 
     visited: set[str] = set()
     components: list[CorrelationComponent] = []
@@ -739,10 +842,18 @@ def build_correlation_components(
             and edge.target_id in component_ids
         ]
 
+        component_associations = [
+            association
+            for association in associations
+            if association.source_id in component_ids
+            and association.target_id in component_ids
+        ]
+
         components.append(
             CorrelationComponent(
                 nodes=component_nodes,
                 edges=component_edges,
+                associations=component_associations,
             )
         )
 
@@ -857,7 +968,16 @@ def root_cause_score(
         return 1.0
 
     root_position = (
-        1.0
+        # No causal edge touches this node at all (it may still sit in a
+        # larger component purely via association - e.g. equal-timestamp
+        # "same incident" evidence) - that is not a root signal, it is the
+        # same "uncorrelated" position classify_node_role already assigns
+        # for this exact condition. Without this, an association-only node
+        # would read as maximally root-like merely for having no incoming
+        # CAUSAL edge, even though it has no outgoing one either.
+        0.0
+        if stats.incoming_count == 0 and stats.outgoing_count == 0
+        else 1.0
         if stats.incoming_count == 0
         else 1.0 / (1.0 + stats.incoming_count)
     )
@@ -1219,13 +1339,15 @@ def run_correlation(
     index_seconds = perf_counter() - index_start
 
     edge_start = perf_counter()
-    edges = build_correlation_edges(
+    edges, associations = build_correlation_edges(
         evidence_rows,
         indexes,
     )
     edge_seconds = perf_counter() - edge_start
 
     dag_start = perf_counter()
+    # enforce_dag only makes sense for directed causal edges - associations
+    # are non-directional by definition, so there is no "cycle" for them.
     dag_edges = enforce_dag(edges)
     dag_seconds = perf_counter() - dag_start
 
@@ -1237,6 +1359,7 @@ def run_correlation(
     components = build_correlation_components(
         nodes,
         dag_edges,
+        associations,
     )
     component_seconds = perf_counter() - component_start
 
@@ -1255,12 +1378,13 @@ def run_correlation(
 
     logger.info(
         "Correlation performance | "
-        "evidence=%s | edges=%s | dag_edges=%s | components=%s | "
+        "evidence=%s | edges=%s | dag_edges=%s | associations=%s | components=%s | "
         "index=%.4fs | edges=%.4fs | dag=%.4fs | nodes=%.4fs | "
         "components=%.4fs | ranking=%.4fs | total=%.4fs",
         len(evidence_rows),
         len(edges),
         len(dag_edges),
+        len(associations),
         len(components),
         index_seconds,
         edge_seconds,

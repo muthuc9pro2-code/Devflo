@@ -127,19 +127,25 @@ def test_end_to_end_normalize_text_event_never_persists_a_truncated_function_nam
 
 
 def test_truncated_frame_does_not_discard_the_rest_of_the_artifact(tmp_path):
-    """Confirms the fix is a targeted per-record decision, not an
-    artifact-level one: a valid, complete record BEFORE the truncated tail
-    is still parsed and retained normally, and the artifact is not marked
-    unsupported/zero-evidence merely because its last record is incomplete.
-    Exercises the real stream_artifact_events() entry point end to end, not
-    just _parse_stack_frames() in isolation.
+    """Confirms the frame-completeness fix is a targeted per-frame decision,
+    not a whole-record/artifact-level one: a valid, complete record BEFORE
+    an incomplete trailing frame is still parsed and retained normally, and
+    the record containing the incomplete frame is ALSO retained (just
+    without a fabricated stack frame for its truncated tail) rather than
+    being silently discarded. Exercises the real stream_artifact_events()
+    entry point end to end, not just _parse_stack_frames() in isolation.
 
     The file's last line here is never terminated (no trailing newline) and
-    ends mid-token ("incomple") - the same generic, format-agnostic
-    truncated-tail signature as real cut-off uploads - so it is now isolated
-    entirely (see _tail_record_is_truncated in diagnostic_adapters.py)
-    rather than surviving as a misleading bare ERROR record with no stack
-    frames. Everything before it is untouched.
+    ends mid-token ("incomple"). EOF-after-a-word does not by itself prove
+    the word was cut in half (a perfectly valid file may end that way with
+    no newline at all) - see the module docstring in diagnostic_adapters.py
+    for why the previous EOF/no-newline/ends-mid-alnum heuristic was removed
+    entirely. The only thing genuinely known here is structural: a Python
+    "File ..., line N, in FUNC" frame with nothing after it in the record is
+    unreliable (Python's own traceback formatter always follows it with a
+    source-snippet line) - so no StackFrame is fabricated for it - but the
+    surrounding ERROR-level record itself is real diagnostic content and
+    must survive.
     """
     content = (
         "2026-01-01 10:00:00 ERROR service=svc-a "
@@ -164,23 +170,23 @@ def test_truncated_frame_does_not_discard_the_rest_of_the_artifact(tmp_path):
     )
     events = [record.event for record in records if record.event is not None]
 
-    # The complete traceback and the plain INFO line (dropped as unimportant
-    # by existing retention rules - unrelated to this fix) are streamed as
-    # records; the truncated tail is isolated entirely rather than streamed
-    # as a misleading bare ERROR record.
-    assert len(records) == 2
+    # The complete svc-a traceback, the plain INFO line (dropped as
+    # unimportant by existing retention rules - unrelated to this fix), and
+    # the svc-b tail (now retained, see below) are all streamed as records.
+    assert len(records) == 3
 
     complete = next(e for e in events if e.service == "svc-a" and e.level == "ERROR")
     assert len(complete.stack_frames) == 1
     assert complete.stack_frames[0].function == "foo"
     assert complete.exception_type == "RuntimeError"
 
-    # The truncated svc-b tail never became evidence at all - not even a
-    # bare ERROR with empty stack_frames - since it is indistinguishable
-    # from a genuinely incomplete cut-off write.
-    assert not any(e.service == "svc-b" for e in events)
+    # The svc-b tail is real ERROR-level evidence (a service crashed) and
+    # must not be silently deleted just because it is the artifact's last,
+    # newline-less record - only its incomplete trailing frame is withheld,
+    # never fabricated as a StackFrame with a guessed/truncated function
+    # name ("incomple" is never persisted as if it were the real name).
+    tail = next(e for e in events if e.service == "svc-b")
+    assert tail.level == "ERROR"
+    assert tail.stack_frames == []
 
-    # Artifact-level outcome is unaffected: not marked unsupported/
-    # zero-evidence merely because its last record was incomplete - the
-    # earlier, complete traceback is still real, retained evidence.
-    assert len(events) == 1
+    assert len(events) == 2

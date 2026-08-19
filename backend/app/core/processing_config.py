@@ -12,6 +12,17 @@ JSON_STREAM_BUFFER_BYTES = 64 * 1024
 MAX_FINGERPRINT_LENGTH = 255
 MAX_REPRESENTATIVE_LINE_BYTES = 64 * 1024 - 1
 
+# Bounds for the SIMPLE-path Gemini context (build_simple_llm_context) -
+# a large uncorrelated investigation can retain thousands of Evidence rows
+# under bounded-memory ingestion, but that guarantee is worthless if every
+# one of them is later dumped into a single Gemini request. The CORRELATED
+# path is already implicitly bounded (roots_per_component + a small fixed
+# number of additional source-matched nodes per component); these give
+# SIMPLE mode an analogous explicit, deterministic bound instead of
+# scattering magic numbers at the call site.
+SIMPLE_LLM_MAX_EVIDENCE_RECORDS = 200
+SIMPLE_LLM_MAX_CONTEXT_BYTES = 2 * MEBIBYTE
+
 # Optional source-code input (GitHub URL or ZIP), kept separate from
 # diagnostic artifact limits above.
 SOURCE_STORAGE_ROOT = "uploads/sources"

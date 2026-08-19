@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import re
 import shlex
 from collections.abc import Iterator, Mapping
@@ -160,7 +159,11 @@ def _stream_image_events(
         global_line += 1
         line_bytes = len(line.encode("utf-8", errors="replace")) + 1
 
-        if pending is not None and _is_multiline_continuation(pending, line):
+        if (
+            pending is not None
+            and _is_multiline_continuation(pending, line)
+            and pending.size_bytes + line_bytes <= MAX_DIAGNOSTIC_RECORD_BYTES
+        ):
             pending.lines.append(line)
             pending.end_global_line = global_line
             pending.artifact_line_number = local_line
@@ -210,6 +213,24 @@ def _build_image_text_event(
             defaults=defaults,
         )
         _default_level_for_bare_stack_frame(event, raw_text)
+        # _stack_trace_may_be_important() already established this OCR text
+        # is genuinely diagnostic (a marker like "error"/"exception"/
+        # "failure"/"critical"/"slow query" or a stack frame is present),
+        # but normalize_text_event()'s stricter, structured level detection
+        # (a standalone LOG_LEVEL_PATTERN token, a capitalized
+        # "XxxException:"-style match, or a recognized frame) can still
+        # legitimately come back empty - e.g. OCR prose like "An exception
+        # occurred while saving the file" carries the marker but no
+        # standalone level token. Without this, such text would silently
+        # vanish at the Evidence-persistence gate (_IMPORTANT_LEVELS in
+        # app/tasks/analysis.py checks event.level, never the raw text)
+        # even though it already passed the importance check right above -
+        # exactly the "parser cannot fully structure it" case the bounded
+        # structured fallback exists for. Never overrides a level that was
+        # actually found; scoped to images only, other formats' retention
+        # semantics are unchanged.
+        if event.level is None:
+            event.level = "ERROR"
         # Real RapidOCR confidence for the image this record came from,
         # never fabricated - set here rather than threaded through
         # normalize_text_event() (shared by every non-image text format,
@@ -262,51 +283,6 @@ def _cloudfront_fields_from_line(line: str) -> list[str] | None:
     if not {'date', 'time', 'sc-status', 'cs-uri-stem'} <= lowered or not lowered.intersection({'x-edge-location', 'x-edge-request-id', 'x-edge-result-type'}):
         return None
     return fields
-
-def _ends_mid_token(text: str) -> bool:
-    stripped = text.rstrip()
-    if not stripped:
-        return False
-    last = stripped[-1]
-    return last.isalnum() or last == "_"
-
-
-def _file_ends_without_trailing_newline(file_path: str) -> bool:
-    size = os.path.getsize(file_path)
-    if size == 0:
-        return False
-    with open(file_path, "rb") as handle:
-        handle.seek(-1, os.SEEK_END)
-        return handle.read(1) != b"\n"
-
-
-def _tail_record_is_truncated(
-    file_path: str,
-    raw_text: str,
-    *,
-    record_start_offset: int,
-    record_end_offset: int,
-) -> bool:
-    """Generic, format-agnostic guard against a genuinely incomplete final
-    record (e.g. an upload cut off mid-write) being retained as normal
-    Evidence just because it happens to contain a marker word/field. Real
-    truncated tails observed in production ("Runt", "Kafk", "trace_id=4bf")
-    share three structural traits, checked here instead of any
-    fixture/format-specific string matching: they are the artifact's actual
-    last bytes, the file has no terminating newline, and the text ends
-    mid-token (no closing word boundary/punctuation). A lone single-record
-    artifact (record_start_offset == 0, i.e. nothing precedes it) is never
-    dropped this way - only a genuine tail fragment following real content
-    is ever isolated, never an artifact's only content.
-    """
-    if record_start_offset <= 0:
-        return False
-    if record_end_offset != os.path.getsize(file_path):
-        return False
-    if not _ends_mid_token(raw_text):
-        return False
-    return _file_ends_without_trailing_newline(file_path)
-
 
 def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int, start_artifact_line: int, global_line_number: int) -> Iterator[ArtifactEvent]:
     local_line = start_artifact_line
@@ -363,21 +339,21 @@ def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, sour
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
         pending = _PendingTextRecord(lines=[line], start_global_line=global_line, end_global_line=global_line, artifact_line_number=local_line, end_offset=end_offset, size_bytes=line_size, multiline_kind=_multiline_kind(artifact_format, line))
     if pending is not None:
-        record_start_offset = pending.end_offset - pending.size_bytes
-        if pending.multiline_kind != 'cri_partial' and _tail_record_is_truncated(
-            file_path,
-            '\n'.join(pending.lines),
-            record_start_offset=record_start_offset,
-            record_end_offset=pending.end_offset,
-        ):
-            logger.info(
-                'Artifact %s | tail record at line %s appears truncated '
-                '(no trailing newline, ends mid-token); isolating only this '
-                'final record, earlier content preserved',
-                file_path,
-                pending.artifact_line_number,
-            )
-        else:
+        # A trailing CRI 'P' (partial) fragment that never got its
+        # concluding 'F' line has an explicit, unambiguous continuation
+        # signal from the format itself (see the CRI_RE handling above) -
+        # that one case really is incomplete and is correctly never
+        # emitted. Every other final record - regardless of whether the
+        # file ends without a trailing newline, or its last character is
+        # alphanumeric - is a normal, structurally complete record (EOF
+        # after a word does not prove the word was cut in half) and must
+        # be yielded exactly like any other record. Genuine incompleteness
+        # is instead caught at the point that actually has structural
+        # evidence of it - e.g. _parse_stack_frames() already refuses a
+        # Python "File ..., line N, in FUNC" frame with nothing after it in
+        # the record, and a JSON/OTLP parse failure is handled where that
+        # parsing actually happens.
+        if pending.multiline_kind != 'cri_partial':
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
 _GENERIC_IMPORTANT_MARKERS = (
     "warn",
@@ -589,18 +565,17 @@ def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, sourc
         try:
             value = json.loads(line)
         except (json.JSONDecodeError, TypeError):
-            if _tail_record_is_truncated(
-                file_path, line, record_start_offset=end_offset - size_bytes, record_end_offset=end_offset,
-            ):
-                logger.info(
-                    'Artifact %s | tail JSON-line at line %s appears truncated; '
-                    'isolating only this final record, earlier content preserved',
-                    file_path,
-                    local_line,
-                )
-                event = None
-            else:
-                event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
+            # A JSON parse failure is real structural evidence this line is
+            # not valid JSON - it must never be promoted to trustworthy
+            # structured evidence (normalize_structured_event/its fields are
+            # never used here). It does NOT, on its own, prove the line is a
+            # truncated fragment rather than ordinary unstructured text
+            # (e.g. a plain-text line mixed into a JSON-lines file, or a
+            # genuinely final line with no trailing newline) - so it falls
+            # back to the same generic text handling any other unstructured
+            # line already gets, exactly like a non-final malformed line
+            # always has, instead of being silently discarded.
+            event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
         else:
             data = value if isinstance(value, Mapping) else {'body': value}
             event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value) if structured_event_may_be_important(data) else None
@@ -785,6 +760,15 @@ def _multiline_kind(artifact_format: ArtifactFormat, line: str) -> str | None:
         return 'panic_stack'
     if artifact_format == ArtifactFormat.STACK_TRACE and EXCEPTION_PATTERN.match(line.strip()):
         return 'language_stack'
+    if artifact_format == ArtifactFormat.STACK_TRACE and _contains_stack_frame(line):
+        # A bare frame line with no preceding "Traceback (most recent call
+        # last)"/exception-in-thread header - e.g. a cropped screenshot that
+        # only captured the frame chain itself. Grouped with the same
+        # continuation rules as language_stack below so the whole chain
+        # still becomes one coherent record instead of one singleton record
+        # per frame line (see _is_multiline_continuation's 'bare_frame_chain'
+        # case for the one-plain-line-per-frame source-snippet allowance).
+        return 'bare_frame_chain'
     if artifact_format == ArtifactFormat.DATABASE and line.lstrip().startswith(('# Time:', 'Time:')):
         return 'database_block'
     if artifact_format == ArtifactFormat.STACK_TRACE and any((marker in lowered for marker in ('crash report', 'core dumped', 'fatal signal'))):
@@ -805,6 +789,24 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
         return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'Caused by:', 'Suppressed:')))
     if record.multiline_kind == 'language_stack':
         return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')))
+    if record.multiline_kind == 'bare_frame_chain':
+        return bool(
+            not stripped
+            or line.startswith((' ', '\t'))
+            or _contains_stack_frame(stripped)
+            or stripped.startswith(('Caused by:', 'Suppressed:'))
+            or stripped == 'During handling of the above exception, another exception occurred:'
+            or EXCEPTION_PATTERN.match(stripped)
+            # Real tracebacks follow each "File ..., line N" frame with
+            # exactly one source-code snippet line - OCR routinely loses
+            # that line's leading indentation, so it wouldn't otherwise
+            # match any rule above. Only fold in ONE such plain line
+            # (checked against the record's last already-accepted line,
+            # not this new one), so unrelated OCR noise two lines after a
+            # frame still starts its own record rather than being swallowed
+            # indefinitely.
+            or (record.lines and _contains_stack_frame(record.lines[-1]))
+        )
     return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')) or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.search(stripped))
 
 def _stack_trace_may_be_important(raw_text: str) -> bool:

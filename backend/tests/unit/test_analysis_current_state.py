@@ -240,4 +240,9 @@ def test_completed_correlated_analysis_includes_correlated_result():
     result = state["investigation_result"]
     assert result["investigation_path"] == "correlated"
     assert result["component_count"] == 1
-    assert result["components"][0]["edges"]
+    # Both rows share trace_id at the exact SAME timestamp - a real
+    # relationship, but with no signal establishing which one came first,
+    # so it is an association (see FIX 4), not a fabricated causal edge.
+    assert len(result["components"][0]["nodes"]) == 2
+    assert result["components"][0]["associations"]
+    assert result["components"][0]["edges"] == []

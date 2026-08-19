@@ -9,8 +9,8 @@ Covers both the pure `build_correlation_payload()` contract (mirroring
 test_investigation_context.py's style, with a real run_correlation()) and an
 end-to-end real-sqlite `_finalize_analysis_task` run proving the production
 wiring: a zero-evidence artifact never blocks the analysis, never removes
-other artifacts' evidence, and shows up in the published correlation_result
-payload.
+other artifacts' evidence, and shows up in the published investigation_result
+payload (the single authoritative final SSE event - see FIX 4/analysis_events.py).
 """
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -289,11 +289,11 @@ def _sqlite_analysis_with_mixed_evidence(monkeypatch):
 def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkeypatch):
     analysis_id, artifact_ids = _sqlite_analysis_with_mixed_evidence(monkeypatch)
 
-    correlation_results = []
+    investigation_results = []
     monkeypatch.setattr(
         analysis_task,
-        "publish_correlation_result",
-        lambda analysis_id, payload: correlation_results.append(payload),
+        "publish_investigation_result",
+        lambda analysis_id, payload: investigation_results.append(payload),
     )
     published_progress = []
     monkeypatch.setattr(
@@ -313,8 +313,11 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
     finally:
         db.close()
 
-    assert len(correlation_results) == 1
-    payload = correlation_results[0]
+    # investigation_result is the single authoritative final SSE event -
+    # published exactly once for this analysis (see FIX 4).
+    assert len(investigation_results) == 1
+    payload = investigation_results[0]
+    assert payload["investigation_path"] == "correlated"
 
     # Requirement 4: the real evidence from the two contributing artifacts
     # is untouched - correlated normally, not diluted by the zero-evidence one.
@@ -351,9 +354,10 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
 def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
     """Requirement 7: when NO artifact produced any evidence at all, the
     existing early-return "no meaningful diagnostic evidence found" path
-    must still fire, with no correlation_result published at all - this
-    task only adds per-artifact outcomes to the CORRELATED payload, it does
-    not invent one for the whole-analysis-zero-evidence path."""
+    must still fire, publishing the zero_evidence-shaped investigation_result
+    (never a correlated-shaped one) - this task only adds per-artifact
+    outcomes to the CORRELATED payload, it does not invent one for the
+    whole-analysis-zero-evidence path."""
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
@@ -379,16 +383,19 @@ def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
     analysis_id = analysis.id
     db.close()
 
-    correlation_results = []
+    investigation_results = []
     monkeypatch.setattr(
         analysis_task,
-        "publish_correlation_result",
-        lambda analysis_id, payload: correlation_results.append(payload),
+        "publish_investigation_result",
+        lambda analysis_id, payload: investigation_results.append(payload),
     )
 
     analysis_task._finalize_analysis_task.run([], analysis_id, None)
 
-    assert correlation_results == []
+    assert len(investigation_results) == 1
+    assert investigation_results[0]["investigation_path"] == "zero_evidence"
+    assert "components" not in investigation_results[0]
+    assert "edges" not in investigation_results[0]
 
     db = session_factory()
     try:

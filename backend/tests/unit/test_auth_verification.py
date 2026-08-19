@@ -10,6 +10,7 @@ from fastapi import HTTPException, Response
 from app.api import auth as auth_api
 from app.core.config import Settings
 from app.core.security import ALGORITHM, SECRET_KEY
+from app.schemas.user import ForgotPasswordRequest
 from app.services.email import send_verification_email
 
 
@@ -110,3 +111,115 @@ def test_verification_email_links_to_the_frontend_verify_page(monkeypatch):
 
     assert sent["url"] == f"{Settings.FRONTEND_URL}/verify-email?token=abc123"
     assert "localhost:8000" not in sent["url"]
+
+
+# --- forgot-password: undefined send_password_reset_email regression ------
+
+
+def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch):
+    """Regression for the previous bug: forgot_password() called
+    send_password_reset_email(...) without it being imported/defined
+    anywhere, so a real request would fail at runtime with a NameError.
+    This exercises the REAL call chain (auth.py -> app.services.email ->
+    app.services.email_service) down to the SES boundary - only
+    ses_client.send_email itself is mocked, proving every name in between
+    actually resolves."""
+    user = SimpleNamespace(email="verified@example.com", is_verified=True)
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    sent = {}
+    monkeypatch.setattr(
+        "app.services.email_service.ses_client.send_email",
+        lambda **kwargs: sent.update(kwargs) or {"MessageId": "fake"},
+    )
+
+    result = auth_api.forgot_password(
+        request=ForgotPasswordRequest(email=user.email), db=Mock()
+    )
+
+    assert result == {
+        "message": (
+            "If an account exists for this email, "
+            "a password reset link has been sent."
+        )
+    }
+    assert sent["Destination"] == {"ToAddresses": [user.email]}
+    assert sent["Message"]["Subject"]["Data"] != "Verify your Devflo account"
+    reset_body = sent["Message"]["Body"]["Text"]["Data"]
+    assert f"{Settings.FRONTEND_URL}/reset-password?token=" in reset_body
+    assert "localhost:3000" not in reset_body
+
+
+def test_forgot_password_reset_token_is_a_real_password_reset_token(monkeypatch):
+    user = SimpleNamespace(email="verified@example.com", is_verified=True)
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    captured = {}
+    monkeypatch.setattr(
+        auth_api,
+        "send_password_reset_email",
+        lambda email, token: captured.update(email=email, token=token),
+    )
+
+    auth_api.forgot_password(request=ForgotPasswordRequest(email=user.email), db=Mock())
+
+    payload = jwt.decode(captured["token"], SECRET_KEY, algorithms=[ALGORITHM])
+    assert payload["sub"] == user.email
+    assert payload["type"] == "password_reset"
+
+
+def test_forgot_password_unknown_email_sends_nothing_but_same_message(monkeypatch):
+    """Anti-user-enumeration: an unknown email must get the identical
+    response and must not trigger any outbound email."""
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
+    send_mock = Mock()
+    monkeypatch.setattr(auth_api, "send_password_reset_email", send_mock)
+
+    result = auth_api.forgot_password(
+        request=ForgotPasswordRequest(email="ghost@example.com"), db=Mock()
+    )
+
+    assert result == {
+        "message": (
+            "If an account exists for this email, "
+            "a password reset link has been sent."
+        )
+    }
+    send_mock.assert_not_called()
+
+
+def test_forgot_password_unverified_user_sends_nothing_but_same_message(monkeypatch):
+    """An existing-but-unverified account must not leak its existence
+    either, and must not receive a reset link before it is even verified."""
+    user = SimpleNamespace(email="unverified@example.com", is_verified=False)
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    send_mock = Mock()
+    monkeypatch.setattr(auth_api, "send_password_reset_email", send_mock)
+
+    result = auth_api.forgot_password(
+        request=ForgotPasswordRequest(email=user.email), db=Mock()
+    )
+
+    assert result == {
+        "message": (
+            "If an account exists for this email, "
+            "a password reset link has been sent."
+        )
+    }
+    send_mock.assert_not_called()
+
+
+def test_password_reset_email_links_to_frontend_reset_page_not_localhost(monkeypatch):
+    """Mirrors test_verification_email_links_to_the_frontend_verify_page:
+    the reset link must use Settings.FRONTEND_URL, never the previous
+    hardcoded http://localhost:3000."""
+    from app.services.email import send_password_reset_email
+
+    sent = {}
+    monkeypatch.setattr(
+        "app.services.email.send_ses_password_reset_email",
+        lambda to_email, reset_url: sent.update(url=reset_url),
+    )
+
+    send_password_reset_email(email="user@example.com", token="reset-abc123")
+
+    assert sent["url"] == f"{Settings.FRONTEND_URL}/reset-password?token=reset-abc123"
+    assert "localhost:3000" not in sent["url"]

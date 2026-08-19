@@ -32,7 +32,6 @@ from app.services.investigation_context import (
 )
 from app.services.analysis_events import (
     publish_artifact_outcome,
-    publish_correlation_result,
     publish_investigation_result,
     publish_progress,
 )
@@ -486,13 +485,32 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 artifacts=artifact_outcomes,
             )
 
-            # Prepared for the Gemini integration to be wired in next; no
-            # Gemini SDK/API call exists in this codebase yet. artifacts=
-            # gives Gemini the same "nginx.log produced 8 evidence rows"
-            # provenance summary as the frontend payload, without dumping
-            # raw lines - the deterministic engine remains the sole
-            # authority on correlation/root-cause, this context only adds
-            # explanatory provenance around it.
+            logger.info(
+                "Analysis %s | correlation completed | components=%s | in %.2fs",
+                analysis_id,
+                len(correlation_run.result.components),
+                perf_counter() - correlation_start,
+            )
+
+            # Small correlation-stage completion signal, published before
+            # the Gemini call below (which can take a few seconds) so a
+            # live client sees "deterministic correlation is done" without
+            # waiting on the explanation layer - and, critically, BEFORE
+            # the authoritative final result, not after it (a progress
+            # event following the real final payload would misleadingly
+            # read as "still working").
+            publish_progress(
+                analysis_id,
+                "correlation",
+                "Deterministic correlation completed",
+                progress=99,
+            )
+
+            # artifacts= gives Gemini the same "nginx.log produced 8
+            # evidence rows" provenance summary as the frontend payload,
+            # without dumping raw lines - the deterministic engine remains
+            # the sole authority on correlation/root-cause, this context
+            # only adds explanatory provenance around it.
             llm_context = build_llm_context(
                 correlation_run,
                 evidence_rows,
@@ -501,32 +519,25 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
             gemini_result = generate_investigation_explanation(llm_context)
             correlation_payload["ai_analysis"] = gemini_result.model_dump()
+            # Persisted only now that Gemini has returned a valid schema
+            # result (generate_investigation_explanation raises otherwise,
+            # so this line is never reached on failure) - lets a client
+            # reconnecting after completion see the exact same explanation
+            # (reconstruct_current_investigation_result attaches this same
+            # field), without a second Gemini call.
+            analysis.ai_analysis = correlation_payload["ai_analysis"]
 
-            publish_correlation_result(
-                analysis_id,
-                correlation_payload,
-            )
-            # New unified final-result event (see build_correlation_payload's
-            # docstring context above) - same payload, published in addition
-            # to the pre-existing correlation_result event so any consumer
-            # relying on that event name keeps working unchanged.
+            # investigation_result is the single authoritative full final
+            # payload for this analysis, published exactly once. There is
+            # no separate correlation_result event: the previous "publish
+            # both" contract transmitted the entire node/edge/evidence
+            # graph over SSE twice for the same finished computation - it
+            # never ran correlation twice, only sent the result twice. No
+            # frontend code in this repository consumes correlation_result
+            # (verified directly, not assumed).
             publish_investigation_result(
                 analysis_id,
                 correlation_payload,
-            )
-
-            logger.info(
-                "Analysis %s | correlation completed | components=%s | in %.2fs",
-                analysis_id,
-                len(correlation_run.result.components),
-                perf_counter() - correlation_start,
-            )
-
-            publish_progress(
-                analysis_id,
-                "correlation",
-                "Deterministic correlation completed",
-                progress=99,
             )
         else:
             evidence_rows = (
@@ -565,6 +576,10 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
             gemini_result = generate_investigation_explanation(simple_llm_context)
             simple_payload["ai_analysis"] = gemini_result.model_dump()
+            # See the CORRELATED branch above: persisted only after a valid
+            # Gemini schema result, so reconnect can reattach it without a
+            # second Gemini call.
+            analysis.ai_analysis = simple_payload["ai_analysis"]
 
             publish_investigation_result(
                 analysis_id,
@@ -913,6 +928,8 @@ def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
 def reconstruct_current_investigation_result(
     db: Session,
     analysis_id: int,
+    *,
+    ai_analysis: dict | None = None,
 ) -> dict:
     """Re-derives the same final investigation_result payload a client
     would have received live via publish_investigation_result, purely from
@@ -923,6 +940,13 @@ def reconstruct_current_investigation_result(
     refactor of it): it reuses the exact same builders and query shapes
     that function already uses, just recomputed on demand rather than
     persisted as a new JSON blob (no schema change).
+
+    ai_analysis is the caller's already-loaded Analysis.ai_analysis (the
+    exact structured Gemini result persisted at live-completion time, see
+    _finalize_analysis_task) - reattached here, never recomputed, so
+    reconnect never triggers a second Gemini call. None for a zero-evidence
+    analysis (no Gemini call is ever made for those) or for any analysis
+    finalized before this field existed.
     """
     evidence_count = (
         db.query(func.count(Evidence.id))
@@ -960,9 +984,14 @@ def reconstruct_current_investigation_result(
             analysis_id=analysis_id,
             evidence_rows=evidence_rows,
         )
-        return build_correlation_payload(correlation_run, evidence_rows, artifacts=artifacts)
+        payload = build_correlation_payload(correlation_run, evidence_rows, artifacts=artifacts)
+    else:
+        payload = build_simple_payload(analysis_id, evidence_rows, artifacts=artifacts)
 
-    return build_simple_payload(analysis_id, evidence_rows, artifacts=artifacts)
+    if ai_analysis is not None:
+        payload["ai_analysis"] = ai_analysis
+
+    return payload
 
 
 def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
@@ -988,7 +1017,7 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
             # same shape), never by this number reaching some sentinel.
             "progress": 99,
             "investigation_result": reconstruct_current_investigation_result(
-                db, analysis.id
+                db, analysis.id, ai_analysis=analysis.ai_analysis
             ),
         }
 

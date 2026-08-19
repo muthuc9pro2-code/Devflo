@@ -28,6 +28,13 @@ Rules:
   supplied values. Do not replace Devflo's scores with your own.
 - Distinguish correlation from causation. A correlated event is not automatically
   a root cause.
+- Within a correlated investigation's components, "propagation" entries are
+  directed, causal relationships (Devflo already established real direction -
+  a parent-span match, or a genuine time-ordered signal). "associations"
+  entries are the opposite: two records are part of the same incident but no
+  direction was established (e.g. identical timestamps). Never describe an
+  association as one event causing or propagating into the other - describe
+  it only as corroborating/co-occurring evidence.
 - When multiple correlation components exist, do not merge separate incident
   groups unless the supplied evidence supports doing so.
 - Use artifact filenames and formats when they help explain which evidence
@@ -42,8 +49,8 @@ Rules:
 - For a simple investigation, analyze the supplied evidence directly. Do not
   invent correlation, propagation, components, or root-cause scores.
 - For a correlated investigation, use Devflo's supplied components, propagation,
-  strengths, root candidates, timings, signals, and evidence as the basis of the
-  explanation.
+  associations, strengths, root candidates, timings, signals, and evidence as
+  the basis of the explanation.
 - Prefer the strongest evidence-supported explanation. If alternatives remain
   plausible, state them clearly rather than pretending certainty.
 - Recommended actions must be concrete, technically useful, and ordered from the

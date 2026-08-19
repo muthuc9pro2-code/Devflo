@@ -207,7 +207,7 @@ def test_dispatch_publishes_progress_zero_first(monkeypatch):
     assert first_kwargs.get("progress") == 0
 
 
-def test_finalize_reports_99_never_100_and_correlation_result_is_completion_signal(monkeypatch, caplog):
+def test_finalize_reports_99_never_100_for_zero_evidence_analysis(monkeypatch, caplog):
     analysis_id = _sqlite_analysis_with_artifacts(monkeypatch, [10])
 
     published_progress = []
@@ -215,12 +215,6 @@ def test_finalize_reports_99_never_100_and_correlation_result_is_completion_sign
         analysis_task,
         "publish_progress",
         lambda analysis_id, stage, message, progress=None: published_progress.append(progress),
-    )
-    correlation_result_calls = []
-    monkeypatch.setattr(
-        analysis_task,
-        "publish_correlation_result",
-        lambda analysis_id, payload: correlation_result_calls.append(payload),
     )
 
     with caplog.at_level("INFO", logger="app.tasks.analysis"):

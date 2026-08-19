@@ -442,7 +442,7 @@ def _sqlite_session(monkeypatch):
     return session_factory, db, analysis
 
 
-def test_correlated_end_to_end_publishes_both_events_with_same_payload(monkeypatch):
+def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
     session_factory, db, analysis = _sqlite_session(monkeypatch)
     nginx = AnalysisArtifact(
         analysis_id=analysis.id, position=0, original_filename="nginx.log", saved_file_path="nginx.log",
@@ -468,18 +468,31 @@ def test_correlated_end_to_end_publishes_both_events_with_same_payload(monkeypat
     analysis_id = analysis.id
     db.close()
 
-    correlation_calls, investigation_calls = [], []
-    monkeypatch.setattr(analysis_task, "publish_correlation_result", lambda aid, p: correlation_calls.append(p))
+    investigation_calls = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: investigation_calls.append(p))
 
     analysis_task._finalize_analysis_task.run([], analysis_id, None)
 
-    assert len(correlation_calls) == 1
+    # investigation_result is the single authoritative full final payload -
+    # published exactly once, never twice (see FIX 4: there used to also be
+    # a duplicate correlation_result event carrying the identical payload).
     assert len(investigation_calls) == 1
-    assert correlation_calls[0] == investigation_calls[0]
     assert investigation_calls[0]["investigation_path"] == "correlated"
     outcome_by_format = {a["source_format"] for a in investigation_calls[0]["artifacts"]}
     assert outcome_by_format == {"web_server", "image"}
+
+
+def test_correlation_result_event_no_longer_exists(monkeypatch):
+    """Regression guard for FIX 4 (analysis_events.py): the duplicate
+    correlation_result event (a second full node/edge/evidence graph over
+    SSE for the same finished computation, with no frontend consumer) was
+    removed rather than kept "for compatibility" - this pins that
+    publish_correlation_result is genuinely gone, not merely unused, so it
+    cannot quietly come back."""
+    from app.services import analysis_events
+
+    assert not hasattr(analysis_events, "publish_correlation_result")
+    assert not hasattr(analysis_task, "publish_correlation_result")
 
 
 def test_simple_end_to_end_publishes_investigation_result_only(monkeypatch):
@@ -498,13 +511,11 @@ def test_simple_end_to_end_publishes_investigation_result_only(monkeypatch):
     analysis_id = analysis.id
     db.close()
 
-    correlation_calls, investigation_calls = [], []
-    monkeypatch.setattr(analysis_task, "publish_correlation_result", lambda aid, p: correlation_calls.append(p))
+    investigation_calls = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: investigation_calls.append(p))
 
     analysis_task._finalize_analysis_task.run([], analysis_id, None)
 
-    assert correlation_calls == []  # legacy event stays CORRELATED-only
     assert len(investigation_calls) == 1
     payload = investigation_calls[0]
     assert payload["investigation_path"] == "simple"

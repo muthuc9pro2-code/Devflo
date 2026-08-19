@@ -58,27 +58,17 @@ def publish_progress(
     )
 
 
-def publish_correlation_result(
-    analysis_id: int,
-    payload: dict[str, Any],
-) -> None:
-    publish_analysis_event(
-        analysis_id=analysis_id,
-        event="correlation_result",
-        data=payload,
-    )
-
-
 def publish_investigation_result(
     analysis_id: int,
     payload: dict[str, Any],
 ) -> None:
-    """Final investigation result, common to all three investigation
-    outcomes (correlated/simple/zero_evidence) - distinguished by the
-    payload's own `investigation_path` field. Published in addition to the
-    existing `correlation_result` event (still published, unchanged, for
-    the correlated path) rather than replacing it, so this is purely
-    additive to the existing SSE contract."""
+    """The single authoritative full final result, common to all three
+    investigation outcomes (correlated/simple/zero_evidence) - distinguished
+    by the payload's own `investigation_path` field. Published exactly
+    once per analysis. There used to also be a `correlation_result` event
+    carrying the identical correlated-path payload a second time (no
+    frontend code ever consumed it) - removed rather than kept "for
+    compatibility" against a contract nothing actually depended on."""
     publish_analysis_event(
         analysis_id=analysis_id,
         event="investigation_result",

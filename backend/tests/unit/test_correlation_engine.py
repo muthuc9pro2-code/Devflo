@@ -264,20 +264,27 @@ def test_sparse_unrelated_evidence_cannot_receive_a_perfect_correlation() -> Non
         ),
     ]
 
-    edges = build_correlation_edges(rows, build_correlation_indexes(rows))
-    assert edges == []
+    causal_edges, associations = build_correlation_edges(rows, build_correlation_indexes(rows))
+    assert causal_edges == []
+    assert associations == []
 
     run = run_correlation(analysis_id=1, evidence_rows=rows)
     assert len(run.result.components) == 5
     assert all(len(component.edges) == 0 for component in run.result.components)
+    assert all(len(component.associations) == 0 for component in run.result.components)
     assert all(len(component.nodes) == 1 for component in run.result.components)
 
 
 def test_real_matching_trace_id_still_correlates_normally() -> None:
     """The fix must not weaken genuine matching - only remove the false
-    sentinel-based one."""
-    left = _evidence(1, source_format="web_server", trace_id="trace-real-1")
-    right = _evidence(2, source_format="database", trace_id="trace-real-1")
+    sentinel-based one. Both records share the SAME explicit timestamp:
+    with no real time separation, a real trace_id match is still a
+    genuine relationship - just an association (same incident), not a
+    fabricated causal direction (see FIX 4: equal timestamps must not gain
+    direction merely from which side happens to be evidence id 1 vs 2)."""
+    same_time = datetime.now(timezone.utc)
+    left = _evidence(1, source_format="web_server", trace_id="trace-real-1", first_seen=same_time, last_seen=same_time)
+    right = _evidence(2, source_format="database", trace_id="trace-real-1", first_seen=same_time, last_seen=same_time)
 
     matches = match_correlation_signals(left, right)
 
@@ -286,9 +293,12 @@ def test_real_matching_trace_id_still_correlates_normally() -> None:
         for match in matches
     )
 
-    edges = build_correlation_edges([left, right], build_correlation_indexes([left, right]))
-    assert len(edges) == 1
-    assert edges[0].score > 0.0
+    causal_edges, associations = build_correlation_edges(
+        [left, right], build_correlation_indexes([left, right])
+    )
+    assert causal_edges == []
+    assert len(associations) == 1
+    assert associations[0].score > 0.0
 
 
 def test_classify_node_role_singleton_component_is_uncorrelated() -> None:
@@ -333,3 +343,203 @@ def test_classify_node_role_propagation_has_both() -> None:
         )
         == "propagation"
     )
+
+
+# --- FIX 4: association vs causation ---------------------------------------
+
+
+def test_equal_timestamp_relationship_never_gains_direction_from_evidence_id():
+    """The exact bug this fix targets: two records sharing a trace_id at
+    the EXACT same timestamp used to become a directed edge purely because
+    one had a lower evidence id / appeared first in the input list. The
+    higher-id record is deliberately listed FIRST here - if direction were
+    still leaking from id/iteration order, evidence-9 would wrongly become
+    the causal "source"."""
+    same_time = datetime.now(timezone.utc)
+    higher_id = _evidence(9, trace_id="trace-x", first_seen=same_time, last_seen=same_time)
+    lower_id = _evidence(3, trace_id="trace-x", first_seen=same_time, last_seen=same_time)
+
+    causal_edges, associations = build_correlation_edges(
+        [higher_id, lower_id], build_correlation_indexes([higher_id, lower_id])
+    )
+
+    assert causal_edges == []
+    assert len(associations) == 1
+    # A pure association carries no directional claim - only that the two
+    # ARE the same relationship, regardless of which id/order produced it.
+    assert {associations[0].source_id, associations[0].target_id} == {
+        "evidence-9",
+        "evidence-3",
+    }
+
+
+def test_strictly_earlier_record_becomes_causal_source_regardless_of_id_order():
+    """The flip side: a REAL time gap does establish direction, and that
+    direction must follow chronology, never evidence id. The
+    chronologically-earlier record here deliberately has the HIGHER
+    evidence id."""
+    base = datetime.now(timezone.utc)
+    earlier_but_higher_id = _evidence(
+        9, trace_id="trace-y", first_seen=base, last_seen=base
+    )
+    later_but_lower_id = _evidence(
+        3, trace_id="trace-y", first_seen=base + timedelta(milliseconds=500),
+        last_seen=base + timedelta(milliseconds=500),
+    )
+
+    causal_edges, associations = build_correlation_edges(
+        [earlier_but_higher_id, later_but_lower_id],
+        build_correlation_indexes([earlier_but_higher_id, later_but_lower_id]),
+    )
+
+    assert associations == []
+    assert len(causal_edges) == 1
+    assert causal_edges[0].source_id == "evidence-9"  # chronologically earlier
+    assert causal_edges[0].target_id == "evidence-3"  # chronologically later
+
+
+def test_exact_parent_span_match_is_causal_even_at_equal_timestamps():
+    """A genuine parent.span_id == child.parent_span_id relationship is
+    real directional evidence and may produce a directed causal edge even
+    when both records share the exact same timestamp - unlike a bare
+    trace_id/request_id match at equal timestamps, which must NOT."""
+    same_time = datetime.now(timezone.utc)
+    parent = _evidence(
+        1, source_format="opentelemetry", trace_id="trace-z", span_id="span-parent",
+        first_seen=same_time, last_seen=same_time,
+    )
+    child = _evidence(
+        2, source_format="opentelemetry", trace_id="trace-z", parent_span_id="span-parent",
+        first_seen=same_time, last_seen=same_time,
+    )
+
+    causal_edges, associations = build_correlation_edges(
+        [parent, child], build_correlation_indexes([parent, child])
+    )
+
+    assert len(causal_edges) == 1
+    assert causal_edges[0].source_id == "evidence-1"
+    assert causal_edges[0].target_id == "evidence-2"
+    assert associations == []
+
+
+def test_root_cause_score_never_treats_an_association_only_node_as_root():
+    """Two nodes connected ONLY by an association (equal timestamps, no
+    real causal signal) must not have either one score/rank as a "root" -
+    role must stay "uncorrelated" and the numeric score must not be
+    inflated by "zero incoming edges" the way a genuine root's would be."""
+    same_time = datetime.now(timezone.utc)
+    a = _evidence(1, trace_id="trace-assoc", first_seen=same_time, last_seen=same_time)
+    b = _evidence(2, trace_id="trace-assoc", first_seen=same_time, last_seen=same_time)
+
+    run = run_correlation(analysis_id=1, evidence_rows=[a, b])
+
+    assert len(run.result.components) == 1
+    component = run.result.components[0]
+    assert component.edges == []
+    assert len(component.associations) == 1
+    assert len(component.nodes) == 2
+
+    roles = {c.node_id: c for c in run.root_causes[0]}
+    assert roles["evidence-1"].role == "uncorrelated"
+    assert roles["evidence-2"].role == "uncorrelated"
+
+
+def test_correlation_direction_is_deterministic_regardless_of_evidence_row_order():
+    """Extends the order-invariance property to the equal-timestamp case
+    specifically: shuffling which record appears first in evidence_rows
+    must not change whether a pair is causal vs association, nor which
+    side a causal edge points from/to."""
+    import random
+
+    base = datetime.now(timezone.utc)
+    rows = [
+        _evidence(1, trace_id="trace-shuffle", first_seen=base, last_seen=base),
+        _evidence(
+            2, trace_id="trace-shuffle",
+            first_seen=base + timedelta(milliseconds=200),
+            last_seen=base + timedelta(milliseconds=200),
+        ),
+        _evidence(3, trace_id="trace-shuffle", first_seen=base, last_seen=base),
+    ]
+
+    def signature(rows_order):
+        causal_edges, associations = build_correlation_edges(
+            rows_order, build_correlation_indexes(rows_order)
+        )
+        return (
+            sorted((e.source_id, e.target_id) for e in causal_edges),
+            sorted(tuple(sorted((a.source_id, a.target_id))) for a in associations),
+        )
+
+    baseline = signature(rows)
+    shuffled = list(rows)
+    random.Random(7).shuffle(shuffled)
+
+    assert signature(shuffled) == baseline
+    assert signature(list(reversed(rows))) == baseline
+
+
+def test_equal_timestamp_same_request_id_is_associated_not_causal():
+    """Same requirement as the trace_id case above, for request_id -
+    listed as its own required regression case since match_correlation_
+    signals/iter_identity_candidates treat the two id kinds as independent
+    candidate sources, not because the scoring differs."""
+    same_time = datetime.now(timezone.utc)
+    a = _evidence(1, request_id="req-x", first_seen=same_time, last_seen=same_time)
+    b = _evidence(2, request_id="req-x", first_seen=same_time, last_seen=same_time)
+
+    causal_edges, associations = build_correlation_edges(
+        [a, b], build_correlation_indexes([a, b])
+    )
+
+    assert causal_edges == []
+    assert len(associations) == 1
+    assert any(s.value == "request_id" for s in associations[0].signals)
+
+
+def test_association_only_relationship_does_not_inflate_downstream_causal_counts():
+    """A node connected to the rest of its component ONLY via association
+    (equal timestamps) must contribute nothing to any other node's
+    incoming/outgoing/downstream causal graph stats - those are computed
+    from component.edges (causal) only, never component.associations."""
+    same_time = datetime.now(timezone.utc)
+    later = same_time + timedelta(milliseconds=500)
+
+    # A causally precedes B (real positive delta, shared trace_id); C only
+    # associates with A via a separate equal-timestamp request_id match -
+    # event_type=None and a unique service on C/victim so NEITHER the
+    # EXCEPTION nor SERVICE structural signal accidentally links C to
+    # victim through the temporal-fallback path (that would defeat the
+    # point of this test: C must have NO real path to victim at all).
+    root = _evidence(
+        1, trace_id="trace-chain", request_id="req-shared", event_type=None,
+        service="svc-root", first_seen=same_time, last_seen=same_time,
+    )
+    victim = _evidence(
+        2, trace_id="trace-chain", event_type=None, service="svc-root",
+        first_seen=later, last_seen=later,
+    )
+    associated_only = _evidence(
+        3, trace_id="trace-other", request_id="req-shared", event_type=None,
+        service="svc-unrelated", first_seen=same_time, last_seen=same_time,
+    )
+
+    run = run_correlation(analysis_id=1, evidence_rows=[root, victim, associated_only])
+
+    assert len(run.result.components) == 1
+    component = run.result.components[0]
+    assert len(component.nodes) == 3
+    assert len(component.associations) >= 1
+
+    stats_by_id = {c.node_id: c.graph_stats for c in run.root_causes[0]}
+    # root's real causal edge to victim is unaffected by the association.
+    assert stats_by_id["evidence-1"].outgoing_count == 1
+    assert stats_by_id["evidence-1"].downstream_count == 1
+    # The association-only node contributes zero incoming/outgoing/
+    # downstream to ANY node's causal graph stats.
+    assert stats_by_id["evidence-3"].incoming_count == 0
+    assert stats_by_id["evidence-3"].outgoing_count == 0
+    assert stats_by_id["evidence-3"].downstream_count == 0
+    roles = {c.node_id: c.role for c in run.root_causes[0]}
+    assert roles["evidence-3"] == "uncorrelated"

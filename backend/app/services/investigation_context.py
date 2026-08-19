@@ -1,5 +1,10 @@
 from __future__ import annotations
+from datetime import datetime, timezone
 from typing import Any
+from app.core.processing_config import (
+    SIMPLE_LLM_MAX_CONTEXT_BYTES,
+    SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
+)
 from app.models.evidence import Evidence
 from app.services.correlation_engine import CorrelationRun
 
@@ -12,6 +17,119 @@ _NO_EVIDENCE_MESSAGE = (
 )
 _NO_EVIDENCE_ANALYSIS_MESSAGE = "No meaningful diagnostic evidence found"
 _UNSUPPORTED_MESSAGE = "This file type is not supported for diagnostic analysis."
+
+# Reuses the same severity vocabulary normalize_level()/LEVEL_ALIASES
+# already normalize evidence.severity into - not a new severity scale.
+_SIMPLE_LLM_SEVERITY_RANK = {
+    "CRITICAL": 3,
+    "ERROR": 2,
+    "WARNING": 1,
+    "WARN": 1,
+}
+_DATETIME_MIN_UTC = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _simple_llm_priority_key(evidence: Evidence) -> tuple:
+    """Deterministic priority for SIMPLE-mode Gemini context selection -
+    only already-computed signals (a real source-code match, severity,
+    occurrence_count, then a stable timestamp/id tiebreak), no AI-based
+    ranking and no second root-cause engine. Sorts ascending, so stronger
+    candidates (True/higher numbers) are negated to sort first."""
+    has_source_match = bool(evidence.source_matches)
+    severity_rank = _SIMPLE_LLM_SEVERITY_RANK.get(
+        (evidence.severity or "").upper(), 0
+    )
+    first_seen = evidence.first_seen
+    if first_seen is not None and first_seen.tzinfo is None:
+        first_seen = first_seen.replace(tzinfo=timezone.utc)
+    return (
+        0 if has_source_match else 1,
+        -severity_rank,
+        -(evidence.occurrence_count or 0),
+        first_seen or _DATETIME_MIN_UTC,
+        evidence.id,
+    )
+
+
+def _evidence_context_size_bytes(evidence: Evidence) -> int:
+    """Approximate serialized size of one evidence row's free-text content
+    in the Gemini context - the one part of _evidence_payload whose size is
+    not already otherwise bounded (representative_line and source-match
+    snippets can each be sizable free text)."""
+    size = len((evidence.representative_line or "").encode("utf-8", errors="replace"))
+
+    for match in evidence.source_matches or []:
+        snippet = match.get("snippet") if isinstance(match, dict) else None
+        if snippet:
+            size += len(str(snippet).encode("utf-8", errors="replace"))
+
+    return size
+
+
+def _select_bounded_simple_evidence(
+    evidence_rows: list[Evidence],
+    *,
+    max_records: int = SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
+    max_context_bytes: int = SIMPLE_LLM_MAX_CONTEXT_BYTES,
+) -> list[Evidence]:
+    """Deterministic, bounded evidence selection for build_simple_llm_context.
+    Reused priorities only (source match > severity > occurrence_count >
+    stable time/id order) - this is not a second root-cause engine, just a
+    cap on what an uncorrelated investigation is allowed to hand to Gemini
+    in one request. Round-robins across artifacts (in a stable, sorted
+    artifact_id order) so one artifact with many rows cannot crowd out
+    every other artifact's evidence merely by having more of it - this is
+    the "artifact diversity" priority.
+    """
+    if len(evidence_rows) <= max_records:
+        total_bytes = sum(_evidence_context_size_bytes(e) for e in evidence_rows)
+        if total_bytes <= max_context_bytes:
+            return evidence_rows
+
+    by_artifact: dict[int, list[Evidence]] = {}
+    for evidence in evidence_rows:
+        by_artifact.setdefault(evidence.artifact_id, []).append(evidence)
+
+    for rows in by_artifact.values():
+        rows.sort(key=_simple_llm_priority_key)
+
+    queues = {
+        artifact_id: iter(rows)
+        for artifact_id, rows in by_artifact.items()
+    }
+    active_artifact_ids = sorted(by_artifact.keys())
+
+    selected: list[Evidence] = []
+    selected_bytes = 0
+    budget_reached = False
+
+    while active_artifact_ids and not budget_reached:
+        next_round: list[int] = []
+
+        for artifact_id in active_artifact_ids:
+            if len(selected) >= max_records or selected_bytes >= max_context_bytes:
+                budget_reached = True
+                break
+
+            evidence = next(queues[artifact_id], None)
+            if evidence is None:
+                continue
+
+            size = _evidence_context_size_bytes(evidence)
+            # Always take at least one record if nothing has been selected
+            # yet (a single oversized record must not empty the context
+            # entirely) - otherwise stop adding once the byte budget would
+            # be exceeded.
+            if selected and selected_bytes + size > max_context_bytes:
+                continue
+
+            selected.append(evidence)
+            selected_bytes += size
+            next_round.append(artifact_id)
+
+        active_artifact_ids = next_round
+
+    return selected
 
 
 def _count_evidence_by_artifact(evidence_rows: list[Evidence]) -> dict[int, int]:
@@ -133,6 +251,8 @@ def build_correlation_payload(
                     for candidate in root_candidates
                 ],
                 "nodes": nodes,
+                # Directed, causal relationships only - see
+                # CorrelationComponent.edges' docstring in correlation_engine.py.
                 "edges": [
                     {
                         "source_id": edge.source_id,
@@ -145,6 +265,25 @@ def build_correlation_payload(
                         ],
                     }
                     for edge in component.edges
+                ],
+                # Non-directional "same incident" relationships (e.g. equal
+                # timestamps, or a timestamp missing on either side) - real
+                # correlation, but no real signal establishes which side
+                # caused the other. node_a/node_b deliberately (not
+                # source_id/target_id) so no direction is implied by the
+                # field names themselves.
+                "associations": [
+                    {
+                        "node_a": association.source_id,
+                        "node_b": association.target_id,
+                        "correlation_strength": round(association.score, 4),
+                        "delta_ms": association.delta_ms,
+                        "signals": [
+                            signal.value
+                            for signal in association.signals
+                        ],
+                    }
+                    for association in component.associations
                 ],
             }
         )
@@ -237,17 +376,34 @@ def build_simple_llm_context(
     *,
     artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
+    # Bounded, deterministic selection (see _select_bounded_simple_evidence)
+    # - the final frontend/database payload (build_simple_payload) still
+    # carries every retained evidence row; only what reaches Gemini in one
+    # request is capped.
+    selected_evidence = _select_bounded_simple_evidence(evidence_rows)
+    truncated = len(selected_evidence) < len(evidence_rows)
+
+    instruction = (
+        "Explain the available diagnostic evidence and suggest "
+        "debugging/investigation steps. Do not invent evidence "
+        "or claim a definitive fix."
+    )
+    if truncated:
+        instruction += (
+            " Only the most diagnostically relevant evidence records "
+            "(evidence_count_included of evidence_count_total) are "
+            "included below - do not assume this is the complete set."
+        )
+
     context: dict[str, Any] = {
         "analysis_id": analysis_id,
         "investigation_path": "simple",
-        "instruction": (
-            "Explain the available diagnostic evidence and suggest "
-            "debugging/investigation steps. Do not invent evidence "
-            "or claim a definitive fix."
-        ),
+        "instruction": instruction,
+        "evidence_count_total": len(evidence_rows),
+        "evidence_count_included": len(selected_evidence),
         "evidence": [
             _evidence_payload(evidence)
-            for evidence in evidence_rows
+            for evidence in selected_evidence
         ],
     }
 
@@ -334,6 +490,10 @@ def build_llm_context(
                     }
                     for candidate in root_candidates
                 ],
+                # Directed, causal relationships only - never an equal-
+                # timestamp/unknown-timestamp association (see associations
+                # below). Gemini must not be told an association is
+                # propagation.
                 "propagation": [
                     {
                         "source": edge.source_id,
@@ -346,6 +506,24 @@ def build_llm_context(
                         ],
                     }
                     for edge in component.edges
+                ],
+                # Same-incident relationships with no established direction
+                # (equal timestamps, or a timestamp missing on either side) -
+                # kept separate from "propagation" so Gemini can describe
+                # these as corroborating/associated evidence rather than a
+                # causal chain.
+                "associations": [
+                    {
+                        "node_a": association.source_id,
+                        "node_b": association.target_id,
+                        "correlation_strength": round(association.score, 4),
+                        "delta_ms": association.delta_ms,
+                        "signals": [
+                            signal.value
+                            for signal in association.signals
+                        ],
+                    }
+                    for association in component.associations
                 ],
                 "root_evidence": [
                     _evidence_payload(evidence_by_id[evidence_id])

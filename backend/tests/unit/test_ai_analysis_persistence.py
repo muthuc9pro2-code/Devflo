@@ -1,0 +1,202 @@
+"""FIX 6: the Gemini AI explanation delivered live must survive a client
+refresh/reconnect after the analysis already completed.
+
+Before this fix, _finalize_analysis_task computed gemini_result and put it
+straight into the live SSE payload, but reconstruct_current_investigation_
+result (used by compute_current_analysis_state on reconnect) re-derived only
+deterministic state from persisted Evidence/AnalysisArtifact rows - it never
+attached any ai_analysis at all. A client reconnecting after completion saw
+a payload with no ai_analysis key, and the only way to get one back would
+have been a second, non-deterministic, costly Gemini call.
+
+These tests exercise the real end-to-end path against a real (sqlite)
+database: _finalize_analysis_task.run(...) for live completion, then
+compute_current_analysis_state(db, analysis) for reconnect - only
+generate_investigation_explanation (the actual Gemini SDK boundary) is
+mocked.
+"""
+from datetime import datetime, timezone
+from unittest.mock import Mock
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.db.database import Base
+from app.models import Analysis, AnalysisArtifact, Evidence, User
+from app.schemas.gemini import GeminiInvestigationResponse
+from app.tasks import analysis as analysis_task
+
+_FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
+    title="Database timeout in payment worker",
+    summary="A database timeout caused cascading payment failures.",
+    probable_root_causes=[],
+    what_happened=["The database connection pool was exhausted."],
+    source_code_findings=[],
+    recommended_actions=["Increase the connection pool size."],
+    uncertainties=[],
+)
+
+
+def _db_with_schema(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
+    return session_factory
+
+
+def _seed_analysis(session_factory, *, evidence_rows_kwargs: list[dict]) -> int:
+    db = session_factory()
+    user = User(username="t", email="t@example.com", hashed_password="x", is_verified=True)
+    db.add(user)
+    db.commit()
+
+    analysis = Analysis(
+        user_id=user.id, original_filename="a", saved_file_path="a", status="processing"
+    )
+    db.add(analysis)
+    db.commit()
+
+    artifact = AnalysisArtifact(
+        analysis_id=analysis.id,
+        position=0,
+        original_filename="artifact-0",
+        saved_file_path="artifact-0",
+        size_bytes=10,
+        status="completed",
+        last_processed_line=1,
+        processed_bytes=10,
+    )
+    db.add(artifact)
+    db.commit()
+
+    base = datetime.now(timezone.utc)
+    for i, kwargs in enumerate(evidence_rows_kwargs):
+        defaults = dict(
+            analysis_id=analysis.id,
+            artifact_id=artifact.id,
+            correlation_key=f"ck-{i}",
+            fingerprint=f"fp-{i}",
+            first_line_number=1,
+            last_line_number=1,
+            first_seen=base,
+            severity="ERROR",
+        )
+        defaults.update(kwargs)
+        db.add(Evidence(**defaults))
+    db.commit()
+
+    analysis_id = analysis.id
+    db.close()
+    return analysis_id
+
+
+def _mock_gemini(monkeypatch, calls: list):
+    def fake(context):
+        calls.append(context)
+        return _FAKE_GEMINI_RESULT
+
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", fake)
+
+
+def test_live_correlated_completion_persists_ai_analysis(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(
+        session_factory,
+        evidence_rows_kwargs=[
+            {"trace_id": "trace-1", "service": "db"},
+            {"trace_id": "trace-1", "service": "api"},
+        ],
+    )
+    calls: list = []
+    _mock_gemini(monkeypatch, calls)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert len(calls) == 1  # exactly one live Gemini call
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.status == "completed"
+    assert analysis.ai_analysis == _FAKE_GEMINI_RESULT.model_dump()
+    db.close()
+
+
+def test_live_simple_completion_persists_ai_analysis(monkeypatch):
+    """A single evidence row (no shared trace/request/span) takes the
+    SIMPLE path - ai_analysis must be persisted there too."""
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(
+        session_factory,
+        evidence_rows_kwargs=[{"service": "worker"}],
+    )
+    calls: list = []
+    _mock_gemini(monkeypatch, calls)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert len(calls) == 1
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.status == "completed"
+    assert analysis.ai_analysis == _FAKE_GEMINI_RESULT.model_dump()
+    db.close()
+
+
+def test_reconnect_returns_persisted_ai_analysis_without_calling_gemini_again(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(
+        session_factory,
+        evidence_rows_kwargs=[
+            {"trace_id": "trace-1", "service": "db"},
+            {"trace_id": "trace-1", "service": "api"},
+        ],
+    )
+    live_calls: list = []
+    _mock_gemini(monkeypatch, live_calls)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    assert len(live_calls) == 1
+
+    # Simulate reconnect: a fresh call into generate_investigation_explanation
+    # that would raise loudly if invoked - proves reconnect never calls it.
+    def _must_not_be_called(context):
+        raise AssertionError("reconnect must not call Gemini again")
+
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _must_not_be_called)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+    db.close()
+
+    assert state["status"] == "completed"
+    assert state["investigation_result"]["ai_analysis"] == _FAKE_GEMINI_RESULT.model_dump()
+
+
+def test_zero_evidence_analysis_has_no_ai_analysis(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(session_factory, evidence_rows_kwargs=[])
+    calls: list = []
+    _mock_gemini(monkeypatch, calls)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert calls == []  # no evidence -> no Gemini call at all, as before
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.ai_analysis is None
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+    db.close()
+
+    assert "ai_analysis" not in state["investigation_result"]

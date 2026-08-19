@@ -122,9 +122,90 @@ def test_ocr_bare_python_frames_with_no_error_keyword_still_become_evidence(monk
     records = _stream_ocr_text(monkeypatch, tmp_path, ocr_text)
     events = _retained_events(records)
 
-    assert len(events) >= 1
-    assert all(event.level == "ERROR" for event in events)
-    assert any("auth.py" in event.raw_line and "13" in event.raw_line for event in events)
+    # The whole frame chain must reconstruct into ONE coherent record, not
+    # five unrelated singleton "incidents" (one per bare "File ..." line) -
+    # see test_image_ocr_record_reconstruction module docstring's sibling
+    # concern, and the real-world regression this guards: a single
+    # ImportError screenshot previously became 5 separate uncorrelated
+    # components in the correlation graph.
+    assert len(events) == 1
+    assert events[0].level == "ERROR"
+    assert "auth.py" in events[0].raw_line and "13" in events[0].raw_line
+    assert "_load_unlocked" in events[0].raw_line
+    assert "main.py" in events[0].raw_line
+
+
+def test_ocr_frame_chain_with_exception_line_extracts_frames_and_exception_together(
+    monkeypatch, tmp_path
+):
+    """Well-formed spacing variant of the bare-frame-chain case above: when
+    OCR also captures the trailing exception line, the reconstructed single
+    record must let the ordinary parser extract both the real stack frames
+    and the real exception type/message - nothing fabricated, everything
+    structurally present in the OCR text itself."""
+    ocr_text = (
+        'File "/home/dev/app/main.py", line 7, in <module>\n'
+        'File "/home/dev/app/api/auth.py", line 13, in <module>\n'
+        "ImportError: cannot import name 'send_password_reset_email'\n"
+    )
+    records = _stream_ocr_text(monkeypatch, tmp_path, ocr_text)
+    events = _retained_events(records)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.level == "ERROR"
+    assert event.exception_type == "ImportError"
+    assert event.exception_message == "cannot import name 'send_password_reset_email'"
+    assert [frame.file for frame in event.stack_frames] == [
+        "/home/dev/app/main.py",
+        "/home/dev/app/api/auth.py",
+    ]
+    assert [frame.line for frame in event.stack_frames] == [7, 13]
+
+
+def test_ocr_frame_chain_record_is_bounded_by_max_diagnostic_record_bytes(
+    monkeypatch, tmp_path
+):
+    """The bare-frame-chain reconstruction must not grow a single record
+    without bound - mirrors the same MAX_DIAGNOSTIC_RECORD_BYTES cap
+    ordinary multi-line text records (_stream_text_events) already enforce,
+    reused here rather than inventing a second limit."""
+    monkeypatch.setattr(diagnostic_adapters, "MAX_DIAGNOSTIC_RECORD_BYTES", 200)
+    frame_line = 'File "/home/dev/app/mod_{i}.py", line {i}, in handler\n'
+    ocr_text = "".join(frame_line.format(i=i) for i in range(50))
+
+    records = _stream_ocr_text(monkeypatch, tmp_path, ocr_text)
+    events = _retained_events(records)
+
+    assert len(events) > 1
+    for event in events:
+        assert len(event.raw_line.encode("utf-8")) <= 200 + len(frame_line)
+
+
+# --- structured fallback: marker-only OCR text with no explicit level -----
+
+
+def test_ocr_marker_only_text_without_explicit_level_still_becomes_evidence(
+    monkeypatch, tmp_path
+):
+    """Reproduces the remaining silent-loss gap: text that already tripped
+    the importance gate via a plain marker word ("exception") - not a
+    standalone LOG_LEVEL_PATTERN token, a capitalized "XxxException:" match,
+    or a recognized stack frame - used to come back with level=None and
+    then vanish at the Evidence-persistence gate (_IMPORTANT_LEVELS in
+    app/tasks/analysis.py checks event.level, never the raw text) even
+    though it was already judged genuinely diagnostic. Nothing is
+    fabricated: no exception_type/frames/service/trace_id are invented,
+    only the level gets a conservative fallback so the record survives."""
+    ocr_text = "An exception occurred while saving the file\n"
+    records = _stream_ocr_text(monkeypatch, tmp_path, ocr_text)
+    events = _retained_events(records)
+
+    assert len(events) == 1
+    assert events[0].level == "ERROR"
+    assert events[0].raw_line == "An exception occurred while saving the file"
+    assert events[0].exception_type is None
+    assert events[0].stack_frames == []
 
 
 def test_ocr_bare_java_frame_with_no_error_keyword_becomes_evidence(monkeypatch, tmp_path):
