@@ -4,10 +4,10 @@ import { useRouter } from './router/useRouter'
 import LoginPage from './pages/LoginPage'
 import SignupPage from './pages/SignupPage'
 import VerifyEmailPage from './pages/VerifyEmailPage'
-import DashboardPage from './pages/DashboardPage'
+import AppShell from './components/AppShell'
 
 function Routes() {
-  const { pathname } = useRouter()
+  const { pathname, navigate } = useRouter()
   const { status } = useAuth()
 
   if (pathname === '/verify-email') {
@@ -23,7 +23,7 @@ function Routes() {
   }
 
   if (status === 'authenticated') {
-    return <DashboardPage />
+    return <AppShell pathname={pathname} navigate={navigate} />
   }
 
   return pathname === '/signup' ? <SignupPage /> : <LoginPage />
@@ -38,5 +38,3 @@ function App() {
 }
 
 export default App
-
-

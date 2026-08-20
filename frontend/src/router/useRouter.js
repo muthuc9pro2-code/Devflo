@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
+const NAVIGATION_EVENT = 'devflo:navigation'
+
 function readLocation() {
   return { pathname: window.location.pathname, search: window.location.search }
 }
@@ -12,12 +14,19 @@ export function useRouter() {
   useEffect(() => {
     const onPopState = () => setLocation(readLocation())
     window.addEventListener('popstate', onPopState)
-    return () => window.removeEventListener('popstate', onPopState)
+    window.addEventListener(NAVIGATION_EVENT, onPopState)
+    return () => {
+      window.removeEventListener('popstate', onPopState)
+      window.removeEventListener(NAVIGATION_EVENT, onPopState)
+    }
   }, [])
 
-  const navigate = useCallback((to) => {
-    window.history.pushState({}, '', to)
-    setLocation(readLocation())
+  const navigate = useCallback((to, { replace = false } = {}) => {
+    if (`${window.location.pathname}${window.location.search}` === to) return
+
+    const method = replace ? 'replaceState' : 'pushState'
+    window.history[method]({}, '', to)
+    window.dispatchEvent(new Event(NAVIGATION_EVENT))
   }, [])
 
   return { ...location, navigate }

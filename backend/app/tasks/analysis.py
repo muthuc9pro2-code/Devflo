@@ -53,7 +53,10 @@ from app.services.analysis_events import (
     publish_investigation_result,
     publish_progress,
 )
-from app.services.gemini_service import generate_investigation_explanation
+from app.services.gemini_service import (
+    GeminiUnavailableError,
+    generate_investigation_explanation,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -397,22 +400,36 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             ]
 
             if fallback_artifacts:
-                fallback_llm_context = build_fallback_llm_context(
-                    analysis_id,
-                    fallback_artifacts,
-                    artifacts=zero_evidence_artifacts,
-                )
-                gemini_result = generate_investigation_explanation(fallback_llm_context)
                 fallback_payload = build_fallback_payload(
                     analysis_id,
                     fallback_artifacts,
                     artifacts=zero_evidence_artifacts,
                 )
-                fallback_payload["ai_analysis"] = gemini_result.model_dump()
-                # Persisted only after a valid Gemini schema result (see the
-                # CORRELATED/SIMPLE branches below) so reconnect can
-                # reattach it without a second Gemini call.
-                analysis.ai_analysis = fallback_payload["ai_analysis"]
+                fallback_llm_context = build_fallback_llm_context(
+                    analysis_id,
+                    fallback_artifacts,
+                    artifacts=zero_evidence_artifacts,
+                )
+                try:
+                    gemini_result = generate_investigation_explanation(fallback_llm_context)
+                    fallback_payload["ai_analysis"] = gemini_result.model_dump()
+                    # Persisted only after a valid Gemini schema result (see
+                    # the CORRELATED/SIMPLE branches below) so reconnect can
+                    # reattach it without a second Gemini call.
+                    analysis.ai_analysis = fallback_payload["ai_analysis"]
+                except GeminiUnavailableError:
+                    # Gemini is only the explanation layer - a temporarily
+                    # unavailable explanation must not fail this otherwise
+                    # complete deterministic result (see the CORRELATED
+                    # branch below for the full rationale). fallback_payload
+                    # keeps no "ai_analysis" key, same as the zero-evidence
+                    # payload below when there is nothing to explain.
+                    logger.warning(
+                        "Analysis %s | Gemini explanation unavailable; "
+                        "completing without an explanation",
+                        analysis_id,
+                    )
+                    analysis.ai_analysis = None
                 # Persist-before-publish (locked requirement) - see the
                 # CORRELATED branch below for the full rationale.
                 analysis.result_snapshot = fallback_payload
@@ -602,15 +619,31 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 supplemental_artifacts=supplemental_artifacts,
             )
 
-            gemini_result = generate_investigation_explanation(llm_context)
-            correlation_payload["ai_analysis"] = gemini_result.model_dump()
-            # Persisted only now that Gemini has returned a valid schema
-            # result (generate_investigation_explanation raises otherwise,
-            # so this line is never reached on failure) - lets a client
-            # reconnecting after completion see the exact same explanation
-            # (reconstruct_current_investigation_result attaches this same
-            # field), without a second Gemini call.
-            analysis.ai_analysis = correlation_payload["ai_analysis"]
+            try:
+                gemini_result = generate_investigation_explanation(llm_context)
+                correlation_payload["ai_analysis"] = gemini_result.model_dump()
+                # Persisted only now that Gemini has returned a valid schema
+                # result - lets a client reconnecting after completion see
+                # the exact same explanation (reconstruct_current_
+                # investigation_result attaches this same field), without a
+                # second Gemini call.
+                analysis.ai_analysis = correlation_payload["ai_analysis"]
+            except GeminiUnavailableError:
+                # Gemini is only the explanation layer sitting on top of an
+                # already-complete deterministic investigation (graph,
+                # timeline, roles, artifact outcomes, source matches are all
+                # already computed above). Its temporary unavailability must
+                # not turn a successful deterministic result into a failed
+                # analysis - complete without an explanation instead;
+                # correlation_payload keeps no "ai_analysis" key, exactly
+                # like the zero-evidence payload above when there is
+                # nothing to explain.
+                logger.warning(
+                    "Analysis %s | Gemini explanation unavailable; "
+                    "completing without an explanation",
+                    analysis_id,
+                )
+                analysis.ai_analysis = None
             # Persist-before-publish (locked requirement): the exact same
             # bounded payload about to be published as investigation_result
             # is committed to the DB FIRST. If the live SSE event is lost
@@ -689,12 +722,23 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 supplemental_artifacts=simple_supplemental_artifacts,
             )
 
-            gemini_result = generate_investigation_explanation(simple_llm_context)
-            simple_payload["ai_analysis"] = gemini_result.model_dump()
-            # See the CORRELATED branch above: persisted only after a valid
-            # Gemini schema result, so reconnect can reattach it without a
-            # second Gemini call.
-            analysis.ai_analysis = simple_payload["ai_analysis"]
+            try:
+                gemini_result = generate_investigation_explanation(simple_llm_context)
+                simple_payload["ai_analysis"] = gemini_result.model_dump()
+                # See the CORRELATED branch above: persisted only after a
+                # valid Gemini schema result, so reconnect can reattach it
+                # without a second Gemini call.
+                analysis.ai_analysis = simple_payload["ai_analysis"]
+            except GeminiUnavailableError:
+                # See the CORRELATED branch above: a temporarily unavailable
+                # explanation must not fail this otherwise complete
+                # deterministic result.
+                logger.warning(
+                    "Analysis %s | Gemini explanation unavailable; "
+                    "completing without an explanation",
+                    analysis_id,
+                )
+                analysis.ai_analysis = None
             # Persist-before-publish (locked requirement) - see the
             # CORRELATED branch above for the full rationale.
             analysis.result_snapshot = simple_payload

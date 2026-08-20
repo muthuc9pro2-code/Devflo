@@ -1,4 +1,9 @@
-import { request } from './client'
+import {
+  finishLogout,
+  markSessionEstablished,
+  prepareForLogout,
+  request,
+} from './client'
 
 export function register({ username, email, password }) {
   return request('/auth/register', {
@@ -7,21 +12,30 @@ export function register({ username, email, password }) {
   })
 }
 
-export function login({ email, password }) {
-  return request('/auth/login', {
+export async function login({ email, password }) {
+  const result = await request('/auth/login', {
     method: 'POST',
     body: JSON.stringify({ email, password }),
   })
+  markSessionEstablished()
+  return result
 }
 
-export function logout() {
-  return request('/auth/logout', { method: 'POST' })
+export async function logout() {
+  await prepareForLogout()
+  try {
+    return await request('/auth/logout', { method: 'POST' })
+  } finally {
+    finishLogout()
+  }
 }
 
 export function getMe() {
   return request('/auth/me')
 }
 
-export function verifyEmail(token) {
-  return request(`/auth/verify-email?token=${encodeURIComponent(token)}`)
+export async function verifyEmail(token) {
+  const result = await request(`/auth/verify-email?token=${encodeURIComponent(token)}`)
+  markSessionEstablished()
+  return result
 }

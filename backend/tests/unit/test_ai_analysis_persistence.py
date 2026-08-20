@@ -24,6 +24,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.schemas.gemini import GeminiInvestigationResponse
+from app.services.gemini_service import GeminiUnavailableError
 from app.tasks import analysis as analysis_task
 
 _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
@@ -199,4 +200,88 @@ def test_zero_evidence_analysis_has_no_ai_analysis(monkeypatch):
     state = analysis_task.compute_current_analysis_state(db, analysis)
     db.close()
 
+    assert "ai_analysis" not in state["investigation_result"]
+
+
+def _raise_gemini_unavailable(context):
+    raise GeminiUnavailableError("This model is currently experiencing high demand.")
+
+
+def test_live_correlated_completion_survives_gemini_unavailable(monkeypatch):
+    """A 503 from Gemini (after bounded retries, see test_gemini_service.py)
+    must not fail an otherwise-complete CORRELATED investigation - it must
+    still complete with the deterministic result, just without an
+    explanation."""
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(
+        session_factory,
+        evidence_rows_kwargs=[
+            {"trace_id": "trace-1", "service": "db"},
+            {"trace_id": "trace-1", "service": "api"},
+        ],
+    )
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_gemini_unavailable)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.status == "completed"
+    assert analysis.ai_analysis is None
+    assert analysis.result_snapshot["investigation_path"] == "correlated"
+    assert len(analysis.result_snapshot["components"]) == 1
+    assert "ai_analysis" not in analysis.result_snapshot
+    db.close()
+
+
+def test_live_simple_completion_survives_gemini_unavailable(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(
+        session_factory,
+        evidence_rows_kwargs=[{"service": "worker"}],
+    )
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_gemini_unavailable)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.status == "completed"
+    assert analysis.ai_analysis is None
+    assert analysis.result_snapshot["investigation_path"] == "simple"
+    assert "ai_analysis" not in analysis.result_snapshot
+    db.close()
+
+
+def test_reconnect_after_gemini_unavailable_completion_shows_deterministic_result_without_calling_gemini_again(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_analysis(
+        session_factory,
+        evidence_rows_kwargs=[
+            {"trace_id": "trace-1", "service": "db"},
+            {"trace_id": "trace-1", "service": "api"},
+        ],
+    )
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_gemini_unavailable)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    def _must_not_be_called(context):
+        raise AssertionError("reconnect must not call Gemini again")
+
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _must_not_be_called)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+    db.close()
+
+    assert state["status"] == "completed"
+    assert state["investigation_result"]["investigation_path"] == "correlated"
     assert "ai_analysis" not in state["investigation_result"]

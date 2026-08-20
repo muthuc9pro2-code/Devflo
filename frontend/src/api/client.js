@@ -40,20 +40,78 @@ async function rawRequest(path, options) {
 
 // Not-authenticated paths where a 401 means "bad credentials", not "expired
 // session" — retrying them via /auth/refresh would be meaningless.
-const NO_REFRESH_RETRY = new Set(['/auth/login', '/auth/refresh', '/auth/register'])
+const NO_REFRESH_RETRY = new Set(['/auth/login', '/auth/logout', '/auth/refresh', '/auth/register'])
+
+let refreshPromise = null
+let sessionEpoch = 0
+let logoutPending = false
+
+function reportExpiredSession() {
+  sessionEpoch += 1
+  window.dispatchEvent(new Event('devflo:session-expired'))
+}
+
+function refreshAccessCookie() {
+  if (logoutPending) return null
+  if (refreshPromise) return refreshPromise
+
+  const pending = rawRequest('/auth/refresh', { method: 'POST' })
+  const tracked = pending.finally(() => {
+    if (refreshPromise === tracked) refreshPromise = null
+  })
+  refreshPromise = tracked
+  return refreshPromise
+}
+
+export function markSessionEstablished() {
+  logoutPending = false
+  sessionEpoch += 1
+}
+
+export async function prepareForLogout() {
+  logoutPending = true
+  sessionEpoch += 1
+  if (!refreshPromise) return
+  try {
+    await refreshPromise
+  } catch {
+    // Logout still needs to run last when a refresh request failed.
+  }
+}
+
+export function finishLogout() {
+  sessionEpoch += 1
+  logoutPending = false
+}
 
 export async function request(path, options = {}) {
+  const requestEpoch = sessionEpoch
   const response = await rawRequest(path, options)
 
-  if (response.status === 401 && !NO_REFRESH_RETRY.has(path)) {
-    const refreshResponse = await rawRequest('/auth/refresh', { method: 'POST' })
+  if (
+    response.status === 401
+    && !NO_REFRESH_RETRY.has(path)
+    && !logoutPending
+    && requestEpoch === sessionEpoch
+  ) {
+    const refreshResponse = await refreshAccessCookie()
+    if (requestEpoch !== sessionEpoch || logoutPending || !refreshResponse) {
+      throw new ApiError(await parseErrorMessage(response), response.status)
+    }
     if (refreshResponse.ok) {
       const retryResponse = await rawRequest(path, options)
       if (!retryResponse.ok) {
+        if (retryResponse.status === 401 && requestEpoch === sessionEpoch && !logoutPending) {
+          reportExpiredSession()
+        }
         throw new ApiError(await parseErrorMessage(retryResponse), retryResponse.status)
       }
       return retryResponse.status === 204 ? null : retryResponse.json()
     }
+    if (refreshResponse.status === 401 || refreshResponse.status === 403) {
+      reportExpiredSession()
+    }
+    throw new ApiError(await parseErrorMessage(refreshResponse), refreshResponse.status)
   }
 
   if (!response.ok) {

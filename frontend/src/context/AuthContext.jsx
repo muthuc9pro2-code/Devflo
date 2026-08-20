@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getMe, login as apiLogin, logout as apiLogout, register as apiRegister } from '../api/auth'
 import { AuthContext } from './auth-context'
 
@@ -8,44 +8,68 @@ import { AuthContext } from './auth-context'
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [status, setStatus] = useState('loading') // loading | authenticated | unauthenticated
+  const sessionRequestRef = useRef(0)
 
-  const refreshSession = useCallback(async () => {
+  const refreshSession = useCallback(async ({ throwOnFailure = false } = {}) => {
+    const requestId = ++sessionRequestRef.current
     try {
       const me = await getMe()
+      if (requestId !== sessionRequestRef.current) {
+        if (throwOnFailure) throw new Error('Session changed before authentication completed.')
+        return null
+      }
       setUser(me)
       setStatus('authenticated')
       return me
-    } catch {
+    } catch (error) {
+      if (requestId !== sessionRequestRef.current) {
+        if (throwOnFailure) throw error
+        return null
+      }
       setUser(null)
       setStatus('unauthenticated')
+      if (throwOnFailure) throw error
       return null
     }
   }, [])
 
   useEffect(() => {
     let cancelled = false
+    const requestId = ++sessionRequestRef.current
 
     getMe()
       .then((me) => {
-        if (cancelled) return
+        if (cancelled || requestId !== sessionRequestRef.current) return
         setUser(me)
         setStatus('authenticated')
       })
       .catch(() => {
-        if (cancelled) return
+        if (cancelled || requestId !== sessionRequestRef.current) return
         setUser(null)
         setStatus('unauthenticated')
       })
 
     return () => {
       cancelled = true
+      if (requestId === sessionRequestRef.current) sessionRequestRef.current += 1
     }
+  }, [])
+
+  useEffect(() => {
+    const onSessionExpired = () => {
+      sessionRequestRef.current += 1
+      setUser(null)
+      setStatus('unauthenticated')
+    }
+    window.addEventListener('devflo:session-expired', onSessionExpired)
+    return () => window.removeEventListener('devflo:session-expired', onSessionExpired)
   }, [])
 
   const login = useCallback(
     async (credentials) => {
+      sessionRequestRef.current += 1
       await apiLogin(credentials)
-      return refreshSession()
+      return refreshSession({ throwOnFailure: true })
     },
     [refreshSession],
   )
@@ -53,6 +77,7 @@ export function AuthProvider({ children }) {
   const register = useCallback((details) => apiRegister(details), [])
 
   const logout = useCallback(async () => {
+    sessionRequestRef.current += 1
     try {
       await apiLogout()
     } finally {

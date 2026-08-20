@@ -1,12 +1,29 @@
 import json
 import logging
-from time import perf_counter
+from time import perf_counter, sleep
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from app.core.config import Settings
 from app.schemas.gemini import GeminiInvestigationResponse
 
 logger = logging.getLogger(__name__)
+
+# Bounded retry for transient Gemini server-side unavailability (e.g. the
+# "This model is currently experiencing high demand" 503). google.genai
+# raises errors.ServerError specifically for 5xx responses - a 4xx
+# ClientError (bad request, auth, quota) is never retried since retrying it
+# cannot succeed. 3 total attempts with a short linear backoff is enough to
+# ride out a brief outage without materially delaying finalize on a real one.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 1.5
+
+
+class GeminiUnavailableError(RuntimeError):
+    """Gemini's explanation layer did not return a result after bounded
+    retries. Callers must treat this as "no explanation available", never
+    as a deterministic-pipeline failure - the caller's already-computed
+    deterministic result must still be persisted/completed."""
 
 _SYSTEM_INSTRUCTION = """
 You are Devflo's AI debugging explanation layer.
@@ -118,29 +135,53 @@ def generate_investigation_explanation(
     logger.info("Gemini request starting")
 
     api_call_start = perf_counter()
-    response = _client.models.generate_content(
-        model=Settings.GEMINI_MODEL,
-        contents=json.dumps(context, default=str),
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=GeminiInvestigationResponse,
-            temperature=0.2,
-            # Devflo never registers callable tools/functions on this
-            # request (no `tools=` above), so the model can never emit a
-            # function call for the SDK to automatically dispatch -
-            # Automatic Function Calling has nothing to do here. Left
-            # enabled (the SDK's default), it still runs its AFC bookkeeping
-            # on every call and logs "AFC is enabled with max remote calls"
-            # + a recommendation to use Chat.send_message instead, neither
-            # of which apply to this tool-less, single-shot request.
-            # Disabling it is a config-only change; generate_content() and
-            # the response schema/prompt above are unchanged.
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True,
-            ),
+    contents = json.dumps(context, default=str)
+    config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=GeminiInvestigationResponse,
+        temperature=0.2,
+        # Devflo never registers callable tools/functions on this
+        # request (no `tools=` above), so the model can never emit a
+        # function call for the SDK to automatically dispatch -
+        # Automatic Function Calling has nothing to do here. Left
+        # enabled (the SDK's default), it still runs its AFC bookkeeping
+        # on every call and logs "AFC is enabled with max remote calls"
+        # + a recommendation to use Chat.send_message instead, neither
+        # of which apply to this tool-less, single-shot request.
+        # Disabling it is a config-only change; generate_content() and
+        # the response schema/prompt above are unchanged.
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=True,
         ),
     )
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            response = _client.models.generate_content(
+                model=Settings.GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+            break
+        except genai_errors.ServerError as exc:
+            if attempt >= _MAX_ATTEMPTS:
+                logger.warning(
+                    "Gemini request unavailable after %s attempt(s): %s",
+                    attempt,
+                    exc,
+                )
+                raise GeminiUnavailableError(str(exc)) from exc
+            logger.warning(
+                "Gemini request attempt %s/%s failed (%s); retrying in %.1fs",
+                attempt,
+                _MAX_ATTEMPTS,
+                exc,
+                _RETRY_BACKOFF_SECONDS * attempt,
+            )
+            sleep(_RETRY_BACKOFF_SECONDS * attempt)
     api_call_seconds = perf_counter() - api_call_start
 
     processing_start = perf_counter()

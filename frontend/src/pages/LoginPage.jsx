@@ -21,7 +21,7 @@ export default function LoginPage() {
     setSubmitting(true)
     try {
       await login(form)
-      navigate('/')
+      navigate('/new', { replace: true })
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
@@ -35,7 +35,7 @@ export default function LoginPage() {
         <h1 className="brand">Devflo</h1>
         <p className="tagline">Sign in to start an investigation</p>
 
-        {error && <div className="alert-error">{error}</div>}
+        {error && <div className="alert-error" role="alert">{error}</div>}
 
         <label className="field">
           <span>Email</span>

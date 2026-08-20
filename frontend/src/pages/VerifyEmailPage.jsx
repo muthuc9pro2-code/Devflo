@@ -19,16 +19,15 @@ export default function VerifyEmailPage() {
     verifyEmail(token)
       .then(async (result) => {
         if (cancelled) return
-        setState('success')
-        setMessage(result.message || 'Email verified successfully.')
-
         // /auth/verify-email already set the same access/refresh cookies
         // /auth/login does - refreshSession() just picks up that cookie
         // state so the app enters as authenticated, with no re-entered
         // credentials and no token carried in the URL.
-        await refreshSession()
+        await refreshSession({ throwOnFailure: true })
         if (cancelled) return
-        navigate('/')
+        setState('success')
+        setMessage(result.message || 'Email verified successfully.')
+        navigate('/new', { replace: true })
       })
       .catch((err) => {
         if (cancelled) return
@@ -50,14 +49,14 @@ export default function VerifyEmailPage() {
       <div className="auth-card">
         <h1 className="brand">Devflo</h1>
 
-        {state === 'verifying' && <p className="tagline">Verifying your email…</p>}
+        {state === 'verifying' && <p className="tagline" role="status">Verifying your email…</p>}
 
-        {state === 'success' && <p className="status-ok">{message}</p>}
+        {state === 'success' && <p className="status-ok" role="status">{message}</p>}
 
         {state === 'error' && (
           <>
-            <p className="status-error">{message}</p>
-            <button className="btn-secondary" onClick={() => navigate('/login')}>
+            <p className="status-error" role="alert">{message}</p>
+            <button className="btn-secondary" type="button" onClick={() => navigate('/login')}>
               Back to login
             </button>
           </>

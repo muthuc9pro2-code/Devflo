@@ -1,29 +1,28 @@
 import { useCallback, useRef, useState } from 'react'
-
-function formatBytes(bytes) {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB']
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
-  const value = bytes / 1024 ** exponent
-  return `${exponent === 0 ? value : value.toFixed(1)} ${units[exponent]}`
-}
+import { formatBytes } from '../utils/files'
 
 // Either-or: a source ZIP and a GitHub URL can't both be sent (the backend
 // rejects the request if both are present), so picking one clears the other.
-export default function SourceCodeSection({ sourceZip, onSourceZipChange, githubUrl, onGithubUrlChange }) {
+export default function SourceCodeSection({
+  sourceZip,
+  onSourceZipChange,
+  githubUrl,
+  onGithubUrlChange,
+  error,
+  disabled = false,
+}) {
   const inputRef = useRef(null)
   const [isDragging, setIsDragging] = useState(false)
 
-  const zipDisabled = githubUrl.trim().length > 0
-  const urlDisabled = sourceZip !== null
+  const zipDisabled = disabled || githubUrl.trim().length > 0
+  const urlDisabled = disabled || sourceZip !== null
 
   const handleZipFile = useCallback(
     (file) => {
       if (!file) return
       onSourceZipChange(file)
-      onGithubUrlChange('')
     },
-    [onSourceZipChange, onGithubUrlChange],
+    [onSourceZipChange],
   )
 
   const onDrop = useCallback(
@@ -45,14 +44,13 @@ export default function SourceCodeSection({ sourceZip, onSourceZipChange, github
   )
 
   return (
-    <section className="source-section">
+    <section className={`source-section${disabled ? ' selection-disabled' : ''}`} aria-disabled={disabled}>
       <div className="source-heading">
-        <h2>Add source code</h2>
+        <h2>Optional source code</h2>
         <span className="optional-badge">Optional</span>
       </div>
       <p className="source-subtitle">
-        Improves correlation accuracy by matching stack traces to your actual source files. Provide
-        either a ZIP of your repository or a GitHub URL - not both.
+        Match diagnostic locations to your repository. Provide a repository ZIP or an HTTPS GitHub URL.
       </p>
 
       <div className="source-options">
@@ -66,10 +64,11 @@ export default function SourceCodeSection({ sourceZip, onSourceZipChange, github
               <button
                 type="button"
                 className="btn-remove"
+                disabled={disabled}
                 onClick={() => onSourceZipChange(null)}
                 aria-label="Remove source ZIP"
               >
-                ✕
+                <span aria-hidden="true">×</span>
               </button>
             </div>
           ) : (
@@ -86,7 +85,10 @@ export default function SourceCodeSection({ sourceZip, onSourceZipChange, github
               tabIndex={zipDisabled ? -1 : 0}
               aria-disabled={zipDisabled}
               onKeyDown={(event) => {
-                if (!zipDisabled && (event.key === 'Enter' || event.key === ' ')) inputRef.current?.click()
+                if (!zipDisabled && (event.key === 'Enter' || event.key === ' ')) {
+                  if (event.key === ' ') event.preventDefault()
+                  inputRef.current?.click()
+                }
               }}
             >
               <input
@@ -97,7 +99,7 @@ export default function SourceCodeSection({ sourceZip, onSourceZipChange, github
                 onChange={onInputChange}
                 disabled={zipDisabled}
               />
-              <p className="dropzone-title">Drop a source code ZIP here</p>
+              <p className="dropzone-title">Repository ZIP</p>
               <p className="dropzone-subtitle">
                 or <span className="link-like">choose a file</span>
               </p>
@@ -111,10 +113,10 @@ export default function SourceCodeSection({ sourceZip, onSourceZipChange, github
 
         <div className={`source-option${urlDisabled ? ' source-option-disabled' : ''}`}>
           <label className="field" htmlFor="github-url">
-            paste a GitHub repo URL
+            GitHub repository URL
             <input
               id="github-url"
-              type="text"
+              type="url"
               placeholder="https://github.com/owner/repo"
               value={githubUrl}
               disabled={urlDisabled}
@@ -123,6 +125,7 @@ export default function SourceCodeSection({ sourceZip, onSourceZipChange, github
           </label>
         </div>
       </div>
+      {error && <p className="field-error" role="alert">{error}</p>}
     </section>
   )
 }
