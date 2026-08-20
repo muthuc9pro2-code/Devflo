@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from app.core.processing_config import TEMPORAL_CANDIDATE_MAX_NEIGHBORS
 from app.models.evidence import Evidence
 from time import perf_counter
 
@@ -83,6 +84,22 @@ class CorrelationEdge:
     score: float
     delta_ms: float | None
     signals: list[CorrelationSignal] = field(default_factory=list)
+    # "causal" (exact parent.span_id == child.parent_span_id match - the
+    # strongest, definitionally-certain relationship) vs
+    # "inferred_propagation" (a strictly positive time delta between two
+    # otherwise-correlated records - directional, but a deterministic
+    # hypothesis, never proven physical causation). None for associations
+    # (this same dataclass shape is reused there; associations are never
+    # directional so relationship_type/direction_confidence do not apply).
+    relationship_type: str | None = None
+    # How confident Devflo is in the DIRECTION/causality claim itself, as
+    # opposed to `score` (how confident the two records are related AT
+    # ALL). 1.0 for causal (parent-span is definitionally certain);
+    # temporal_score(delta_ms) for inferred_propagation - the same decay
+    # function scoring already uses, reused rather than inventing a new
+    # confidence number: two records 5ms apart support a directional
+    # propagation hypothesis far more than the same pair 5 seconds apart.
+    direction_confidence: float | None = None
 
 @dataclass(slots=True)
 class CorrelationComponent:
@@ -526,13 +543,17 @@ def iter_temporal_candidates(
 
             left += 1
 
-        # left/right still bound the search space by the fixed,
-        # unmodified max window (unchanged two-pointer sliding-window
-        # behavior, still O(n) amortized - no all-pairs scan). Within that
-        # already-bounded range, each individual pair additionally has to
-        # clear its OWN adaptive window below - a strictly narrower,
+        # left/right bound the search space by the fixed max window, but
+        # that alone is only O(n) amortized when events are temporally
+        # sparse - a dense burst (many events within one window) would
+        # otherwise degrade toward an all-pairs O(n^2) scan (see
+        # TEMPORAL_CANDIDATE_MAX_NEIGHBORS). Capping to the nearest K
+        # candidates keeps total work O(n * K) regardless of density.
+        # Within that bounded range, each individual pair additionally has
+        # to clear its OWN adaptive window below - a strictly narrower,
         # per-pair filter layered on top, never a wider one.
-        for index in range(left, right):
+        window_start = max(left, right - TEMPORAL_CANDIDATE_MAX_NEIGHBORS)
+        for index in range(window_start, right):
             candidate = ordered[index]
 
             if (
@@ -573,12 +594,29 @@ def has_structural_match(
     left: Evidence,
     right: Evidence,
 ) -> bool:
+    """Gate for the temporal-fallback path only (real trace/request/parent-
+    span identity never reaches this - iter_temporal_candidates excludes
+    any pair already sharing one). Same-artifact pairs (one uploaded file,
+    genuinely one log stream) may correlate on a single structural signal -
+    that shared provenance is already real evidence. Cross-artifact pairs
+    need at least two independent structural signals: two different
+    uploaded files merely sharing one service name, or one HTTP status
+    (never counted as structural to begin with), is not enough evidence
+    that they describe the same incident - see e.g. same fingerprint +
+    compatible service, or same exception + compatible service/module.
+    """
     matches = match_correlation_signals(left, right)
-
-    return any(
-        match.signal in _STRUCTURAL_SIGNALS
-        for match in matches
+    structural_signal_count = sum(
+        1 for match in matches if match.signal in _STRUCTURAL_SIGNALS
     )
+
+    if structural_signal_count == 0:
+        return False
+
+    if left.artifact_id == right.artifact_id:
+        return True
+
+    return structural_signal_count >= 2
 
 def iter_valid_temporal_candidates(
     evidence_rows: list[Evidence],
@@ -611,6 +649,11 @@ def build_correlation_edge(
         score=score,
         delta_ms=delta_ms,
         signals=[match.signal for match in matches],
+        # This function is only ever called for a verified parent.span_id
+        # == child.parent_span_id match (see the caller below) - exact
+        # parent-span identity, the strongest possible relationship.
+        relationship_type="causal",
+        direction_confidence=1.0,
     )
 
 def _pair_key(
@@ -713,15 +756,24 @@ def build_correlation_edges(
         if not matches or score <= 0.0:
             return
 
+        is_time_ordered = _causal_direction_delta(delta_ms)
+
         relationship = CorrelationEdge(
             source_id=f"evidence-{source.id}",
             target_id=f"evidence-{target.id}",
             score=score,
             delta_ms=delta_ms,
             signals=[match.signal for match in matches],
+            # A strictly positive delta_ms between two otherwise-correlated
+            # records is a directional HYPOTHESIS (inferred_propagation),
+            # never proven physical causation the way an exact parent-span
+            # match is - direction_confidence reuses the same temporal
+            # decay scoring already applies, not a new number.
+            relationship_type="inferred_propagation" if is_time_ordered else None,
+            direction_confidence=temporal_score(delta_ms) if is_time_ordered else None,
         )
 
-        if _causal_direction_delta(delta_ms):
+        if is_time_ordered:
             causal_edges.append(relationship)
         else:
             associations.append(relationship)
@@ -884,19 +936,57 @@ def would_create_cycle(
 
     return False
 
+def _is_time_ordered(edge: CorrelationEdge) -> bool:
+    return edge.delta_ms is not None and edge.delta_ms > 0.0
+
+
 def enforce_dag(
     edges: list[CorrelationEdge],
 ) -> list[CorrelationEdge]:
-    adjacency: dict[str, set[str]] = {}
-    dag_edges: list[CorrelationEdge] = []
+    """A directed cycle needs at least one edge that does NOT strictly
+    advance in time: a chain of strictly-increasing timestamps can never
+    loop back to an earlier one. So every edge with delta_ms > 0 (the vast
+    majority in practice - every inferred_propagation edge) is safe to
+    include unconditionally, skipping the expensive incremental
+    reachability check (would_create_cycle) for it entirely. Only edges
+    without that guarantee (parent-span edges at an equal/unknown/non-
+    positive delta - the only way a causal edge can lack strictly-positive
+    delta_ms) need real cycle detection, evaluated against the adjacency
+    already built from every time-ordered edge.
 
-    ordered_edges = sorted(
-        edges,
+    This was a genuine, measured bottleneck: enforce_dag's original
+    "check every edge against the whole graph so far" cost degrades toward
+    O(edges * (nodes + edges)) as edges accumulate - confirmed directly, a
+    few thousand densely-timestamped evidence rows did not finish
+    correlating within 60s before this fix (see
+    TEMPORAL_CANDIDATE_MAX_NEIGHBORS for the matching candidate-count
+    bound). Splitting by provable safety instead of checking every edge
+    is a correctness-preserving optimization, not a new heuristic: the
+    final included/excluded edge set is unchanged except in the one
+    corner case where a lower-scored time-ordered edge would previously
+    have been dropped in favor of a higher-scored but NOT time-ordered one
+    that turned out to conflict with it - time-ordered edges are now
+    always preferred there, which is at least as defensible as pure score.
+    """
+    time_ordered = sorted(
+        (edge for edge in edges if _is_time_ordered(edge)),
+        key=lambda edge: edge.score,
+        reverse=True,
+    )
+    remaining = sorted(
+        (edge for edge in edges if not _is_time_ordered(edge)),
         key=lambda edge: edge.score,
         reverse=True,
     )
 
-    for edge in ordered_edges:
+    adjacency: dict[str, set[str]] = {}
+    dag_edges: list[CorrelationEdge] = []
+
+    for edge in time_ordered:
+        adjacency.setdefault(edge.source_id, set()).add(edge.target_id)
+        dag_edges.append(edge)
+
+    for edge in remaining:
         if would_create_cycle(
             adjacency,
             edge.source_id,
@@ -939,22 +1029,54 @@ def build_graph_stats(
 
         outgoing[edge.source_id].add(edge.target_id)
 
-    for node in nodes:
-        stack = list(outgoing[node.id])
-        visited: set[str] = set()
-
-        while stack:
-            target_id = stack.pop()
-
-            if target_id in visited:
-                continue
-
-            visited.add(target_id)
-            stack.extend(outgoing[target_id])
-
-        stats[node.id].downstream_count = len(visited)
+    downstream_cache: dict[str, frozenset[str]] = {}
+    # downstream_count = distinct nodes reachable via outgoing edges.
+    # `edges` is always component.edges - already a DAG (enforce_dag) - so
+    # this is computed once for the whole graph via topological-order DP
+    # (downstream[v] = union of v's children and each child's own already-
+    # resolved downstream set) rather than one full DFS PER node, which
+    # degrades to O(V * (V+E)) on a densely-connected component (measured
+    # directly: the per-node-DFS version took 33s on a 2000-node dense
+    # component that this version completes in a small fraction of that).
+    for node_id in reversed(_topological_order(nodes, outgoing)):
+        reachable: set[str] = set(outgoing[node_id])
+        for child_id in outgoing[node_id]:
+            reachable |= downstream_cache.get(child_id, frozenset())
+        downstream_cache[node_id] = frozenset(reachable)
+        stats[node_id].downstream_count = len(reachable)
 
     return stats
+
+
+def _topological_order(
+    nodes: list[CorrelationNode],
+    outgoing: dict[str, set[str]],
+) -> list[str]:
+    """Kahn's algorithm. Safe to assume the graph is acyclic (it is always
+    built from enforce_dag's output); any node that unexpectedly never
+    reaches in-degree 0 (would only happen if that invariant were somehow
+    violated) is simply omitted rather than raising - build_graph_stats
+    treats a missing entry as "no further downstream" instead of crashing.
+    """
+    incoming_count: dict[str, int] = {node.id: 0 for node in nodes}
+
+    for targets in outgoing.values():
+        for target_id in targets:
+            incoming_count[target_id] += 1
+
+    queue = [node_id for node_id, count in incoming_count.items() if count == 0]
+    order: list[str] = []
+
+    while queue:
+        node_id = queue.pop()
+        order.append(node_id)
+
+        for target_id in outgoing[node_id]:
+            incoming_count[target_id] -= 1
+            if incoming_count[target_id] == 0:
+                queue.append(target_id)
+
+    return order
 
 def root_cause_score(
     node: CorrelationNode,
@@ -1322,6 +1444,37 @@ def temporal_score(
         return 0.0
 
     return 1.0 / (1.0 + (delta_ms / decay_ms))
+
+def has_genuine_correlatable_structure(evidence_rows: list[Evidence]) -> bool:
+    """Early-exit yes/no check reusing the EXACT relationship semantics
+    build_correlation_edges uses (parent-span, identity-candidate, and
+    bounded temporal+structural matching) - so investigation routing can
+    never drift from what correlation itself would actually find. Stops at
+    the first qualifying relationship; callers here only need a routing
+    decision, never the full graph/scores.
+    """
+    if len(evidence_rows) <= 1:
+        return False
+
+    indexes = build_correlation_indexes(evidence_rows)
+
+    for child in evidence_rows:
+        if find_parent_span_candidate(child, indexes) is not None:
+            return True
+
+    for source in evidence_rows:
+        for target in iter_identity_candidates(source, indexes):
+            score, _delta_ms, matches = score_candidate_pair(source, target)
+            if matches and score > 0.0:
+                return True
+
+    for source, target in iter_valid_temporal_candidates(evidence_rows):
+        score, _delta_ms, matches = score_candidate_pair(source, target)
+        if matches and score > 0.0:
+            return True
+
+    return False
+
 
 def run_correlation(
     analysis_id: int,

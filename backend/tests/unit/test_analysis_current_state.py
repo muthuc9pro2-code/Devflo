@@ -124,10 +124,11 @@ def test_duplicate_and_unsupported_artifacts_do_not_block_the_99_transition():
     assert state["progress"] == 99
 
 
-def test_duplicate_and_unsupported_artifacts_do_not_skew_byte_ratio():
-    """Both were pre-set (create_analysis) to processed_bytes=size_bytes,
-    so they contribute equally to numerator/denominator here too - the
-    ratio is driven only by the real, still-ingesting artifact."""
+def test_duplicate_and_unsupported_artifacts_are_excluded_from_the_byte_ratio():
+    """Additional Requirement B: unsupported/duplicate artifacts are never
+    dispatched for ingestion, so their size_bytes/processed_bytes must not
+    enter the numerator or denominator at all - only genuinely dispatchable
+    artifacts drive the ratio."""
     db, user = _session()
     analysis = _analysis(db, user, status="processing")
     _artifact(db, analysis, position=0, size_bytes=1000, processed_bytes=500, status="processing")
@@ -138,8 +139,25 @@ def test_duplicate_and_unsupported_artifacts_do_not_skew_byte_ratio():
 
     state = analysis_task.compute_current_analysis_state(db, analysis)
 
-    # (500 + 500) / (1000 + 500) = 66% - not skewed toward 33% or 100%.
-    assert state["progress"] == 66
+    # 500 / 1000 = 50% - driven only by the real, still-ingesting artifact.
+    assert state["progress"] == 50
+
+
+def test_large_unsupported_artifact_does_not_suppress_progress():
+    """Before Additional Requirement B, a huge skipped artifact sitting in
+    the denominator could pin visible progress near 0% for the entire
+    ingestion of the real, small artifact. It must not."""
+    db, user = _session()
+    analysis = _analysis(db, user, status="processing")
+    _artifact(
+        db, analysis, position=0, size_bytes=1_000_000_000, processed_bytes=0,
+        status="unsupported",
+    )
+    _artifact(db, analysis, position=1, size_bytes=100, processed_bytes=100, status="processing")
+
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+
+    assert state["progress"] == 98
 
 
 # --- completed / failed -----------------------------------------------
@@ -246,3 +264,75 @@ def test_completed_correlated_analysis_includes_correlated_result():
     assert len(result["components"][0]["nodes"]) == 2
     assert result["components"][0]["associations"]
     assert result["components"][0]["edges"] == []
+
+
+# --- Section 5: reconnect must not lose already-known artifact outcomes ---
+
+
+def test_reconnect_snapshot_includes_already_known_unsupported_and_duplicate_outcomes():
+    """Redis pub/sub has no replay - if a client connects AFTER an
+    upload-time unsupported/duplicate outcome was already published live,
+    it must still see it via the initial snapshot, not just once the whole
+    analysis eventually completes."""
+    db, user = _session()
+    analysis = _analysis(db, user, status="processing")
+    canonical = _artifact(
+        db, analysis, position=0, original_filename="a.log",
+        status="processing", processed_bytes=0,
+    )
+    _artifact(
+        db, analysis, position=1, original_filename="weird.xyz",
+        detected_format=None, status="unsupported", size_bytes=50, processed_bytes=50,
+    )
+    _artifact(
+        db, analysis, position=2, original_filename="copy.log",
+        status="duplicate", duplicate_of_artifact_id=canonical.id,
+        size_bytes=100, processed_bytes=100,
+    )
+
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+
+    assert state["status"] == "processing"
+    outcomes = {a["source_file"]: a for a in state["artifacts"]}
+    assert outcomes["weird.xyz"]["status"] == "unsupported"
+    assert "not supported" in outcomes["weird.xyz"]["message"].lower()
+    assert outcomes["copy.log"]["status"] == "duplicate"
+    assert outcomes["copy.log"]["duplicate_of_artifact_id"] == canonical.id
+    assert outcomes["copy.log"]["duplicate_of_source_file"] == "a.log"
+    # The still-processing canonical artifact's outcome is NOT terminal yet
+    # - it must not appear as if it were already decided.
+    assert "a.log" not in outcomes
+
+
+def test_reconnect_snapshot_includes_known_zero_evidence_artifact_outcome():
+    """A per-artifact zero-evidence outcome (published live once that one
+    artifact finishes ingestion, independent of the whole analysis) is
+    subject to the exact same missed-event race."""
+    db, user = _session()
+    analysis = _analysis(db, user, status="processing")
+    _artifact(
+        db, analysis, position=0, original_filename="empty.log",
+        status="completed", size_bytes=10, processed_bytes=10,
+    )
+    _artifact(
+        db, analysis, position=1, original_filename="still-going.log",
+        status="processing", size_bytes=1000, processed_bytes=200,
+    )
+
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+
+    outcomes = {a["source_file"]: a for a in state["artifacts"]}
+    assert outcomes["empty.log"]["status"] == "processed"
+    assert outcomes["empty.log"]["evidence_count"] == 0
+    assert "no meaningful diagnostic evidence" in outcomes["empty.log"]["message"].lower()
+    assert "still-going.log" not in outcomes
+
+
+def test_reconnect_snapshot_artifacts_empty_when_nothing_terminal_yet():
+    db, user = _session()
+    analysis = _analysis(db, user, status="processing")
+    _artifact(db, analysis, position=0, status="processing")
+
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+
+    assert state["artifacts"] == []

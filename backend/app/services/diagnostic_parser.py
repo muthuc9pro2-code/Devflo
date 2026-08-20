@@ -1,6 +1,7 @@
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent, StackFrame
@@ -24,6 +25,24 @@ EXCEPTION_PATTERN = re.compile('\\b([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Fa
 PYTHON_FRAME_PATTERN = re.compile('^\\s*File "([^"]+)", line (\\d+), in (.+)$', re.MULTILINE)
 JAVA_FRAME_PATTERN = re.compile('^\\s*at\\s+(?:(.+?)\\()?([^():]+):(\\d+)\\)?$', re.MULTILINE)
 NODE_FRAME_PATTERN = re.compile('^\\s*at\\s+(?:(.+?)\\s+\\()?([^():]+):(\\d+):\\d+\\)?$', re.MULTILINE)
+# Conservative, language-agnostic "path/to/file.ext:LINE[:COLUMN]" or
+# .NET-style "file.ext:line LINE" fallback - covers common diagnostics from
+# Go, Rust, Ruby, .NET, C/C++ and other runtimes that don't use any of the
+# three explicit conventions above, without building a parser per language.
+# Deliberately loose (e.g. "host.example.com:8080" can match syntactically)
+# - this only ever produces a StackFrame CANDIDATE; source_index.py's
+# _match_frame() still has to resolve the path unambiguously against the
+# real indexed source tree before Devflo claims an actual source match, so
+# a loose regex here can never fabricate one on its own.
+GENERIC_SOURCE_LOCATION_PATTERN = re.compile(
+    r'(?P<path>[\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,9})'
+    r':(?:line\s+)?(?P<line>\d+)(?::(?P<column>\d+))?',
+    re.IGNORECASE,
+)
+# Fast substring-scale pre-check for _classify_text's _STACK feature gate -
+# "does this text even contain a '.ext:digit'-shaped substring anywhere",
+# cheaper than running the full named-group pattern above on every record.
+_LOOSE_SOURCE_LOCATION_HINT = re.compile(r'\.[A-Za-z]\w{0,9}:\d')
 LEVEL_ALIASES = {'WARN': 'WARNING', 'WARNING': 'WARNING', 'ERR': 'ERROR', 'ERROR': 'ERROR', 'SEVERE': 'CRITICAL', 'FATAL': 'CRITICAL', 'CRITICAL': 'CRITICAL', 'ALERT': 'CRITICAL', 'EMERG': 'CRITICAL', 'EMERGENCY': 'CRITICAL', 'NOTICE': 'INFO'}
 FIELD_ALIASES = {'traceid': 'trace_id', 'spanid': 'span_id', 'parentspanid': 'parent_span_id', 'requestid': 'request_id', 'correlationid': 'request_id', 'xrequestid': 'request_id', 'service': 'service', 'servicename': 'service', 'app': 'service', 'component': 'service', 'module': 'module', 'logger': 'module', 'host': 'host', 'hostname': 'host', 'node': 'host', 'container': 'container', 'containerid': 'container', 'containername': 'container', 'pod': 'pod', 'podname': 'pod', 'status': 'http_status', 'statuscode': 'http_status', 'httpstatus': 'http_status', 'endpoint': 'endpoint', 'route': 'endpoint', 'path': 'endpoint', 'url': 'endpoint'}
 _TEXT_FIELDS = ('trace_id', 'request_id', 'service', 'module', 'endpoint', 'span_id', 'parent_span_id', 'host', 'container', 'pod')
@@ -164,6 +183,20 @@ def _parse_stack_frames(raw_text: str) -> list[StackFrame]:
         for pattern in (NODE_FRAME_PATTERN, JAVA_FRAME_PATTERN):
             for function, file, line in pattern.findall(raw_text):
                 frames.append(StackFrame(file=file, line=int(line), function=function or None))
+    if not frames:
+        # Explicit Python/JVM/Node parsers above take precedence; only
+        # fall back to the generic path:line[:column] shape when none of
+        # them found anything. function is always None here - a bare
+        # path:line carries no function name, and inventing one would be
+        # exactly the fabrication this must not do.
+        for match in GENERIC_SOURCE_LOCATION_PATTERN.finditer(raw_text):
+            frames.append(
+                StackFrame(
+                    file=match.group('path'),
+                    line=int(match.group('line')),
+                    function=None,
+                )
+            )
     return frames
 
 def _classify_text(raw_text: str) -> tuple[str, int]:
@@ -181,7 +214,17 @@ def _classify_text(raw_text: str) -> tuple[str, int]:
 
     if '-' in head and ':' in head:
         features |= _TIMESTAMP
-    if '\n' in raw_text or raw_text.lstrip().startswith(('at ', 'File ')): features |= _STACK
+    if (
+        '\n' in raw_text
+        or raw_text.lstrip().startswith(('at ', 'File '))
+        # Cheap pre-check for a single-line generic "file.ext:N" shape
+        # (Go/Rust/Ruby/.NET/C/C++ etc.) - only a fast substring-scale
+        # regex, not the full named-group GENERIC_SOURCE_LOCATION_PATTERN,
+        # so records with no ".x:digit" shape at all skip stack-frame
+        # parsing exactly as cheaply as before.
+        or _LOOSE_SOURCE_LOCATION_HINT.search(raw_text)
+    ):
+        features |= _STACK
     if 'slow query' in lowered: features |= _SLOW
     return lowered, features
 
@@ -344,7 +387,11 @@ def _normalize_fully_defaulted_event(raw_text: str, line_number: int, *, source_
                 exception_message = exception_message or exception_match.group(2)
 
     stack_frames = []
-    if '\n' in raw_text or raw_text.lstrip().startswith(('at ', 'File ')):
+    if (
+        '\n' in raw_text
+        or raw_text.lstrip().startswith(('at ', 'File '))
+        or _LOOSE_SOURCE_LOCATION_HINT.search(raw_text)
+    ):
         stack_frames = _parse_stack_frames(raw_text)
 
     return ParsedEvent(
@@ -476,14 +523,21 @@ def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Map
     building its full ~15-alias defaults dict and running normalize_text_event
     on its message just to be discarded a moment later.
 
-    Only returns False when the record is PROVABLY unimportant: an explicit
-    level/severity field resolves to something non-important, or a status
-    code resolves to INFO *and* the message text carries no level word of
-    its own that normalize_text_event would otherwise have picked up instead
-    (the message text always wins over a status-derived level there). Any
-    other shape - no explicit level, no usable status, or an exception
-    already implying ERROR - returns True and the record gets fully parsed,
-    exactly like today.
+    Only returns False when the record is PROVABLY unimportant: none of the
+    real signals below fired, AND an explicit level/severity field (when
+    present) resolves to something non-important. A producer's own level
+    label is not trusted blindly - a record explicitly labeled "INFO" that
+    still carries a real exception/error type, an "stderr" stream, an
+    error-shaped status/state string, or an HTTP 4xx/5xx status is exactly
+    the "producer mislabeled a real failure" case is_evidence_worthy()
+    (event_filter.py) exists to catch, so those signals are checked before
+    ever trusting an unimportant explicit level (previously: an explicit
+    level short-circuited every other check, so
+    {"level":"INFO","exception":{"type":"ConnectionError", ...}} was
+    treated as provably unimportant and never even reached the full
+    parser). Any other shape - no explicit level, no usable status, or an
+    exception already implying ERROR - returns True and the record gets
+    fully parsed, exactly like today.
     """
     inherited = inherited or {}
     key_cache: dict[int, dict[str, Any]] = {}
@@ -492,8 +546,8 @@ def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Map
         return _first_value(data, paths, key_cache)
 
     level_value = first(('level',), ('severity',), ('severityText',), ('severity_text',), ('logLevel',), ('levelname',))
-    if level_value is not None:
-        return normalize_level(level_value) in IMPORTANT_LEVELS
+    if level_value is not None and normalize_level(level_value) in IMPORTANT_LEVELS:
+        return True
 
     exception_type = first(('exception_type',), ('exception', 'type'), ('error', 'type'), ('error', 'name'))
     exception_message = first(('exception_message',), ('exceptionMessage',), ('exception', 'message'), ('error', 'message'), ('error',), ('exception',))
@@ -508,10 +562,16 @@ def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Map
         return True
 
     status = _safe_int(first(('http_status',), ('status_code',), ('statusCode',), ('http', 'status_code'), ('http', 'response', 'status_code'), ('response', 'status'), ('response', 'statusCode'), ('elb_status_code',), ('target_status_code',), ('status',)))
+    if status is not None and level_from_http_status(status) in IMPORTANT_LEVELS:
+        return True
+
+    if level_value is not None:
+        # A real, explicit level that is not itself important, and none of
+        # the real signals above fired either - trust the producer's level.
+        return False
+
     if status is None:
         return True  # nothing resolved at all - uncertain, fully parse
-    if level_from_http_status(status) in IMPORTANT_LEVELS:
-        return True
 
     message_value = first(('message',), ('msg',), ('log',), ('@message',), ('body',), ('event', 'message'), ('error', 'message'), ('exception', 'message'))
     message_text = (_value_text(message_value) or '').lower()
@@ -570,7 +630,15 @@ def _store_diagnostic_field(fields: dict[str, str], match: re.Match[str], wanted
     if canonical_key is not None and (wanted is None or canonical_key in wanted) and canonical_key not in fields:
         fields[canonical_key] = match.group('value').rstrip('.,;)')
 
+@lru_cache(maxsize=2048)
 def _normalized_key(value: str) -> str:
+    # A pure string function, called for the same small, repeated set of
+    # alias path components (e.g. 'level', 'exception_type', 'status')
+    # tens of times per structured record - memoized so the regex
+    # substitution runs once per distinct key ever seen, not once per
+    # lookup. Bounded (not @cache) so an adversarial record with many
+    # distinct field names cannot grow this unboundedly across a whole
+    # ingestion run.
     return _NON_ALNUM_PATTERN.sub('', value.lower())
 
 def _value_text(value: Any) -> str | None:

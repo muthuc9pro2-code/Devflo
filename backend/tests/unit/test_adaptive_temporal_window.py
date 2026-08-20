@@ -243,6 +243,33 @@ def test_strong_identity_correlation_result_is_unchanged():
 
 
 def test_cross_artifact_strong_signal_pair_still_correlates():
+    """Section 15: cross-artifact correlation without real trace/request
+    identity needs multiple independent structural signals, not just one -
+    same service AND same fingerprint together is the kind of combined
+    evidence that justifies it."""
+    base = datetime.now(timezone.utc)
+    a = _evidence(
+        1, artifact_id=101, source_format="database", service="orders-db",
+        fingerprint="fp-shared", first_seen=base,
+    )
+    b = _evidence(
+        2, artifact_id=202, source_format="database", service="orders-db",
+        fingerprint="fp-shared", first_seen=base + timedelta(milliseconds=4000),
+    )
+
+    causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
+
+    assert len(causal_edges) == 1
+    assert associations == []
+    assert causal_edges[0].source_id == "evidence-1"
+    assert causal_edges[0].target_id == "evidence-2"
+
+
+def test_cross_artifact_single_structural_signal_alone_is_not_sufficient():
+    """The flip side (Scenario R): two DIFFERENT uploaded files sharing
+    only a service name, a few seconds apart, must NOT be treated as one
+    incident - same-service-alone cross-artifact is exactly the weak
+    signal Section 15 requires more than one of."""
     base = datetime.now(timezone.utc)
     a = _evidence(
         1, artifact_id=101, source_format="database", service="orders-db", first_seen=base
@@ -254,10 +281,8 @@ def test_cross_artifact_strong_signal_pair_still_correlates():
 
     causal_edges, associations = build_correlation_edges([a, b], build_correlation_indexes([a, b]))
 
-    assert len(causal_edges) == 1
+    assert causal_edges == []
     assert associations == []
-    assert causal_edges[0].source_id == "evidence-1"
-    assert causal_edges[0].target_id == "evidence-2"
 
 
 # --- 9: two nearby unsupported incidents are not incorrectly collapsed ---

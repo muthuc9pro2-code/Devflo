@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
+from app.schemas.gemini import GeminiInvestigationResponse
 from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import (
     build_correlation_payload,
@@ -27,6 +28,14 @@ from app.services.investigation_context import (
     build_zero_evidence_payload,
 )
 from app.tasks import analysis as analysis_task
+
+# Section 26: unit tests must never require the real Gemini API/network/
+# quota - this is the same fixed, deterministic result every mocked
+# _finalize_analysis_task run in this file uses instead.
+_FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
+    title="t", summary="s", probable_root_causes=[], what_happened=[],
+    source_code_findings=[], recommended_actions=[], uncertainties=[],
+)
 
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
@@ -172,9 +181,10 @@ def test_zero_evidence_message_never_claims_unrelated():
 def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
     """A third artifact's evidence has no shared trace/request/etc. with
     the main incident and so lands in its own connected component - it must
-    still be reported as evidence_count > 0 with no zero-evidence message,
-    distinguishable via `components` (existing provenance), not conflated
-    with "no evidence extracted"."""
+    still be reported as evidence_count > 0, never conflated with "no
+    evidence extracted" - and, per Section 14, is deterministically
+    reported as not_linked to the primary (artifact 101+102) incident
+    rather than silently indistinguishable from it."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
@@ -196,7 +206,82 @@ def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
 
     outcome_by_id = {a["artifact_id"]: a for a in payload["artifacts"]}
     assert outcome_by_id[103]["evidence_count"] == 1
-    assert "message" not in outcome_by_id[103]
+    assert outcome_by_id[103]["relationship_status"] == "not_linked"
+    assert outcome_by_id[103]["message"] == "Not linked to the correlated incident evidence."
+    # The primary (larger, cross-artifact) incident's own members are
+    # correctly reported as linked to it, not as isolated.
+    assert outcome_by_id[101]["relationship_status"] == "linked"
+    assert outcome_by_id[102]["relationship_status"] == "linked"
+
+
+def test_artifact_with_evidence_split_across_primary_and_isolated_is_partially_linked():
+    """One artifact contributes evidence to BOTH the primary incident and
+    a separate isolated component - Section 14's partially_linked case."""
+    base = datetime.now(timezone.utc)
+    rows = [
+        _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
+        _evidence(
+            2, artifact_id=102, trace_id="trace-1", service="api",
+            first_seen=base + timedelta(milliseconds=10),
+        ),
+        # Same artifact (101) also contributes a second, genuinely
+        # unrelated evidence row, far apart in time, sharing nothing.
+        _evidence(
+            3, artifact_id=101, fingerprint="fp-unrelated", service="unrelated-svc",
+            first_seen=base + timedelta(hours=6),
+        ),
+    ]
+    run = run_correlation(analysis_id=1, evidence_rows=rows)
+    assert len(run.result.components) == 2
+
+    artifacts = [
+        _artifact_row(101, "database.log", "database"),
+        _artifact_row(102, "nginx.log", "web_server"),
+    ]
+    payload = build_correlation_payload(run, rows, artifacts=artifacts)
+
+    outcome_by_id = {a["artifact_id"]: a for a in payload["artifacts"]}
+    assert outcome_by_id[101]["relationship_status"] == "partially_linked"
+    assert "linked" in outcome_by_id[101]["message"].lower()
+    assert outcome_by_id[102]["relationship_status"] == "linked"
+
+
+def test_scenario_e_four_related_artifacts_plus_one_unrelated_log():
+    """nginx + application + database + OTel share a real incident; a
+    fifth, genuinely unrelated batch-job log must not strengthen that
+    incident's root score and is reported not_linked, without losing its
+    own retained evidence."""
+    base = datetime.now(timezone.utc)
+    rows = [
+        _evidence(1, artifact_id=101, trace_id="trace-1", service="gateway", source_format="cloud_gateway", first_seen=base),
+        _evidence(2, artifact_id=102, trace_id="trace-1", service="checkout-api", source_format="web_server", first_seen=base + timedelta(milliseconds=20)),
+        _evidence(3, artifact_id=103, trace_id="trace-1", service="orders-db", source_format="database", first_seen=base + timedelta(milliseconds=60)),
+        _evidence(4, artifact_id=104, trace_id="trace-1", service="orders-db", source_format="opentelemetry", span_id="span-4", first_seen=base + timedelta(milliseconds=70)),
+        _evidence(5, artifact_id=105, service="batch-job", first_seen=base + timedelta(days=1)),
+    ]
+    run = run_correlation(analysis_id=1, evidence_rows=rows)
+    assert len(run.result.components) == 2
+
+    artifacts = [
+        _artifact_row(101, "gateway.log", "cloud_gateway"),
+        _artifact_row(102, "nginx.log", "web_server"),
+        _artifact_row(103, "database.log", "database"),
+        _artifact_row(104, "otel.json", "opentelemetry"),
+        _artifact_row(105, "batch.log", "generic"),
+    ]
+    payload = build_correlation_payload(run, rows, artifacts=artifacts)
+
+    outcome_by_id = {a["artifact_id"]: a for a in payload["artifacts"]}
+    for artifact_id in (101, 102, 103, 104):
+        assert outcome_by_id[artifact_id]["relationship_status"] == "linked"
+    assert outcome_by_id[105]["relationship_status"] == "not_linked"
+    assert outcome_by_id[105]["evidence_count"] == 1  # retained, not deleted
+
+    # The unrelated artifact's evidence must not appear in the primary
+    # incident's own component/root candidates.
+    primary_component = max(payload["components"], key=lambda c: len(c["nodes"]))
+    linked_artifact_ids = {node["artifact_id"] for node in primary_component["nodes"]}
+    assert 105 not in linked_artifact_ids
 
     # Its evidence is genuinely present, just in the other component.
     component_ids_with_artifact_103 = [
@@ -289,6 +374,9 @@ def _sqlite_analysis_with_mixed_evidence(monkeypatch):
 def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkeypatch):
     analysis_id, artifact_ids = _sqlite_analysis_with_mixed_evidence(monkeypatch)
 
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: _FAKE_GEMINI_RESULT
+    )
     investigation_results = []
     monkeypatch.setattr(
         analysis_task,

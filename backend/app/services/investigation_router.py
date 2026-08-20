@@ -1,7 +1,7 @@
 from enum import Enum
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.evidence import Evidence
+from app.services.correlation_engine import has_genuine_correlatable_structure
 
 
 class InvestigationPath(str, Enum):
@@ -13,70 +13,31 @@ def choose_investigation_path(
     db: Session,
     analysis_id: int,
 ) -> InvestigationPath:
-    evidence_count = (
-        db.query(func.count(Evidence.id))
+    """CORRELATED is chosen only when has_genuine_correlatable_structure()
+    (correlation_engine.py) finds at least one real relationship - the
+    SAME relationship semantics build_correlation_edges itself uses, never
+    a second, independently-drifting heuristic here.
+
+    Two previous router-only signals were removed as unsound:
+      - a shared correlation_key: that hash is generated from sentinel
+        placeholders ("__none__") whenever trace_id/request_id/span_id are
+        ALL missing, so every untraced evidence row in an analysis shares
+        the identical hash regardless of whether they are actually
+        related - a persistence/dedup grouping key, never trustworthy
+        incident identity.
+      - "this row has both span_id and parent_span_id set": that only
+        proves the row itself looks like a child span: it says nothing
+        about whether the actual PARENT row (matching span_id, compatible
+        trace) exists at all. has_genuine_correlatable_structure() instead
+        calls find_parent_span_candidate(), which verifies a real match.
+    """
+    evidence_rows = (
+        db.query(Evidence)
         .filter(Evidence.analysis_id == analysis_id)
-        .scalar()
-        or 0
+        .all()
     )
 
-    if evidence_count <= 1:
-        return InvestigationPath.SIMPLE
-
-    has_parent_child_span = (
-        db.query(Evidence.id)
-        .filter(
-            Evidence.analysis_id == analysis_id,
-            Evidence.parent_span_id.is_not(None),
-            Evidence.span_id.is_not(None),
-        )
-        .first()
-        is not None
-    )
-
-    if has_parent_child_span:
-        return InvestigationPath.CORRELATED
-
-    shared_trace = (
-        db.query(Evidence.trace_id)
-        .filter(
-            Evidence.analysis_id == analysis_id,
-            Evidence.trace_id.is_not(None),
-        )
-        .group_by(Evidence.trace_id)
-        .having(func.count(Evidence.id) > 1)
-        .first()
-    )
-
-    if shared_trace is not None:
-        return InvestigationPath.CORRELATED
-
-    shared_request = (
-        db.query(Evidence.request_id)
-        .filter(
-            Evidence.analysis_id == analysis_id,
-            Evidence.request_id.is_not(None),
-        )
-        .group_by(Evidence.request_id)
-        .having(func.count(Evidence.id) > 1)
-        .first()
-    )
-
-    if shared_request is not None:
-        return InvestigationPath.CORRELATED
-
-    shared_correlation = (
-        db.query(Evidence.correlation_key)
-        .filter(
-            Evidence.analysis_id == analysis_id,
-            Evidence.correlation_key.is_not(None),
-        )
-        .group_by(Evidence.correlation_key)
-        .having(func.count(Evidence.id) > 1)
-        .first()
-    )
-
-    if shared_correlation is not None:
+    if has_genuine_correlatable_structure(evidence_rows):
         return InvestigationPath.CORRELATED
 
     return InvestigationPath.SIMPLE

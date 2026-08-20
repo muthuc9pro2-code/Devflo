@@ -33,6 +33,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
+from app.schemas.gemini import GeminiInvestigationResponse
 from app.services import diagnostic_adapters
 from app.services.artifact_detector import ArtifactFormat, detect_artifact_sample
 from app.services.correlation_engine import run_correlation
@@ -45,6 +46,14 @@ from app.services.investigation_context import (
     build_zero_evidence_payload,
 )
 from app.tasks import analysis as analysis_task
+
+# Section 26: unit tests must never require the real Gemini API/network/
+# quota - this is the same fixed, deterministic result every mocked
+# _finalize_analysis_task run in this file uses instead.
+_FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
+    title="t", summary="s", probable_root_causes=[], what_happened=[],
+    source_code_findings=[], recommended_actions=[], uncertainties=[],
+)
 
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
@@ -468,6 +477,9 @@ def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
     analysis_id = analysis.id
     db.close()
 
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: _FAKE_GEMINI_RESULT
+    )
     investigation_calls = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: investigation_calls.append(p))
 
@@ -511,6 +523,9 @@ def test_simple_end_to_end_publishes_investigation_result_only(monkeypatch):
     analysis_id = analysis.id
     db.close()
 
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: _FAKE_GEMINI_RESULT
+    )
     investigation_calls = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: investigation_calls.append(p))
 

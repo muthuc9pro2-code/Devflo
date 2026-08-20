@@ -29,12 +29,22 @@ Rules:
 - Distinguish correlation from causation. A correlated event is not automatically
   a root cause.
 - Within a correlated investigation's components, "propagation" entries are
-  directed, causal relationships (Devflo already established real direction -
-  a parent-span match, or a genuine time-ordered signal). "associations"
-  entries are the opposite: two records are part of the same incident but no
-  direction was established (e.g. identical timestamps). Never describe an
-  association as one event causing or propagating into the other - describe
-  it only as corroborating/co-occurring evidence.
+  directed relationships, each labeled relationship_type:
+    - "causal": an exact parent-span match (parent.span_id ==
+      child.parent_span_id) - a strongly evidenced, proven directional
+      relationship. You may describe this as one event causing or leading to
+      the other.
+    - "inferred_propagation": a real positive time delta between two
+      otherwise-correlated records - a directional HYPOTHESIS Devflo
+      established deterministically, never proven physical causation. Use
+      wording like "likely propagated into", "appears to have preceded", or
+      "is consistent with downstream impact" - never state or imply this is
+      proven causation.
+  "associations" entries are the opposite of both: two records are part of
+  the same incident but no direction was established (e.g. identical
+  timestamps). Never describe an association as one event causing or
+  propagating into the other - describe it only as corroborating/co-occurring
+  evidence.
 - When multiple correlation components exist, do not merge separate incident
   groups unless the supplied evidence supports doing so.
 - Use artifact filenames and formats when they help explain which evidence
@@ -48,6 +58,13 @@ Rules:
   evidence. Do not treat their existence as support for a root cause.
 - For a simple investigation, analyze the supplied evidence directly. Do not
   invent correlation, propagation, components, or root-cause scores.
+- When context_kind is "unstructured_fallback", there is no structured Evidence
+  at all - only bounded free text (fallback_context) that Devflo judged likely
+  diagnostic but could not formally structure. Treat it as possibly imperfect
+  (OCR text especially so) and explain the probable problem and concrete next
+  debugging steps from it. Do not claim it as verified evidence, do not invent
+  an exception type/trace id/service/timestamp that is not literally present
+  in the text, and do not assign it a root-cause score.
 - For a correlated investigation, use Devflo's supplied components, propagation,
   associations, strengths, root candidates, timings, signals, and evidence as
   the basis of the explanation.

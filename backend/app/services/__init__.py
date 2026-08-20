@@ -9,6 +9,10 @@ _EXPORTS = {
         "app.services.event_filter",
         "filter_important_events",
     ),
+    "is_evidence_worthy": (
+        "app.services.event_filter",
+        "is_evidence_worthy",
+    ),
     "build_exception_fingerprint": (
         "app.services.exception_fingerprint",
         "build_exception_fingerprint",
@@ -30,9 +34,9 @@ _EXPORTS = {
         "app.services.persistent_timeline",
         "stream_timeline_evidence",
     ),
-    "process_persisted_timelines": (
+    "build_component_timeline": (
         "app.services.timeline_processor",
-        "process_persisted_timelines",
+        "build_component_timeline",
     ),
 }
 

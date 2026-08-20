@@ -3,7 +3,7 @@
 Bounded-memory ingestion (a 1 GiB input processed with bounded memory) is
 worthless if every retained Evidence row is later dumped into a single
 Gemini request for the SIMPLE (uncorrelated) investigation path. These
-tests prove build_simple_llm_context()/_select_bounded_simple_evidence()
+tests prove build_simple_llm_context()/select_bounded_evidence()
 enforce explicit, deterministic bounds (SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
 SIMPLE_LLM_MAX_CONTEXT_BYTES in processing_config.py) - never an AI-based
 ranking, never a second root-cause engine - while the final frontend/
@@ -18,7 +18,7 @@ from app.core.processing_config import (
 )
 from app.models.evidence import Evidence
 from app.services.investigation_context import (
-    _select_bounded_simple_evidence,
+    select_bounded_evidence,
     build_simple_llm_context,
     build_simple_payload,
 )
@@ -93,7 +93,7 @@ def test_selection_prioritizes_source_matches_then_severity_then_occurrence():
     high_severity = _evidence(3, severity="CRITICAL", occurrence_count=1, first_seen=base)
     high_occurrence = _evidence(4, severity="ERROR", occurrence_count=5000, first_seen=base)
 
-    selected = _select_bounded_simple_evidence(
+    selected = select_bounded_evidence(
         [weak, strong_source_match, high_severity, high_occurrence],
         max_records=2,
         max_context_bytes=SIMPLE_LLM_MAX_CONTEXT_BYTES,
@@ -121,7 +121,7 @@ def test_selection_respects_the_byte_budget_even_under_the_record_limit():
         for i in range(1, 6)
     ]
 
-    selected = _select_bounded_simple_evidence(
+    selected = select_bounded_evidence(
         rows, max_records=100, max_context_bytes=25_000,
     )
 
@@ -136,7 +136,7 @@ def test_a_single_oversized_record_is_still_included_not_dropped_to_empty():
         source_matches=[{"relative_path": "a.py", "snippet": "x" * 50_000}],
     )
 
-    selected = _select_bounded_simple_evidence(
+    selected = select_bounded_evidence(
         [oversized], max_records=100, max_context_bytes=100,
     )
 
@@ -156,7 +156,7 @@ def test_artifact_diversity_prevents_one_artifact_from_dominating():
         _evidence(100, artifact_id=2, severity="ERROR", first_seen=base),
     ]
 
-    selected = _select_bounded_simple_evidence(
+    selected = select_bounded_evidence(
         noisy_artifact + quiet_artifact,
         max_records=3,
         max_context_bytes=SIMPLE_LLM_MAX_CONTEXT_BYTES,
@@ -177,7 +177,7 @@ def test_selection_is_deterministic_regardless_of_input_order():
     def selected_ids(order):
         return sorted(
             e.id
-            for e in _select_bounded_simple_evidence(order, max_records=10, max_context_bytes=SIMPLE_LLM_MAX_CONTEXT_BYTES)
+            for e in select_bounded_evidence(order, max_records=10, max_context_bytes=SIMPLE_LLM_MAX_CONTEXT_BYTES)
         )
 
     baseline = selected_ids(rows)

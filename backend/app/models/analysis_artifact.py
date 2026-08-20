@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -81,5 +82,12 @@ class AnalysisArtifact(Base):
         DateTime(timezone=True),
         server_default=func.now(),
     )
+
+    # Small, bounded unstructured-diagnostic-text fallback (Sections 9-11),
+    # e.g. {"kind": "text"|"ocr", "text": "...", "ocr_confidence": 0.94} -
+    # captured during this artifact's own (only) ingestion pass, used only
+    # when the WHOLE analysis otherwise retains zero structured Evidence.
+    # Never raw image bytes, never an unbounded slice of the artifact.
+    fallback_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     analysis = relationship("Analysis", back_populates="artifacts")

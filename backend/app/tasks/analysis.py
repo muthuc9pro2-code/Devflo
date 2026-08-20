@@ -7,17 +7,31 @@ from celery import chain, chord, group
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.core.celery_app import celery_app
+from app.core.processing_config import (
+    CORRELATED_MAX_CONTEXT_BYTES,
+    CORRELATED_MAX_EVIDENCE_RECORDS,
+    SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES,
+    SIMPLE_FALLBACK_MAX_TEXT_BYTES,
+)
 from app.db.database import sessionLocal
 from app.models import Analysis, AnalysisArtifact, Evidence
 from app.services import (
     build_exception_fingerprint,
     create_batches,
+    is_evidence_worthy,
     persist_evidence_batch,
     persist_resolved_identities,
-    process_persisted_timelines,
 )
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
-from app.services.diagnostic_adapters import stream_artifact_events
+from app.services.diagnostic_adapters import (
+    stream_artifact_events,
+    stream_image_events_from_text,
+)
+from app.services.fallback_context import (
+    capture_ocr_fallback_context,
+    capture_text_fallback_context,
+)
+from app.services.image_text_extractor import extract_text_from_image_with_confidence
 from app.services.source_archive import prepare_source
 from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
@@ -25,10 +39,13 @@ from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import (
     build_artifact_outcome_payload,
     build_correlation_payload,
+    build_fallback_llm_context,
+    build_fallback_payload,
     build_llm_context,
     build_simple_llm_context,
     build_simple_payload,
     build_zero_evidence_payload,
+    select_bounded_evidence,
 )
 from app.services.analysis_events import (
     publish_artifact_outcome,
@@ -39,8 +56,6 @@ from app.services.gemini_service import generate_investigation_explanation
 
 
 logger = logging.getLogger(__name__)
-
-_IMPORTANT_LEVELS = frozenset({'WARNING', 'WARN', 'ERROR', 'CRITICAL'})
 
 # ParsedEvent.line_number ("global_line_number" below) is internal
 # bookkeeping only - never returned by any schema/API/frontend, and
@@ -354,6 +369,69 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
         )
 
         if evidence_count == 0:
+            # Every artifact reaching finalize is "completed", and since the
+            # WHOLE analysis retained zero evidence, every one of them is
+            # necessarily a zero-evidence artifact - one bounded query,
+            # reused both for the artifacts[] outcome list and to check for
+            # a captured Sections 9-12 fallback context (never a second
+            # read/re-OCR - fallback_context was already captured during
+            # each artifact's own ingestion pass in _process_artifact).
+            zero_evidence_artifacts = (
+                db.query(AnalysisArtifact)
+                .filter(AnalysisArtifact.analysis_id == analysis_id)
+                .all()
+            )
+            fallback_artifacts = [
+                artifact
+                for artifact in zero_evidence_artifacts
+                if artifact.fallback_context
+            ]
+
+            if fallback_artifacts:
+                fallback_llm_context = build_fallback_llm_context(
+                    analysis_id,
+                    fallback_artifacts,
+                    artifacts=zero_evidence_artifacts,
+                )
+                gemini_result = generate_investigation_explanation(fallback_llm_context)
+                fallback_payload = build_fallback_payload(
+                    analysis_id,
+                    fallback_artifacts,
+                    artifacts=zero_evidence_artifacts,
+                )
+                fallback_payload["ai_analysis"] = gemini_result.model_dump()
+                # Persisted only after a valid Gemini schema result (see the
+                # CORRELATED/SIMPLE branches below) so reconnect can
+                # reattach it without a second Gemini call.
+                analysis.ai_analysis = fallback_payload["ai_analysis"]
+                # Persist-before-publish (locked requirement) - see the
+                # CORRELATED branch below for the full rationale.
+                analysis.result_snapshot = fallback_payload
+                analysis.status = "completed"
+                db.commit()
+
+                logger.info(
+                    "Analysis %s | zero structured evidence, %s artifact(s) "
+                    "with a usable unstructured fallback context",
+                    analysis_id,
+                    len(fallback_artifacts),
+                )
+                logger.info(
+                    "Analysis %s | TOTAL processing time %.2fs",
+                    analysis_id,
+                    _true_total_seconds(),
+                )
+
+                publish_investigation_result(analysis_id, fallback_payload)
+                return
+
+            zero_evidence_payload = build_zero_evidence_payload(
+                analysis_id,
+                artifacts=zero_evidence_artifacts,
+            )
+            # Persist-before-publish (locked requirement) - see the
+            # CORRELATED branch below for the full rationale.
+            analysis.result_snapshot = zero_evidence_payload
             analysis.status = "completed"
             db.commit()
 
@@ -374,28 +452,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 progress=99,
             )
 
-            # Every artifact reaching finalize is "completed", and since the
-            # WHOLE analysis retained zero evidence, every one of them is
-            # necessarily a zero-evidence artifact - one bounded query, no
-            # Gemini call (there is no evidence to explain).
-            zero_evidence_artifacts = (
-                db.query(
-                    AnalysisArtifact.id,
-                    AnalysisArtifact.original_filename,
-                    AnalysisArtifact.detected_format,
-                    AnalysisArtifact.status,
-                    AnalysisArtifact.duplicate_of_artifact_id,
-                )
-                .filter(AnalysisArtifact.analysis_id == analysis_id)
-                .all()
-            )
-            publish_investigation_result(
-                analysis_id,
-                build_zero_evidence_payload(
-                    analysis_id,
-                    artifacts=zero_evidence_artifacts,
-                ),
-            )
+            publish_investigation_result(analysis_id, zero_evidence_payload)
 
             return
 
@@ -425,21 +482,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 progress=99,
             )
 
-            timeline_start = perf_counter()
-            process_persisted_timelines(db=db, analysis_id=analysis_id)
-            logger.info("Analysis %s | persisted timelines processed", analysis_id)
-            logger.info(
-                "Analysis %s | timeline processing completed in %.2fs",
-                analysis_id,
-                perf_counter() - timeline_start,
-            )
-            publish_progress(
-                analysis_id,
-                "timeline",
-                "Timeline reconstruction completed",
-                progress=99,
-            )
-
             publish_progress(
                 analysis_id,
                 "correlation",
@@ -455,6 +497,28 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 .order_by(Evidence.first_seen, Evidence.id)
                 .all()
             )
+            total_evidence_count = len(evidence_rows)
+
+            # Section 20: hard safety net for an extreme-volume single
+            # incident - Evidence itself remains fully persisted in MySQL
+            # either way (never deleted), this only bounds what one
+            # CORRELATED graph/SSE payload has to build and transmit. The
+            # common case (below the bound) is completely unaffected.
+            if total_evidence_count > CORRELATED_MAX_EVIDENCE_RECORDS:
+                evidence_rows = select_bounded_evidence(
+                    evidence_rows,
+                    max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
+                    max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
+                )
+                logger.warning(
+                    "Analysis %s | %s evidence rows exceed "
+                    "CORRELATED_MAX_EVIDENCE_RECORDS (%s); correlating a "
+                    "deterministically-selected bounded subset of %s",
+                    analysis_id,
+                    total_evidence_count,
+                    CORRELATED_MAX_EVIDENCE_RECORDS,
+                    len(evidence_rows),
+                )
 
             correlation_run = run_correlation(
                 analysis_id=analysis_id,
@@ -483,6 +547,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 correlation_run,
                 evidence_rows,
                 artifacts=artifact_outcomes,
+                total_evidence_count=total_evidence_count,
             )
 
             logger.info(
@@ -526,6 +591,21 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             # (reconstruct_current_investigation_result attaches this same
             # field), without a second Gemini call.
             analysis.ai_analysis = correlation_payload["ai_analysis"]
+            # Persist-before-publish (locked requirement): the exact same
+            # bounded payload about to be published as investigation_result
+            # is committed to the DB FIRST. If the live SSE event is lost
+            # immediately afterward (client disconnected, process crashed),
+            # History/reconnect must already have the authoritative result
+            # rather than racing a result that only ever went out over the
+            # wire.
+            analysis.result_snapshot = correlation_payload
+            analysis.status = "completed"
+            db.commit()
+            logger.info(
+                "Analysis %s | TOTAL processing time %.2fs",
+                analysis_id,
+                _true_total_seconds(),
+            )
 
             # investigation_result is the single authoritative full final
             # payload for this analysis, published exactly once. There is
@@ -580,26 +660,28 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             # Gemini schema result, so reconnect can reattach it without a
             # second Gemini call.
             analysis.ai_analysis = simple_payload["ai_analysis"]
+            # Persist-before-publish (locked requirement) - see the
+            # CORRELATED branch above for the full rationale.
+            analysis.result_snapshot = simple_payload
+            analysis.status = "completed"
+            db.commit()
+            logger.info(
+                "Analysis %s | TOTAL processing time %.2fs",
+                analysis_id,
+                _true_total_seconds(),
+            )
 
+            # investigation_result is the single authoritative full final
+            # payload, published exactly once - no progress event follows
+            # it (see the CORRELATED branch above and the SSE contract:
+            # investigation_result must be the final meaningful event, not
+            # followed by a progress message that would misleadingly read
+            # as "still working" after the real result already arrived).
             publish_investigation_result(
                 analysis_id,
                 simple_payload,
             )
 
-            publish_progress(
-                analysis_id,
-                "completed",
-                "Evidence review completed",
-                progress=99,
-            )
-
-        analysis.status = "completed"
-        db.commit()
-        logger.info(
-            "Analysis %s | TOTAL processing time %.2fs",
-            analysis_id,
-            _true_total_seconds(),
-        )
     except Exception:
         db.rollback()
         logger.exception("Analysis %s finalize processing failed", analysis_id)
@@ -607,6 +689,18 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
         raise
     finally:
         db.close()
+
+
+def _capture_small_text_artifact_fallback(saved_file_path: str) -> dict | None:
+    """A bounded (<= SIMPLE_FALLBACK_MAX_TEXT_BYTES) prefix read of an
+    already-confirmed-small (<= SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES, a few
+    MiB at most) text artifact - not the "reopen a 1 GiB artifact" cost
+    Section 9 warns against, and never a second pass over the artifact's
+    real parsing/retention path (stream_artifact_events runs exactly once,
+    immediately after this, unaffected by it)."""
+    with open(saved_file_path, "rb") as handle:
+        raw = handle.read(SIMPLE_FALLBACK_MAX_TEXT_BYTES)
+    return capture_text_fallback_context(raw.decode("utf-8", errors="ignore"))
 
 
 def _process_artifact(
@@ -651,14 +745,41 @@ def _process_artifact(
     checkpoint_offset = artifact.processed_bytes
     last_published_progress = -1
 
-    records = stream_artifact_events(
-        file_path=artifact.saved_file_path,
-        artifact_format=artifact_format,
-        source_file=artifact.original_filename,
-        start_offset=artifact.processed_bytes,
-        start_artifact_line=artifact.last_processed_line,
-        global_line_number=analysis.last_processed_line,
-    )
+    if artifact_format == ArtifactFormat.IMAGE:
+        # OCR still runs exactly once per image: this SAME extraction
+        # feeds both the fallback context (Sections 9-12) and evidence
+        # reconstruction below - stream_image_events_from_text() never
+        # calls RapidOCR itself, unlike stream_artifact_events()'s normal
+        # IMAGE dispatch, which is why this bypasses it here.
+        extracted_text, ocr_confidence = extract_text_from_image_with_confidence(
+            artifact.saved_file_path
+        )
+        fallback_context = capture_ocr_fallback_context(extracted_text, ocr_confidence)
+        if fallback_context is not None:
+            artifact.fallback_context = fallback_context
+            db.commit()
+        records = stream_image_events_from_text(
+            extracted_text=extracted_text,
+            ocr_confidence=ocr_confidence,
+            source_file=artifact.original_filename,
+            global_line_number=analysis.last_processed_line,
+        )
+    else:
+        if artifact.size_bytes <= SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES:
+            fallback_context = _capture_small_text_artifact_fallback(
+                artifact.saved_file_path
+            )
+            if fallback_context is not None:
+                artifact.fallback_context = fallback_context
+                db.commit()
+        records = stream_artifact_events(
+            file_path=artifact.saved_file_path,
+            artifact_format=artifact_format,
+            source_file=artifact.original_filename,
+            start_offset=artifact.processed_bytes,
+            start_artifact_line=artifact.last_processed_line,
+            global_line_number=analysis.last_processed_line,
+        )
 
     for batch in create_batches(records):
         parsed_count += _persist_artifact_batch(
@@ -764,7 +885,16 @@ def _publish_ingestion_progress(
                 func.sum(AnalysisArtifact.processed_bytes),
                 func.sum(AnalysisArtifact.size_bytes),
             )
-            .filter(AnalysisArtifact.analysis_id == analysis_id)
+            .filter(
+                AnalysisArtifact.analysis_id == analysis_id,
+                # Unsupported/duplicate artifacts are never dispatched for
+                # ingestion and their size_bytes would otherwise inflate the
+                # denominator with bytes that will never be processed,
+                # permanently understating progress for the rest of the
+                # analysis (e.g. one skipped 900MB artifact alongside a real
+                # 10MB one would cap visible progress near 1%).
+                AnalysisArtifact.status.notin_(["unsupported", "duplicate"]),
+            )
             .first()
         )
         processed_bytes, total_bytes = totals if totals is not None else (None, None)
@@ -813,10 +943,7 @@ def _persist_artifact_batch(
 
         event.artifact_id = artifact.id
 
-        if event.level in _IMPORTANT_LEVELS or (
-            event.source_format == "opentelemetry"
-            and (event.trace_id is not None or event.span_id is not None)
-        ):
+        if is_evidence_worthy(event):
             important_append(event)
         
     _correlate_source_events(important_events, source_index)
@@ -930,24 +1057,31 @@ def reconstruct_current_investigation_result(
     analysis_id: int,
     *,
     ai_analysis: dict | None = None,
+    result_snapshot: dict | None = None,
 ) -> dict:
-    """Re-derives the same final investigation_result payload a client
-    would have received live via publish_investigation_result, purely from
-    already-persisted Evidence/AnalysisArtifact rows - for a client that
-    reconnects after the analysis already finished and missed the live
-    event. This deliberately does NOT touch _finalize_analysis_task's own
-    control flow (a small, separate, read-only function instead of a
-    refactor of it): it reuses the exact same builders and query shapes
-    that function already uses, just recomputed on demand rather than
-    persisted as a new JSON blob (no schema change).
+    """The final investigation_result payload for a completed analysis, for
+    a client that reconnects/re-enters after the analysis already
+    finished and missed (or never opened) the live SSE event.
 
-    ai_analysis is the caller's already-loaded Analysis.ai_analysis (the
-    exact structured Gemini result persisted at live-completion time, see
-    _finalize_analysis_task) - reattached here, never recomputed, so
-    reconnect never triggers a second Gemini call. None for a zero-evidence
-    analysis (no Gemini call is ever made for those) or for any analysis
-    finalized before this field existed.
+    result_snapshot is the caller's already-loaded Analysis.result_snapshot
+    - the exact bounded payload persisted BEFORE it was published (see
+    _finalize_analysis_task's persist-before-publish ordering). When
+    present it is returned as-is: no correlation is rerun and no Gemini
+    call is made, and - critically for History - a later change to
+    correlation/scoring logic can never silently alter what a historical
+    analysis is shown to have concluded (result immutability).
+
+    result_snapshot is only None for analyses finalized before that column
+    existed, in which case this falls back to recomputing the payload from
+    persisted Evidence/AnalysisArtifact rows (the legacy compatibility
+    path) and reattaching ai_analysis (the caller's already-loaded
+    Analysis.ai_analysis) exactly as before - never a second Gemini call
+    either way, just recomputed on demand rather than read from a stored
+    blob.
     """
+    if result_snapshot is not None:
+        return result_snapshot
+
     evidence_count = (
         db.query(func.count(Evidence.id))
         .filter(Evidence.analysis_id == analysis_id)
@@ -956,18 +1090,20 @@ def reconstruct_current_investigation_result(
     )
 
     artifacts = (
-        db.query(
-            AnalysisArtifact.id,
-            AnalysisArtifact.original_filename,
-            AnalysisArtifact.detected_format,
-            AnalysisArtifact.status,
-            AnalysisArtifact.duplicate_of_artifact_id,
-        )
+        db.query(AnalysisArtifact)
         .filter(AnalysisArtifact.analysis_id == analysis_id)
         .all()
     )
 
     if evidence_count == 0:
+        fallback_artifacts = [a for a in artifacts if a.fallback_context]
+        if fallback_artifacts:
+            payload = build_fallback_payload(
+                analysis_id, fallback_artifacts, artifacts=artifacts
+            )
+            if ai_analysis is not None:
+                payload["ai_analysis"] = ai_analysis
+            return payload
         return build_zero_evidence_payload(analysis_id, artifacts=artifacts)
 
     investigation_path = choose_investigation_path(db=db, analysis_id=analysis_id)
@@ -978,13 +1114,25 @@ def reconstruct_current_investigation_result(
         .order_by(Evidence.first_seen, Evidence.id)
         .all()
     )
+    total_evidence_count = len(evidence_rows)
 
     if investigation_path == InvestigationPath.CORRELATED:
+        if total_evidence_count > CORRELATED_MAX_EVIDENCE_RECORDS:
+            evidence_rows = select_bounded_evidence(
+                evidence_rows,
+                max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
+                max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
+            )
         correlation_run = run_correlation(
             analysis_id=analysis_id,
             evidence_rows=evidence_rows,
         )
-        payload = build_correlation_payload(correlation_run, evidence_rows, artifacts=artifacts)
+        payload = build_correlation_payload(
+            correlation_run,
+            evidence_rows,
+            artifacts=artifacts,
+            total_evidence_count=total_evidence_count,
+        )
     else:
         payload = build_simple_payload(analysis_id, evidence_rows, artifacts=artifacts)
 
@@ -1017,16 +1165,15 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
             # same shape), never by this number reaching some sentinel.
             "progress": 99,
             "investigation_result": reconstruct_current_investigation_result(
-                db, analysis.id, ai_analysis=analysis.ai_analysis
+                db,
+                analysis.id,
+                ai_analysis=analysis.ai_analysis,
+                result_snapshot=analysis.result_snapshot,
             ),
         }
 
     rows = (
-        db.query(
-            AnalysisArtifact.processed_bytes,
-            AnalysisArtifact.size_bytes,
-            AnalysisArtifact.status,
-        )
+        db.query(AnalysisArtifact)
         .filter(AnalysisArtifact.analysis_id == analysis.id)
         .all()
     )
@@ -1046,13 +1193,59 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
         # "completed".
         progress = 99
     else:
-        total_bytes = sum(row.size_bytes for row in rows)
-        processed_bytes = sum(row.processed_bytes for row in rows)
+        # Same exclusion as the live _publish_ingestion_progress query:
+        # unsupported/duplicate artifacts are never dispatched, so their
+        # size_bytes must not sit in the denominator alongside real
+        # processed_bytes that will never catch up to it.
+        total_bytes = sum(row.size_bytes for row in dispatchable)
+        processed_bytes = sum(row.processed_bytes for row in dispatchable)
         progress = _ingestion_percentage(processed_bytes, total_bytes) if total_bytes else 0
 
     return {
         "analysis_id": analysis.id,
         "status": analysis.status,  # "pending" or "processing"
         "progress": progress,
+        # Redis pub/sub has no replay: a client that connects AFTER an
+        # upload-time (unsupported/duplicate) or per-artifact
+        # (zero-evidence) outcome was already published live would
+        # otherwise never learn about it until the whole analysis
+        # completes. Every artifact whose outcome is ALREADY
+        # deterministically decided - never one still "pending"/
+        # "processing" - is included here so the initial snapshot alone is
+        # authoritative; future live artifact_outcome events for the
+        # remaining artifacts still arrive normally.
+        "artifacts": _known_terminal_artifact_outcomes(db, analysis.id, rows),
     }
+
+
+def _known_terminal_artifact_outcomes(
+    db: Session, analysis_id: int, artifacts: list[AnalysisArtifact]
+) -> list[dict]:
+    terminal = [
+        artifact
+        for artifact in artifacts
+        if artifact.status in ("unsupported", "duplicate", "completed")
+    ]
+    if not terminal:
+        return []
+
+    # One bounded, artifact-count-sized query (never evidence-volume-sized)
+    # for the "completed" rows' real evidence counts - unsupported/
+    # duplicate artifacts never have evidence and don't need it.
+    evidence_counts = dict(
+        db.query(Evidence.artifact_id, func.count(Evidence.id))
+        .filter(Evidence.analysis_id == analysis_id)
+        .group_by(Evidence.artifact_id)
+        .all()
+    )
+    filename_by_artifact_id = {artifact.id: artifact.original_filename for artifact in artifacts}
+
+    return [
+        build_artifact_outcome_payload(
+            artifact,
+            evidence_counts.get(artifact.id, 0),
+            filename_by_artifact_id,
+        )
+        for artifact in terminal
+    ]
 

@@ -144,6 +144,81 @@ def test_identical_bytes_different_filename_is_flagged_duplicate():
     db.close()
 
 
+def test_duplicate_staged_bytes_are_deleted_but_metadata_and_canonical_survive(
+    tmp_path, monkeypatch
+):
+    """Section 6: duplicate rows were previously marked "duplicate" in the
+    DB but their staged physical bytes were never reclaimed. Only the
+    duplicate's file must be deleted - never the canonical's - and only
+    after the DB has durably established the relationship; all metadata
+    (filename, duplicate_of_artifact_id) must remain queryable."""
+    from app.crud import analysis as crud_analysis
+
+    monkeypatch.setattr(crud_analysis, "_UPLOAD_ROOT", tmp_path.resolve())
+
+    canonical_path = tmp_path / "original.log"
+    duplicate_path = tmp_path / "copy.log"
+    canonical_path.write_bytes(b"same bytes")
+    duplicate_path.write_bytes(b"same bytes")
+
+    session_factory, db, user = _sqlite_session()
+    digest = hashlib.sha256(b"same bytes").hexdigest()
+
+    analysis = create_analysis(
+        db=db,
+        user_id=user.id,
+        filename="original.log",
+        saved_file_path=str(canonical_path),
+        artifacts=[
+            {
+                "original_filename": "original.log",
+                "saved_file_path": str(canonical_path),
+                "size_bytes": 10,
+                "detected_format": "web_server",
+                "content_sha256": digest,
+            },
+            {
+                "original_filename": "copy.log",
+                "saved_file_path": str(duplicate_path),
+                "size_bytes": 10,
+                "detected_format": "web_server",
+                "content_sha256": digest,
+            },
+        ],
+    )
+
+    assert canonical_path.exists()
+    assert not duplicate_path.exists()
+
+    rows = (
+        db.query(AnalysisArtifact)
+        .filter(AnalysisArtifact.analysis_id == analysis.id)
+        .order_by(AnalysisArtifact.position)
+        .all()
+    )
+    original, copy = rows
+    assert original.status == "pending"
+    assert copy.status == "duplicate"
+    assert copy.duplicate_of_artifact_id == original.id
+    assert copy.original_filename == "copy.log"
+    db.close()
+
+
+def test_duplicate_deletion_refuses_to_delete_outside_the_upload_root(tmp_path, monkeypatch):
+    """Safety: even if a saved_file_path somehow pointed outside the upload
+    root, the deletion helper must refuse rather than deleting it."""
+    from app.crud import analysis as crud_analysis
+
+    monkeypatch.setattr(crud_analysis, "_UPLOAD_ROOT", (tmp_path / "uploads").resolve())
+
+    outside_path = tmp_path / "outside.log"
+    outside_path.write_bytes(b"do not delete me")
+
+    crud_analysis._delete_staged_upload(str(outside_path))
+
+    assert outside_path.exists()
+
+
 def test_identical_filename_different_bytes_is_not_duplicate():
     session_factory, db, user = _sqlite_session()
 

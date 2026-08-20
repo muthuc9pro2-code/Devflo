@@ -1,8 +1,14 @@
+import logging
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 from sqlalchemy.orm import Session
 from app.models.analysis import Analysis
 from app.models.analysis_artifact import AnalysisArtifact
+
+logger = logging.getLogger(__name__)
+
+_UPLOAD_ROOT = Path("uploads").resolve()
 
 def create_analysis(
     db: Session,
@@ -98,4 +104,36 @@ def create_analysis(
         db.rollback()
         raise
 
+    # Best-effort, post-commit only: the DB has already durably established
+    # canonical vs duplicate (including duplicate_of_artifact_id), so it is
+    # now safe to reclaim the duplicate's redundant staged bytes. Metadata
+    # (original_filename, duplicate_of_artifact_id, status) stays in the DB
+    # either way - only the physical file is removed, and only the
+    # duplicate's, never the canonical artifact's. A deletion failure is
+    # logged and otherwise ignored: the investigation is already durably
+    # correct without it, and redundant bytes left on disk are not worth
+    # failing the upload over.
+    for duplicate, _canonical in duplicates:
+        _delete_staged_upload(duplicate.saved_file_path)
+
     return analysis
+
+
+def _delete_staged_upload(saved_file_path: str) -> None:
+    path = Path(saved_file_path)
+    resolved = path.resolve(strict=False)
+
+    if resolved.parent != _UPLOAD_ROOT:
+        logger.warning(
+            "Refusing to delete staged upload outside the upload root: %s",
+            saved_file_path,
+        )
+        return
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception(
+            "Failed to delete duplicate artifact's staged file: %s",
+            saved_file_path,
+        )

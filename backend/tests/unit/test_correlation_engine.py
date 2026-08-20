@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.models.evidence import Evidence
 from app.services.correlation_engine import (
     NodeGraphStats,
@@ -543,3 +545,95 @@ def test_association_only_relationship_does_not_inflate_downstream_causal_counts
     assert stats_by_id["evidence-3"].downstream_count == 0
     roles = {c.node_id: c.role for c in run.root_causes[0]}
     assert roles["evidence-3"] == "uncorrelated"
+
+
+# --- Section 16: causal vs inferred_propagation vs association ------------
+
+
+def test_scenario_n_exact_parent_span_is_relationship_type_causal():
+    same_time = datetime.now(timezone.utc)
+    parent = _evidence(
+        1, source_format="opentelemetry", trace_id="trace-n", span_id="span-parent",
+        first_seen=same_time, last_seen=same_time,
+    )
+    child = _evidence(
+        2, source_format="opentelemetry", trace_id="trace-n", parent_span_id="span-parent",
+        first_seen=same_time, last_seen=same_time,
+    )
+
+    causal_edges, associations = build_correlation_edges(
+        [parent, child], build_correlation_indexes([parent, child])
+    )
+
+    assert len(causal_edges) == 1
+    assert associations == []
+    edge = causal_edges[0]
+    assert edge.relationship_type == "causal"
+    assert edge.direction_confidence == 1.0
+
+
+def test_scenario_q_positive_time_shared_identity_is_inferred_propagation_with_exact_delta():
+    base = datetime.now(timezone.utc)
+    earlier = _evidence(1, trace_id="trace-q", first_seen=base, last_seen=base)
+    later = _evidence(
+        2, trace_id="trace-q",
+        first_seen=base + timedelta(milliseconds=27.4),
+        last_seen=base + timedelta(milliseconds=27.4),
+    )
+
+    causal_edges, associations = build_correlation_edges(
+        [earlier, later], build_correlation_indexes([earlier, later])
+    )
+
+    assert len(causal_edges) == 1
+    assert associations == []
+    edge = causal_edges[0]
+    assert edge.relationship_type == "inferred_propagation"
+    assert edge.delta_ms == pytest.approx(27.4)
+    assert edge.direction_confidence is not None
+    assert 0.0 < edge.direction_confidence <= 1.0
+    # Not mislabeled as proven causality - "causal" is reserved for
+    # verified parent-span relationships only.
+    assert edge.relationship_type != "causal"
+
+
+def test_associations_never_carry_a_relationship_type_or_direction_confidence():
+    same_time = datetime.now(timezone.utc)
+    a = _evidence(1, trace_id="trace-assoc2", first_seen=same_time, last_seen=same_time)
+    b = _evidence(2, trace_id="trace-assoc2", first_seen=same_time, last_seen=same_time)
+
+    causal_edges, associations = build_correlation_edges(
+        [a, b], build_correlation_indexes([a, b])
+    )
+
+    assert causal_edges == []
+    assert len(associations) == 1
+    assert associations[0].relationship_type is None
+    assert associations[0].direction_confidence is None
+
+
+def test_closer_in_time_inferred_propagation_has_higher_direction_confidence():
+    """direction_confidence reuses the existing temporal_score decay -
+    closer in time supports the propagation hypothesis more strongly."""
+    base = datetime.now(timezone.utc)
+    close_rows = [
+        _evidence(1, trace_id="trace-close", first_seen=base, last_seen=base),
+        _evidence(
+            2, trace_id="trace-close",
+            first_seen=base + timedelta(milliseconds=5),
+            last_seen=base + timedelta(milliseconds=5),
+        ),
+    ]
+    far_rows = [
+        _evidence(3, trace_id="trace-far", first_seen=base, last_seen=base),
+        _evidence(
+            4, trace_id="trace-far",
+            first_seen=base + timedelta(seconds=4),
+            last_seen=base + timedelta(seconds=4),
+        ),
+    ]
+
+    close_edge = build_correlation_edges(close_rows, build_correlation_indexes(close_rows))[0][0]
+    far_edge = build_correlation_edges(far_rows, build_correlation_indexes(far_rows))[0][0]
+
+    assert close_edge.direction_confidence > far_edge.direction_confidence

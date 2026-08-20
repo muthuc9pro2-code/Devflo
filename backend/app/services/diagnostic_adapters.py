@@ -10,7 +10,7 @@ from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, JSON_STR
 from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
-from .diagnostic_parser import EXCEPTION_PATTERN, JAVA_FRAME_PATTERN, NODE_FRAME_PATTERN, PYTHON_FRAME_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
+from .diagnostic_parser import EXCEPTION_PATTERN, GENERIC_SOURCE_LOCATION_PATTERN, JAVA_FRAME_PATTERN, NODE_FRAME_PATTERN, PYTHON_FRAME_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
 from app.services.image_text_extractor import extract_text_from_image_with_confidence
@@ -129,6 +129,27 @@ def _stream_image_events(
     # extract_text_from_image_with_confidence) - everything below only
     # restructures that one result in memory, no second OCR pass.
     extracted_text, ocr_confidence = extract_text_from_image_with_confidence(file_path)
+    yield from stream_image_events_from_text(
+        extracted_text=extracted_text,
+        ocr_confidence=ocr_confidence,
+        source_file=source_file,
+        global_line_number=global_line_number,
+    )
+
+
+def stream_image_events_from_text(
+    *,
+    extracted_text: str,
+    ocr_confidence: float | None,
+    source_file: str,
+    global_line_number: int,
+) -> Iterator[ArtifactEvent]:
+    """Record reconstruction only, from ALREADY-extracted OCR text - split
+    out of _stream_image_events so a caller that also needs the raw OCR
+    result for something else (the zero-evidence fallback context, see
+    app.tasks.analysis._process_artifact) can call
+    extract_text_from_image_with_confidence() itself exactly once and reuse
+    the same result here, instead of this function extracting it again."""
     normalized_text = normalize_ocr_text(extracted_text)
 
     if not normalized_text.strip():
@@ -412,8 +433,9 @@ def _default_level_for_bare_stack_frame(event: ParsedEvent | None, raw_text: str
 
 
 def _contains_stack_frame(raw_text: str) -> bool:
-    """A structurally-recognized stack frame line (Python/Java/Node - the
-    same three languages _parse_stack_frames already decodes; nothing new
+    """A structurally-recognized stack frame line (Python/Java/Node, or the
+    generic path:line[:column] shape covering Go/Rust/Ruby/.NET/C/C++ etc -
+    the same conventions _parse_stack_frames already decodes; nothing new
     here) is inherently diagnostic on its own. Frame chains only ever occur
     in crash/exception output, even when the explicit ERROR/Traceback
     keyword line that normally accompanies them is missing from what was
@@ -423,6 +445,7 @@ def _contains_stack_frame(raw_text: str) -> bool:
         PYTHON_FRAME_PATTERN.search(raw_text)
         or JAVA_FRAME_PATTERN.search(raw_text)
         or NODE_FRAME_PATTERN.search(raw_text)
+        or GENERIC_SOURCE_LOCATION_PATTERN.search(raw_text)
         or _LOOSE_FRAME_MARKER_RE.search(raw_text)
     )
 

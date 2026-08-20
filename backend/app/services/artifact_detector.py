@@ -82,13 +82,38 @@ def detect_artifact_stream(stream: BinaryIO, *, filename: str | None=None, mime_
         stream.seek(original_position)
     return detect_artifact_sample(sample, filename=filename, mime_type=mime_type)
 
+_ROTATION_SUFFIX_PATTERN = re.compile(r"^\.\d+$")
+
+
+def _effective_suffix(filename: str) -> str:
+    """A purely numeric trailing suffix (access.log.1, error.log.2 - the
+    standard rotated-log naming convention) is not itself a format marker;
+    it shadows the real one. Falls back to the suffix before it so rotated
+    logs are recognized the same way their unrotated original would be."""
+    path = Path(filename or "")
+    suffixes = path.suffixes
+    if len(suffixes) > 1 and _ROTATION_SUFFIX_PATTERN.match(suffixes[-1]):
+        return suffixes[-2].lower()
+    return path.suffix.lower()
+
+
+def _sample_is_text_like(sample: bytes) -> bool:
+    if not sample or b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def is_supported_diagnostic_sample(
     sample: bytes,
     *,
     filename: str | None = None,
     mime_type: str | None = None,
 ) -> bool:
-    suffix = Path(filename or "").suffix.lower()
+    suffix = _effective_suffix(filename or "")
     normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
 
     if (
@@ -98,20 +123,26 @@ def is_supported_diagnostic_sample(
         return True
 
     if (
-        suffix not in SUPPORTED_TEXT_SUFFIXES
-        and normalized_mime not in SUPPORTED_TEXT_MIME_TYPES
+        suffix in SUPPORTED_TEXT_SUFFIXES
+        or normalized_mime in SUPPORTED_TEXT_MIME_TYPES
     ):
+        return _sample_is_text_like(sample)
+
+    # Unfamiliar suffix/MIME (e.g. cloudfront.tsv, service.out with an
+    # unrecognized content-type): content still wins over extension, but
+    # only when detection is CONFIDENT about a specific, non-generic
+    # diagnostic family - an unfamiliar suffix alone must not fall back to
+    # "accept as GENERIC text", and arbitrary binary content is still
+    # rejected by the same text-like check every other branch uses.
+    if not _sample_is_text_like(sample):
         return False
 
-    if not sample or b"\x00" in sample:
-        return False
-
-    try:
-        sample.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return False
-
-    return True
+    detected = detect_artifact_sample(sample, filename=filename, mime_type=mime_type)
+    return detected not in (
+        ArtifactFormat.GENERIC,
+        ArtifactFormat.UNSUPPORTED,
+        ArtifactFormat.IMAGE,
+    )
 
 def detect_artifact_sample(sample: bytes, *, filename: str | None=None, mime_type: str | None=None) -> ArtifactFormat:
     sample_suffix = Path(filename or '').suffix.lower()

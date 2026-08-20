@@ -8,6 +8,7 @@ artifact behavior - and an end-to-end real-DB check that dispatch starts
 at 0, ingestion advances, and finalize reports 99 (never 100) before the
 existing completion signal.
 """
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,7 +16,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.models import Analysis, AnalysisArtifact, User
+from app.models import Analysis, AnalysisArtifact, Evidence, User
+from app.schemas.gemini import GeminiInvestigationResponse
 from app.services import analysis_events
 from app.tasks import analysis as analysis_task
 
@@ -146,6 +148,46 @@ def test_progress_reflects_aggregate_across_all_artifacts_not_a_single_one():
     assert any("size_bytes" in str(col) for col in query_columns)
 
 
+def test_ingestion_progress_excludes_unsupported_and_duplicate_artifact_bytes(monkeypatch):
+    """Additional Requirement B: unsupported/duplicate artifacts are never
+    dispatched for ingestion, so a huge one must not sit in the denominator
+    and suppress visible progress on the real, dispatchable artifact."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    user = User(username="t", email="t@example.com", hashed_password="x", is_verified=True)
+    db.add(user)
+    db.commit()
+    analysis = Analysis(user_id=user.id, original_filename="a", saved_file_path="a", status="processing")
+    db.add(analysis)
+    db.commit()
+    db.add_all(
+        [
+            AnalysisArtifact(
+                analysis_id=analysis.id, position=0, original_filename="huge.bin",
+                saved_file_path="huge.bin", size_bytes=1_000_000_000, status="unsupported",
+                last_processed_line=0, processed_bytes=0,
+            ),
+            AnalysisArtifact(
+                analysis_id=analysis.id, position=1, original_filename="dup.log",
+                saved_file_path="dup.log", size_bytes=500, status="duplicate",
+                duplicate_of_artifact_id=None, last_processed_line=0, processed_bytes=500,
+            ),
+            AnalysisArtifact(
+                analysis_id=analysis.id, position=2, original_filename="real.log",
+                saved_file_path="real.log", size_bytes=100, status="processing",
+                last_processed_line=0, processed_bytes=100,
+            ),
+        ]
+    )
+    db.commit()
+
+    result = analysis_task._publish_ingestion_progress(db=db, analysis_id=analysis.id, last_published=-1)
+
+    assert result == 98  # 100/100 real bytes = 100%, clamped to the 98 mid-ingestion cap
+
+
 # --- End-to-end: dispatch starts at 0, finalize reports 99 not 100 ------
 
 
@@ -226,3 +268,93 @@ def test_finalize_reports_99_never_100_for_zero_evidence_analysis(monkeypatch, c
     # stage progress event itself (no correlated evidence to run
     # identity/timeline/correlation for) - still must never be 100.
     assert published_progress  # at least the "Evidence extraction completed" + "completed" events fired
+
+
+# --- Additional Locked Requirement A: investigation_result is always LAST -
+
+
+def _events_in_order(monkeypatch):
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        analysis_task,
+        "publish_progress",
+        lambda analysis_id, stage, message, progress=None: events.append(("progress", progress)),
+    )
+    monkeypatch.setattr(
+        analysis_task,
+        "publish_investigation_result",
+        lambda analysis_id, payload: events.append(("investigation_result", payload)),
+    )
+    return events
+
+
+def test_simple_path_investigation_result_is_the_last_event(monkeypatch):
+    analysis_id = _sqlite_analysis_with_artifacts(monkeypatch, [10])
+    db = analysis_task.sessionLocal()
+    artifact = db.query(AnalysisArtifact).filter_by(analysis_id=analysis_id).first()
+    db.add(
+        Evidence(
+            analysis_id=analysis_id, artifact_id=artifact.id, correlation_key="ck-1",
+            fingerprint="fp-1", service="worker", source_format="generic",
+            first_line_number=1, last_line_number=1, severity="ERROR",
+        )
+    )
+    db.commit()
+    db.close()
+
+    fake_result = GeminiInvestigationResponse(
+        title="t", summary="s", probable_root_causes=[], what_happened=[],
+        source_code_findings=[], recommended_actions=[], uncertainties=[],
+    )
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: fake_result
+    )
+    events = _events_in_order(monkeypatch)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert events, "expected at least one SSE event"
+    assert events[-1][0] == "investigation_result"
+    assert events[-1][1]["investigation_path"] == "simple"
+
+
+def test_correlated_path_investigation_result_is_the_last_event(monkeypatch):
+    analysis_id = _sqlite_analysis_with_artifacts(monkeypatch, [10])
+    db = analysis_task.sessionLocal()
+    artifact = db.query(AnalysisArtifact).filter_by(analysis_id=analysis_id).first()
+    base_time = datetime.now(timezone.utc)
+    db.add_all(
+        [
+            Evidence(
+                analysis_id=analysis_id, artifact_id=artifact.id, correlation_key="ck-1",
+                fingerprint="fp-1", trace_id="trace-1", service="api", source_format="generic",
+                first_line_number=1, last_line_number=1, severity="ERROR", first_seen=base_time,
+            ),
+            Evidence(
+                analysis_id=analysis_id, artifact_id=artifact.id, correlation_key="ck-2",
+                fingerprint="fp-2", trace_id="trace-1", service="db", source_format="generic",
+                first_line_number=2, last_line_number=2, severity="ERROR",
+                first_seen=base_time,
+            ),
+        ]
+    )
+    db.commit()
+    db.close()
+
+    fake_result = GeminiInvestigationResponse(
+        title="t", summary="s", probable_root_causes=[], what_happened=[],
+        source_code_findings=[], recommended_actions=[], uncertainties=[],
+    )
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: fake_result
+    )
+    events = _events_in_order(monkeypatch)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert events, "expected at least one SSE event"
+    assert events[-1][0] == "investigation_result"
+    assert events[-1][1]["investigation_path"] == "correlated"
+    # A progress event legitimately precedes it (deterministic correlation
+    # finishing before the Gemini call) - just never one AFTER it.
+    assert any(kind == "progress" for kind, _ in events[:-1])

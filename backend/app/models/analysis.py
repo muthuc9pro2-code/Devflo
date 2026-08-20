@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, Index, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -8,6 +8,14 @@ from app.db.database import Base
 
 class Analysis(Base):
     __tablename__ = "analyses"
+    __table_args__ = (
+        # Covers the History-list query - WHERE user_id = ? ORDER BY
+        # created_at DESC, id DESC (keyset pagination) - with a single
+        # index instead of a filter plus a separate sort. A bare user_id
+        # index (implicit from the FK) would satisfy the filter but still
+        # require sorting every matching row in memory.
+        Index("ix_analyses_user_id_created_at_id", "user_id", "created_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
@@ -54,3 +62,16 @@ class Analysis(Base):
     # investigations (no Gemini call is ever made for those) and for any
     # analysis finalized before this field existed.
     ai_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # The exact same bounded final payload published as investigation_result
+    # (correlated/simple/zero_evidence/fallback, ai_analysis already
+    # attached) - written BEFORE that event is published (see
+    # _finalize_analysis_task) so History/reconnect always has an
+    # authoritative, immutable record of what was actually shown, even if
+    # the live SSE event never reaches a client. Never recomputed after the
+    # fact - a later change to correlation/scoring logic must not alter a
+    # historical result. Null for analyses finalized before this column
+    # existed and for analyses still pending/processing/failed;
+    # reconstruct_current_investigation_result() remains the read-time
+    # fallback for those legacy completed rows.
+    result_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)

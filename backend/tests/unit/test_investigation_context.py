@@ -103,6 +103,28 @@ def test_correlated_frontend_payload_uses_explicit_strength_names():
     assert '"score"' not in payload_text
 
 
+def test_node_carries_its_own_role_and_root_cause_strength():
+    """Section 17: a node is self-sufficient - the frontend must not have
+    to cross-reference the separate root_causes[] array merely to know
+    whether a node is the root, a propagation step, or a victim."""
+    run, evidence_rows = _correlated_fixture()
+    payload = build_correlation_payload(run, evidence_rows)
+
+    component = payload["components"][0]
+    role_and_strength_by_node_id = {
+        c["node_id"]: (c["role"], c["root_cause_strength"]) for c in component["root_causes"]
+    }
+    assert component["nodes"], "expected nodes in the fixture"
+    for node in component["nodes"]:
+        role, strength = role_and_strength_by_node_id[node["id"]]
+        assert node["role"] == role
+        assert node["root_cause_strength"] == strength
+
+    roles = {node["id"]: node["role"] for node in component["nodes"]}
+    assert "root" in roles.values()
+    assert "victim" in roles.values()
+
+
 def test_correlated_gemini_context_uses_explicit_strength_names():
     run, evidence_rows = _correlated_fixture()
     context = build_llm_context(run, evidence_rows)

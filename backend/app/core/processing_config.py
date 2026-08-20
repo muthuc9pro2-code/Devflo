@@ -23,6 +23,52 @@ MAX_REPRESENTATIVE_LINE_BYTES = 64 * 1024 - 1
 SIMPLE_LLM_MAX_EVIDENCE_RECORDS = 200
 SIMPLE_LLM_MAX_CONTEXT_BYTES = 2 * MEBIBYTE
 
+# iter_temporal_candidates' two-pointer sliding window is O(n) amortized
+# only when events are temporally sparse relative to the window (the
+# window naturally shrinks). A busy production service can easily emit
+# thousands of events within any single 5-second window - in that dense
+# case the window never shrinks and the per-event inner scan degrades
+# toward O(n^2) candidate pairs (confirmed directly: ~2000 evidence rows
+# packed into one 5-second window did not finish correlating within 60s).
+# Capping each event to its nearest TEMPORAL_CANDIDATE_MAX_NEIGHBORS by
+# time bounds total candidate-pair work to O(n * K) regardless of density,
+# without weakening burst correlation: adjacent events' neighbor sets
+# still overlap enough to transitively chain an entire dense burst into
+# one connected component (see
+# test_dense_temporal_burst_still_correlates_within_bounded_time).
+TEMPORAL_CANDIDATE_MAX_NEIGHBORS = 40
+
+# Zero-evidence SIMPLE unstructured fallback (Sections 9-11): a small,
+# artifact-level bounded slice of "this looked like real diagnostic text"
+# content, captured during an artifact's ORIGINAL ingestion pass (never a
+# second read/re-OCR) and used only when the WHOLE analysis otherwise
+# retains zero structured Evidence - never a parallel evidence model, and
+# never large enough to look like "send the raw file to Gemini instead".
+SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES = 2 * MEBIBYTE
+SIMPLE_FALLBACK_MAX_TEXT_BYTES = 64 * 1024
+SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES = 256 * 1024
+
+# Section 20: hard safety-net bound on how much evidence a single CORRELATED
+# graph (and therefore its serialized SSE/frontend payload) is allowed to
+# carry - the 1 GiB bounded-streaming-ingestion guarantee is meaningless if
+# finalize later loads/serializes an unbounded Evidence table. Evidence
+# stays fully persisted in MySQL regardless; this only bounds what one
+# request/response cycle has to build and transmit. 5000 is comfortably
+# above any real single-incident investigation's actual evidence volume
+# (see test_correlation_engine.py's dense-burst benchmark: correlation
+# itself remains well within a background Celery task's time budget at
+# this scale, after the TEMPORAL_CANDIDATE_MAX_NEIGHBORS/enforce_dag fixes).
+CORRELATED_MAX_EVIDENCE_RECORDS = 5000
+CORRELATED_MAX_CONTEXT_BYTES = 20 * MEBIBYTE
+
+# Section 21: same idea for the SIMPLE path's frontend/SSE result
+# (build_simple_payload) - Gemini's own SIMPLE context is already bounded
+# separately (SIMPLE_LLM_MAX_EVIDENCE_RECORDS, far smaller); this only
+# protects the response/serialization size for a giant uncorrelated
+# investigation. Evidence stays fully persisted in MySQL regardless.
+SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS = 5000
+SIMPLE_FRONTEND_MAX_CONTEXT_BYTES = 20 * MEBIBYTE
+
 # Optional source-code input (GitHub URL or ZIP), kept separate from
 # diagnostic artifact limits above.
 SOURCE_STORAGE_ROOT = "uploads/sources"
