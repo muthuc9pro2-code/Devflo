@@ -12,6 +12,7 @@ from app.core.processing_config import (
     CORRELATED_MAX_EVIDENCE_RECORDS,
     SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES,
     SIMPLE_FALLBACK_MAX_TEXT_BYTES,
+    SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES,
 )
 from app.db.database import sessionLocal
 from app.models import Analysis, AnalysisArtifact, Evidence
@@ -45,7 +46,7 @@ from app.services.investigation_context import (
     build_simple_llm_context,
     build_simple_payload,
     build_zero_evidence_payload,
-    select_bounded_evidence,
+    select_bounded_evidence_from_db,
 )
 from app.services.analysis_events import (
     publish_artifact_outcome,
@@ -198,13 +199,21 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
         # See _GLOBAL_LINE_NUMBER_STRIDE above: deterministic per-position
         # band instead of a cross-artifact running total, since concurrent
         # artifacts have no well-defined "how many lines came before them".
-        analysis.last_processed_line = artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
+        # A plain local variable (Section 5) - not analysis.last_processed_line
+        # - so this never dirties the shared Analysis row: concurrent
+        # artifact tasks previously all wrote to that one row on every
+        # batch commit (see _persist_artifact_batch), causing unnecessary
+        # row-lock contention between them. Analysis.processed_bytes/
+        # last_processed_line are recomputed once, from the authoritative
+        # per-artifact rows, at _finalize_analysis_task.
+        global_line_number = artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
 
         return _process_artifact(
             db=db,
             analysis=analysis,
             artifact=artifact,
             source_index=source_index,
+            global_line_number=global_line_number,
         )
     except Exception:
         db.rollback()
@@ -491,25 +500,20 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
             correlation_start = perf_counter()
 
-            evidence_rows = (
-                db.query(Evidence)
-                .filter(Evidence.analysis_id == analysis_id)
-                .order_by(Evidence.first_seen, Evidence.id)
-                .all()
+            # Section 4 (final hardening pass): genuinely end-to-end
+            # bounded selection - never materializes the whole Evidence
+            # result set into memory merely to truncate it afterward.
+            # Below CORRELATED_MAX_EVIDENCE_RECORDS this is exactly one
+            # query, identical to before. Evidence itself remains fully
+            # persisted in MySQL either way; this only bounds what one
+            # CORRELATED graph/SSE payload has to build and transmit.
+            evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
+                db,
+                analysis_id=analysis_id,
+                max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
+                max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
             )
-            total_evidence_count = len(evidence_rows)
-
-            # Section 20: hard safety net for an extreme-volume single
-            # incident - Evidence itself remains fully persisted in MySQL
-            # either way (never deleted), this only bounds what one
-            # CORRELATED graph/SSE payload has to build and transmit. The
-            # common case (below the bound) is completely unaffected.
-            if total_evidence_count > CORRELATED_MAX_EVIDENCE_RECORDS:
-                evidence_rows = select_bounded_evidence(
-                    evidence_rows,
-                    max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
-                    max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
-                )
+            if total_evidence_count > len(evidence_rows):
                 logger.warning(
                     "Analysis %s | %s evidence rows exceed "
                     "CORRELATED_MAX_EVIDENCE_RECORDS (%s); correlating a "
@@ -538,16 +542,31 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
                     AnalysisArtifact.duplicate_of_artifact_id,
+                    AnalysisArtifact.fallback_context,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
             )
+
+            # Section 2: an artifact that retained zero structured Evidence
+            # of its own but did capture useful fallback text/OCR content
+            # during its own ingestion pass (never a second read/OCR) must
+            # not silently disappear just because OTHER artifacts in this
+            # same analysis have real structured Evidence - it becomes
+            # bounded, clearly-non-causal supplemental context instead.
+            artifact_ids_with_evidence = {evidence.artifact_id for evidence in evidence_rows}
+            supplemental_artifacts = [
+                artifact
+                for artifact in artifact_outcomes
+                if artifact.fallback_context and artifact.id not in artifact_ids_with_evidence
+            ]
 
             correlation_payload = build_correlation_payload(
                 correlation_run,
                 evidence_rows,
                 artifacts=artifact_outcomes,
                 total_evidence_count=total_evidence_count,
+                supplemental_artifacts=supplemental_artifacts,
             )
 
             logger.info(
@@ -580,6 +599,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 correlation_run,
                 evidence_rows,
                 artifacts=artifact_outcomes,
+                supplemental_artifacts=supplemental_artifacts,
             )
 
             gemini_result = generate_investigation_explanation(llm_context)
@@ -634,15 +654,29 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
                     AnalysisArtifact.duplicate_of_artifact_id,
+                    AnalysisArtifact.fallback_context,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
             )
 
+            # Section 2: same low-structure-survives-a-mixed-investigation
+            # treatment as the CORRELATED branch above.
+            simple_artifact_ids_with_evidence = {
+                evidence.artifact_id for evidence in evidence_rows
+            }
+            simple_supplemental_artifacts = [
+                artifact
+                for artifact in simple_artifacts
+                if artifact.fallback_context
+                and artifact.id not in simple_artifact_ids_with_evidence
+            ]
+
             simple_payload = build_simple_payload(
                 analysis_id,
                 evidence_rows,
                 artifacts=simple_artifacts,
+                supplemental_artifacts=simple_supplemental_artifacts,
             )
 
             # Prepared for the Gemini integration to be wired in next -
@@ -652,6 +686,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 evidence_rows,
                 artifacts=simple_artifacts,
+                supplemental_artifacts=simple_supplemental_artifacts,
             )
 
             gemini_result = generate_investigation_explanation(simple_llm_context)
@@ -709,7 +744,17 @@ def _process_artifact(
     analysis: Analysis,
     artifact: AnalysisArtifact,
     source_index=None,
+    global_line_number: int | None = None,
 ) -> int:
+    # Section 5: an explicit local starting line number rather than reading
+    # analysis.last_processed_line - the caller (_process_artifact_task) no
+    # longer maintains that shared-row attribute at all. Falls back to
+    # reading it only for callers that still seed it directly (e.g. legacy/
+    # test call sites constructing a lightweight `analysis` object), never
+    # itself writes it back.
+    if global_line_number is None:
+        global_line_number = getattr(analysis, "last_processed_line", 0)
+
     artifact_start = perf_counter()
     initial_size = getsize(artifact.saved_file_path)
     is_migrated_artifact = (
@@ -742,7 +787,6 @@ def _process_artifact(
     db.commit()
 
     parsed_count = 0
-    checkpoint_offset = artifact.processed_bytes
     last_published_progress = -1
 
     if artifact_format == ArtifactFormat.IMAGE:
@@ -762,7 +806,7 @@ def _process_artifact(
             extracted_text=extracted_text,
             ocr_confidence=ocr_confidence,
             source_file=artifact.original_filename,
-            global_line_number=analysis.last_processed_line,
+            global_line_number=global_line_number,
         )
     else:
         if artifact.size_bytes <= SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES:
@@ -778,7 +822,7 @@ def _process_artifact(
             source_file=artifact.original_filename,
             start_offset=artifact.processed_bytes,
             start_artifact_line=artifact.last_processed_line,
-            global_line_number=analysis.last_processed_line,
+            global_line_number=global_line_number,
         )
 
     for batch in create_batches(records):
@@ -789,7 +833,6 @@ def _process_artifact(
             batch=batch,
             source_index=source_index,
         )
-        checkpoint_offset = artifact.processed_bytes
         last_published_progress = _publish_ingestion_progress(
             db=db,
             analysis_id=analysis.id,
@@ -802,10 +845,13 @@ def _process_artifact(
             f"Artifact {artifact.id} changed during processing; checkpoint not completed"
         )
 
-    remaining_bytes = max(artifact.size_bytes - checkpoint_offset, 0)
+    # Section 5: only this artifact's own row is updated here - the shared
+    # Analysis.processed_bytes/last_processed_line are never mutated during
+    # per-artifact/per-batch processing (see _persist_artifact_batch),
+    # only recomputed once from AnalysisArtifact rows at
+    # _finalize_analysis_task.
     artifact.processed_bytes = artifact.size_bytes
     artifact.status = "completed"
-    analysis.processed_bytes += remaining_bytes
     db.commit()
 
     logger.info(
@@ -955,13 +1001,16 @@ def _persist_artifact_batch(
         artifact_id=artifact.id,
     )
 
+    # Section 5: only this artifact's own row is dirtied here (never the
+    # shared Analysis row) - concurrent artifact tasks each commit their
+    # own row without contending for a lock on one shared row per batch.
+    # Analysis.processed_bytes/last_processed_line are recomputed once
+    # from AnalysisArtifact rows at _finalize_analysis_task instead.
     last_record = batch[-1]
     previous_offset = artifact.processed_bytes
     new_offset = max(previous_offset, last_record.end_offset)
     artifact.processed_bytes = new_offset
     artifact.last_processed_line = last_record.artifact_line_number
-    analysis.processed_bytes += new_offset - previous_offset
-    analysis.last_processed_line = last_record.global_end_line_number
     db.commit()
 
     if logger.isEnabledFor(logging.DEBUG):
@@ -983,9 +1032,26 @@ def _correlate_source_events(events, source_index) -> None:
         event.source_matches = correlate_event(event, source_index)
 
 
+# Section 6: a small, bounded, process-LOCAL cache of already-built
+# SourceIndex objects, keyed by analysis_id. This is a pure optimization,
+# never the sole correctness mechanism - Celery workers are separate OS
+# processes with no shared memory, so a worker handling several artifacts
+# from the SAME analysis sequentially skips even reading/parsing the
+# persisted manifest (see source_archive.prepare_source) for every
+# artifact after the first, while a DIFFERENT worker process still
+# correctly reconstructs the same index from that manifest. Bounded
+# (simple FIFO eviction) so a long-lived worker that has touched many
+# different analyses cannot grow this unboundedly.
+_source_index_process_cache: dict[int, object] = {}
+
+
 def _prepare_source_index(analysis: Analysis):
     if not analysis.source_kind or not analysis.source_reference:
         return None
+
+    cached = _source_index_process_cache.get(analysis.id)
+    if cached is not None:
+        return cached
 
     index = prepare_source(
         analysis.source_kind,
@@ -994,6 +1060,12 @@ def _prepare_source_index(analysis: Analysis):
     )
     if analysis.source_kind == "zip":
         _remove_staged_source_archive(analysis.source_reference)
+
+    if len(_source_index_process_cache) >= SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES:
+        oldest_analysis_id = next(iter(_source_index_process_cache))
+        del _source_index_process_cache[oldest_analysis_id]
+    _source_index_process_cache[analysis.id] = index
+
     return index
 
 
@@ -1108,21 +1180,31 @@ def reconstruct_current_investigation_result(
 
     investigation_path = choose_investigation_path(db=db, analysis_id=analysis_id)
 
-    evidence_rows = (
-        db.query(Evidence)
-        .filter(Evidence.analysis_id == analysis_id)
-        .order_by(Evidence.first_seen, Evidence.id)
-        .all()
-    )
-    total_evidence_count = len(evidence_rows)
+    # A cheap, bounded (O(distinct artifacts), never O(rows)) query rather
+    # than deriving this from a full evidence_rows fetch - keeps this
+    # legacy-reconnect path end-to-end bounded too (Section 4).
+    artifact_ids_with_evidence = {
+        row[0]
+        for row in (
+            db.query(Evidence.artifact_id)
+            .filter(Evidence.analysis_id == analysis_id)
+            .distinct()
+            .all()
+        )
+    }
+    legacy_supplemental_artifacts = [
+        artifact
+        for artifact in artifacts
+        if artifact.fallback_context and artifact.id not in artifact_ids_with_evidence
+    ]
 
     if investigation_path == InvestigationPath.CORRELATED:
-        if total_evidence_count > CORRELATED_MAX_EVIDENCE_RECORDS:
-            evidence_rows = select_bounded_evidence(
-                evidence_rows,
-                max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
-                max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
-            )
+        evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
+            db,
+            analysis_id=analysis_id,
+            max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
+            max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
+        )
         correlation_run = run_correlation(
             analysis_id=analysis_id,
             evidence_rows=evidence_rows,
@@ -1132,9 +1214,21 @@ def reconstruct_current_investigation_result(
             evidence_rows,
             artifacts=artifacts,
             total_evidence_count=total_evidence_count,
+            supplemental_artifacts=legacy_supplemental_artifacts,
         )
     else:
-        payload = build_simple_payload(analysis_id, evidence_rows, artifacts=artifacts)
+        evidence_rows = (
+            db.query(Evidence)
+            .filter(Evidence.analysis_id == analysis_id)
+            .order_by(Evidence.first_seen, Evidence.id)
+            .all()
+        )
+        payload = build_simple_payload(
+            analysis_id,
+            evidence_rows,
+            artifacts=artifacts,
+            supplemental_artifacts=legacy_supplemental_artifacts,
+        )
 
     if ai_analysis is not None:
         payload["ai_analysis"] = ai_analysis

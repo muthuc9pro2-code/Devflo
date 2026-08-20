@@ -182,6 +182,10 @@ def persist_evidence_batch(
                     fingerprint_events,
                     "source_matches",
                 ),
+                "diagnostic_attributes": _first_truthy(
+                    fingerprint_events,
+                    "diagnostic_attributes",
+                ),
                 # Only ever non-None for source_format="image" events (see
                 # ParsedEvent.ocr_confidence / _stream_image_events) - every
                 # other format's events never set this attribute value away
@@ -255,6 +259,10 @@ def persist_evidence_batch(
         source_matches=func.coalesce(
             Evidence.source_matches,
             statement.inserted.source_matches,
+        ),
+        diagnostic_attributes=func.coalesce(
+            Evidence.diagnostic_attributes,
+            statement.inserted.diagnostic_attributes,
         ),
         ocr_confidence=func.coalesce(
             Evidence.ocr_confidence,

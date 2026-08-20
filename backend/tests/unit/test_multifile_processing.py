@@ -11,23 +11,46 @@ from app.tasks.analysis import _process_artifact
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
 
 
-def test_two_artifacts_accumulate_under_one_analysis_checkpoint():
+def test_two_artifacts_process_independently_with_position_based_line_bands():
+    """Section 5: each artifact computes its own starting global_line_number
+    from its own position band (exactly like _process_artifact_task does),
+    independent of any other artifact - no shared, accumulating checkpoint
+    on the Analysis row anymore."""
     db = Mock()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     first = _artifact(101, 0, "generic.txt")
     second = _artifact(102, 1, "docker.jsonl")
 
-    first_count = _process_artifact(db=db, analysis=analysis, artifact=first)
-    first_global_line = analysis.last_processed_line
-    second_count = _process_artifact(db=db, analysis=analysis, artifact=second)
+    first_count = _process_artifact(
+        db=db, analysis=analysis, artifact=first, global_line_number=0
+    )
+    second_count = _process_artifact(
+        db=db,
+        analysis=analysis,
+        artifact=second,
+        global_line_number=1 * analysis_task._GLOBAL_LINE_NUMBER_STRIDE,
+    )
 
     assert (first_count, second_count) == (1, 1)
     assert first.status == second.status == "completed"
     assert first.processed_bytes == first.size_bytes
     assert second.processed_bytes == second.size_bytes
-    assert analysis.processed_bytes == first.size_bytes + second.size_bytes
-    assert analysis.last_processed_line > first_global_line
     assert db.execute.call_count == 2
+
+
+def test_processing_never_mutates_the_shared_analysis_row():
+    """Section 5: batch/artifact processing must not repeatedly dirty the
+    shared Analysis.processed_bytes/last_processed_line row - only this
+    artifact's own row is ever written. (Recomputing the legacy aggregate
+    columns once, at finalize time, is covered separately.)"""
+    db = Mock()
+    analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
+    artifact = _artifact(101, 0, "generic.txt")
+
+    _process_artifact(db=db, analysis=analysis, artifact=artifact, global_line_number=0)
+
+    assert analysis.processed_bytes == 0
+    assert analysis.last_processed_line == 0
 
 
 def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
@@ -106,6 +129,11 @@ def test_artifact_batch_correlates_only_retained_events(monkeypatch):
 
 
 def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
+    # Section 6's process-local cache is module-level and keyed by
+    # analysis.id - reset it so an id=9 entry left behind by another test
+    # (this fixture id is reused throughout the suite) can never make this
+    # test silently skip calling prepare_source.
+    monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
     analysis = SimpleNamespace(
         id=9,
         source_kind="zip",
@@ -219,8 +247,10 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
     assert artifact.detected_format == ArtifactFormat.GENERIC.value
     assert artifact.size_bytes == path.stat().st_size
     assert artifact.processed_bytes == path.stat().st_size
-    assert analysis.last_processed_line == 2
-    assert analysis.processed_bytes == path.stat().st_size
+    # Section 5: the shared Analysis row is no longer written by
+    # _process_artifact - only this artifact's own row (asserted above).
+    assert analysis.last_processed_line == 1
+    assert analysis.processed_bytes == len(first_line)
     assert db.execute.call_count == 1
 
 

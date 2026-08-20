@@ -71,6 +71,10 @@ class CorrelationNode:
     representative_line: str | None = None
     identity_match_type: str | None = None
     identity_strength: float | None = None
+    # Bounded, non-canonical structured fields carried straight through
+    # from Evidence.diagnostic_attributes (see diagnostic_adapters.py) -
+    # provenance only, never itself a matching/correlation signal.
+    diagnostic_attributes: dict | None = None
 
 @dataclass(frozen=True, slots=True)
 class CorrelationSignalMatch:
@@ -206,6 +210,28 @@ def _append_shared_signal(
             )
         )
 
+
+def _shared_source_location(left: Evidence, right: Evidence) -> bool:
+    """True only when both records have a source_matches entry pointing at
+    the identical file+line - never merely "both have some source match".
+    Every source_matches entry already comes from source_index.py's
+    _match_frame(), which returns None rather than guess on an ambiguous
+    candidate, so no additional confidence filtering is needed here."""
+    left_locations = {
+        (match.get("relative_path"), match.get("line_number"))
+        for match in (left.source_matches or [])
+        if isinstance(match, dict) and match.get("relative_path") and match.get("line_number")
+    }
+    if not left_locations:
+        return False
+
+    return any(
+        isinstance(match, dict)
+        and (match.get("relative_path"), match.get("line_number")) in left_locations
+        for match in (right.source_matches or [])
+    )
+
+
 def match_correlation_signals(
     left: Evidence,
     right: Evidence,
@@ -215,6 +241,15 @@ def match_correlation_signals(
     shared_checks = (
         (CorrelationSignal.TRACE_ID, left.trace_id, right.trace_id),
         (CorrelationSignal.REQUEST_ID, left.request_id, right.request_id),
+        # A real equal span_id is a genuine identity/correlation signal
+        # (Section 7) - configured with format weights in
+        # FORMAT_SIGNAL_PRIORITY for years but never actually emitted here.
+        # This alone can never become a causal direction: only an exact
+        # parent.span_id == child.parent_span_id match (match_parent_span/
+        # build_correlation_edge) is treated as causal - resolve_pair()
+        # (build_correlation_edges) decides direction purely from a real
+        # positive time delta, never from which signal matched.
+        (CorrelationSignal.SPAN_ID, left.span_id, right.span_id),
         (
             CorrelationSignal.RESOLVED_IDENTITY,
             left.resolved_identity,
@@ -243,6 +278,26 @@ def match_correlation_signals(
             left_value,
             right_value,
         )
+
+    # A real, unambiguous match to the SAME source-code location on both
+    # sides (Section 7) - source_index.py's _match_frame() already never
+    # fabricates/guesses an ambiguous match, so every entry actually in
+    # source_matches is already trustworthy; this only checks whether two
+    # records' matches converge on the identical file+line, never merely
+    # "both came from source code in general".
+    if _shared_source_location(left, right):
+        strength = _pair_strength(
+            left.source_format,
+            right.source_format,
+            CorrelationSignal.SOURCE,
+        )
+        if strength is not None:
+            matches.append(
+                CorrelationSignalMatch(
+                    signal=CorrelationSignal.SOURCE,
+                    strength=strength,
+                )
+            )
 
     if (
         left.http_status is not None
@@ -300,7 +355,11 @@ def match_parent_span(
 class CorrelationIndexes:
     trace_ids: dict[str, list[Evidence]] = field(default_factory=dict)
     request_ids: dict[str, list[Evidence]] = field(default_factory=dict)
-    span_ids: dict[str, Evidence] = field(default_factory=dict)
+    # A list, not a single Evidence, so two different rows that happen to
+    # share the same span_id (retried/duplicate emissions, or a genuine
+    # collision) are both considered - previously the last one indexed
+    # silently shadowed any earlier one for parent-span lookups.
+    span_ids: dict[str, list[Evidence]] = field(default_factory=dict)
     resolved_identities: dict[str, list[Evidence]] = field(default_factory=dict)
 
 
@@ -328,9 +387,7 @@ def build_correlation_indexes(
             evidence.resolved_identity,
             evidence,
         )
-
-        if evidence.span_id is not None:
-            indexes.span_ids[evidence.span_id] = evidence
+        _append_index(indexes.span_ids, evidence.span_id, evidence)
 
     return indexes
 
@@ -341,15 +398,15 @@ def find_parent_span_candidate(
     if child.parent_span_id is None:
         return None
 
-    parent = indexes.span_ids.get(child.parent_span_id)
+    candidates = indexes.span_ids.get(child.parent_span_id, [])
 
-    if parent is None or parent.id == child.id:
-        return None
+    for parent in candidates:
+        if parent.id == child.id:
+            continue
+        if match_parent_span(parent, child) is not None:
+            return parent
 
-    if match_parent_span(parent, child) is None:
-        return None
-
-    return parent
+    return None
 
 def iter_identity_candidates(
     evidence: Evidence,
@@ -368,6 +425,15 @@ def iter_identity_candidates(
     ), (
         indexes.resolved_identities.get(evidence.resolved_identity, [])
         if evidence.resolved_identity is not None
+        else []
+    ), (
+        # A real equal span_id (Section 7) - never causal on its own (see
+        # match_correlation_signals), but a genuine identity-tier candidate
+        # like trace_id/request_id, so it must actually be discoverable as
+        # a candidate pair, not just scoreable if it happened to already be
+        # one.
+        indexes.span_ids.get(evidence.span_id, [])
+        if evidence.span_id is not None
         else []
     )
 
@@ -466,6 +532,11 @@ _STRUCTURAL_SIGNALS = frozenset({
     CorrelationSignal.ENDPOINT,
     CorrelationSignal.EXCEPTION,
     CorrelationSignal.FINGERPRINT,
+    # A genuine same-file+line source match (Section 7) is real structural
+    # relatedness, never fabricated (see _shared_source_location) - SPAN_ID
+    # is deliberately NOT included here, it is treated as an identity-tier
+    # signal (see iter_identity_candidates) like trace_id/request_id.
+    CorrelationSignal.SOURCE,
 })
 
 # Small, explicit, deterministic tiers for the temporal FALLBACK window
@@ -572,6 +643,12 @@ def iter_temporal_candidates(
                 candidate.resolved_identity is not None
                 and candidate.resolved_identity
                 == evidence.resolved_identity
+            ):
+                continue
+
+            if (
+                candidate.span_id is not None
+                and candidate.span_id == evidence.span_id
             ):
                 continue
 
@@ -827,6 +904,7 @@ def build_correlation_nodes(
                 representative_line=evidence.representative_line,
                 identity_match_type=evidence.identity_match_type,
                 identity_strength=evidence.identity_strength,
+                diagnostic_attributes=evidence.diagnostic_attributes,
             )
         )
 

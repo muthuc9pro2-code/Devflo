@@ -71,6 +71,14 @@ class ParsedEvent:
     # diagnostic_adapters._stream_image_events for source_format="image"
     # events; left at its default (None) everywhere else, never fabricated.
     ocr_confidence: float | None = None
+    # Bounded (DIAGNOSTIC_ATTRIBUTES_MAX_BYTES), scalar-only structured
+    # fields that are diagnostically useful but not one of the canonical
+    # fields above - e.g. {"error_code": "POOL_EXHAUSTED",
+    # "available_connections": 0} from a real JSON record. Never a
+    # correlation signal on its own (only canonical fields are); never the
+    # whole raw event. None whenever nothing qualified or the source was
+    # not structured JSON.
+    diagnostic_attributes: dict[str, Any] | None = None
 
 
 def estimate_parsed_event_size_bytes(event: ParsedEvent) -> int:
@@ -106,6 +114,12 @@ def estimate_parsed_event_size_bytes(event: ParsedEvent) -> int:
         for value in (frame.file, frame.function)
         if value is not None
     )
+    if event.diagnostic_attributes:
+        size += sum(
+            len(str(key).encode("utf-8", errors="replace"))
+            + len(str(value).encode("utf-8", errors="replace"))
+            for key, value in event.diagnostic_attributes.items()
+        )
     return max(size, 1)
 
 

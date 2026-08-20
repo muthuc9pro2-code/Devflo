@@ -106,23 +106,27 @@ def test_correlated_frontend_payload_uses_explicit_strength_names():
 def test_node_carries_its_own_role_and_root_cause_strength():
     """Section 17: a node is self-sufficient - the frontend must not have
     to cross-reference the separate root_causes[] array merely to know
-    whether a node is the root, a propagation step, or a victim."""
+    whether a node is the root, a propagation step, or a victim. Section 9
+    additionally narrows root_causes[] to actual role=="root" candidates
+    only, so every node (including propagation/victim ones no longer
+    listed there at all) must still carry its own role/root_cause_strength
+    directly."""
     run, evidence_rows = _correlated_fixture()
     payload = build_correlation_payload(run, evidence_rows)
 
     component = payload["components"][0]
-    role_and_strength_by_node_id = {
-        c["node_id"]: (c["role"], c["root_cause_strength"]) for c in component["root_causes"]
-    }
     assert component["nodes"], "expected nodes in the fixture"
     for node in component["nodes"]:
-        role, strength = role_and_strength_by_node_id[node["id"]]
-        assert node["role"] == role
-        assert node["root_cause_strength"] == strength
+        assert "role" in node
+        assert "root_cause_strength" in node
 
     roles = {node["id"]: node["role"] for node in component["nodes"]}
     assert "root" in roles.values()
     assert "victim" in roles.values()
+
+    # root_causes[] lists exactly the role=="root" nodes, no more.
+    root_node_ids = {node["id"] for node in component["nodes"] if node["role"] == "root"}
+    assert root_node_ids == {c["node_id"] for c in component["root_causes"]}
 
 
 def test_correlated_gemini_context_uses_explicit_strength_names():
@@ -308,8 +312,10 @@ def test_gemini_context_still_reaches_a_source_match_outside_top_roots():
     assert source_matched["source_matches"][0]["line_number"] == 42
 
     # Root-cause ranking/roles themselves are untouched by this widening.
+    # Section 9: displayed root_candidates is narrowed to actual
+    # role=="root" candidates only (evidence-2/3 are propagation/victim).
     assert [c["node_id"] for c in context["components"][0]["root_candidates"]] == [
-        "evidence-1", "evidence-2", "evidence-3",
+        "evidence-1",
     ]
 
 

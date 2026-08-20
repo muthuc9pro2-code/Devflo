@@ -1,7 +1,12 @@
 from __future__ import annotations
+import heapq
+import json
 from datetime import datetime, timezone
 from typing import Any
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 from app.core.processing_config import (
+    CORRELATED_GEMINI_CONTEXT_MAX_BYTES,
     SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES,
     SIMPLE_FRONTEND_MAX_CONTEXT_BYTES,
     SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS,
@@ -29,6 +34,17 @@ _NOT_LINKED_MESSAGE = "Not linked to the correlated incident evidence."
 _PARTIALLY_LINKED_MESSAGE = (
     "Some of this artifact's evidence is linked to the correlated incident; "
     "the rest is not."
+)
+# Section 2: an artifact that retained zero STRUCTURED Evidence but did
+# capture a useful fallback_context (see fallback_context.py) during its
+# own ingestion pass is a materially different outcome from one with
+# nothing useful at all - never call this "no meaningful diagnostic
+# evidence", and never claim it was deterministically linked/unlinked to
+# anything (relationship_status "low_structure" is neither "linked" nor
+# "not_linked" - it was never structured enough to attempt linking).
+_LOW_STRUCTURE_MESSAGE = (
+    "Diagnostic content was extracted, but it could not be "
+    "deterministically structured/linked."
 )
 
 # Reuses the same severity vocabulary normalize_level()/LEVEL_ALIASES
@@ -147,6 +163,196 @@ def select_bounded_evidence(
     return selected
 
 
+_SEVERITY_PRIORITY_RANK = {"CRITICAL": 4, "FATAL": 4, "ERROR": 3, "WARNING": 2, "WARN": 2}
+# Bounded batch size for the streaming keyset scan below - large enough to
+# make few round trips, small enough that memory stays O(max_records +
+# this), never O(total Evidence rows).
+_BOUNDED_EVIDENCE_SCAN_BATCH_SIZE = 2000
+
+
+def _bounded_evidence_priority(
+    evidence: Evidence,
+    *,
+    fingerprint_counts: dict[str, int],
+    bridging_trace_ids: set[str],
+) -> float:
+    """Section 4: a single-row, single-pass priority score (no second
+    root-cause engine) biased toward the same signals that actually build
+    incident structure downstream in correlation_engine.py, so bounded
+    selection is more likely to preserve a coherent incident rather than
+    just "whatever happened to be most severe"."""
+    score = 0.0
+    if evidence.span_id is not None or evidence.parent_span_id is not None:
+        score += 5.0  # actual parent-span participant (potential)
+    if evidence.trace_id is not None and evidence.trace_id in bridging_trace_ids:
+        score += 4.0  # cross-artifact identity bridge evidence
+    elif (
+        evidence.trace_id is not None
+        or evidence.request_id is not None
+        or evidence.resolved_identity is not None
+    ):
+        score += 3.0  # trace/request/identity-bearing evidence
+    score += _SEVERITY_PRIORITY_RANK.get((evidence.severity or "").upper(), 0)
+    if evidence.source_matches:
+        score += 2.0  # source-code matched evidence
+    fingerprint_count = fingerprint_counts.get(evidence.fingerprint, 1) if evidence.fingerprint else 1
+    score += 1.0 / fingerprint_count  # rare/unique fingerprints score higher
+    return score
+
+
+def select_bounded_evidence_from_db(
+    db: Session,
+    *,
+    analysis_id: int,
+    max_records: int,
+    max_context_bytes: int,
+    batch_size: int = _BOUNDED_EVIDENCE_SCAN_BATCH_SIZE,
+) -> tuple[list[Evidence], int]:
+    """Section 4: genuinely end-to-end bounded evidence selection for a
+    pathological single analysis with far more Evidence rows than
+    max_records. Never loads the whole Evidence result set into memory
+    merely to truncate it afterward - reads the table in bounded batches
+    (keyset-paginated by id) and maintains only a bounded max_records-sized
+    working set (a small max-heap) plus two small bounded aggregate
+    lookups, so memory stays O(max_records + batch_size + distinct
+    fingerprints/bridging trace_ids), never O(total Evidence rows).
+    Evidence itself is never touched/deleted in MySQL either way - this
+    only bounds what one CORRELATED graph/payload has to build.
+
+    Returns (selected_rows, total_count) - total_count is the real,
+    unbounded count for the whole analysis (never silently understated by
+    the caller).
+    """
+    total_count = (
+        db.query(func.count(Evidence.id))
+        .filter(Evidence.analysis_id == analysis_id)
+        .scalar()
+        or 0
+    )
+
+    if total_count <= max_records:
+        rows = (
+            db.query(Evidence)
+            .filter(Evidence.analysis_id == analysis_id)
+            .order_by(Evidence.first_seen, Evidence.id)
+            .all()
+        )
+        return rows, total_count
+
+    # Two small, bounded (O(distinct values), never O(rows)) aggregate
+    # passes that inform per-row scoring without a second full materialize.
+    fingerprint_counts = dict(
+        db.query(Evidence.fingerprint, func.count(Evidence.id))
+        .filter(Evidence.analysis_id == analysis_id, Evidence.fingerprint.isnot(None))
+        .group_by(Evidence.fingerprint)
+        .all()
+    )
+    bridging_trace_ids = {
+        trace_id
+        for trace_id, artifact_count in (
+            db.query(Evidence.trace_id, func.count(func.distinct(Evidence.artifact_id)))
+            .filter(Evidence.analysis_id == analysis_id, Evidence.trace_id.isnot(None))
+            .group_by(Evidence.trace_id)
+            .all()
+        )
+        if artifact_count > 1
+    }
+
+    # Stable temporal boundary/ordering: the earliest/latest few records by
+    # first_seen are always reserved a seat regardless of score - cheap and
+    # index-backed (ix_evidence_analysis_first_seen_id), O(boundary_reserve)
+    # only, never a full-table sort.
+    boundary_reserve = min(50, max(max_records // 20, 1))
+    boundary_rows = (
+        db.query(Evidence)
+        .filter(Evidence.analysis_id == analysis_id, Evidence.first_seen.isnot(None))
+        .order_by(Evidence.first_seen.asc(), Evidence.id.asc())
+        .limit(boundary_reserve)
+        .all()
+    ) + (
+        db.query(Evidence)
+        .filter(Evidence.analysis_id == analysis_id, Evidence.first_seen.isnot(None))
+        .order_by(Evidence.first_seen.desc(), Evidence.id.desc())
+        .limit(boundary_reserve)
+        .all()
+    )
+    reserved_by_id: dict[int, Evidence] = {row.id: row for row in boundary_rows}
+    remaining_budget = max(max_records - len(reserved_by_id), 0)
+
+    heap: list[tuple[float, int, Evidence]] = []  # (score, tiebreak, row) min-heap
+    selected_count_by_artifact: dict[int, int] = {}
+    tiebreak_counter = 0
+    last_id = 0
+
+    while True:
+        batch = (
+            db.query(Evidence)
+            .filter(Evidence.analysis_id == analysis_id, Evidence.id > last_id)
+            .order_by(Evidence.id)
+            .limit(batch_size)
+            .all()
+        )
+        if not batch:
+            break
+        last_id = batch[-1].id
+
+        for row in batch:
+            if row.id in reserved_by_id:
+                continue
+            if remaining_budget <= 0:
+                continue
+            diversity_penalty = 0.02 * selected_count_by_artifact.get(row.artifact_id, 0)
+            score = (
+                _bounded_evidence_priority(
+                    row,
+                    fingerprint_counts=fingerprint_counts,
+                    bridging_trace_ids=bridging_trace_ids,
+                )
+                - diversity_penalty
+            )
+            tiebreak_counter += 1
+            if len(heap) < remaining_budget:
+                heapq.heappush(heap, (score, tiebreak_counter, row))
+                selected_count_by_artifact[row.artifact_id] = (
+                    selected_count_by_artifact.get(row.artifact_id, 0) + 1
+                )
+            elif score > heap[0][0]:
+                _evicted_score, _evicted_tiebreak, evicted_row = heapq.heapreplace(
+                    heap, (score, tiebreak_counter, row)
+                )
+                selected_count_by_artifact[evicted_row.artifact_id] -= 1
+                selected_count_by_artifact[row.artifact_id] = (
+                    selected_count_by_artifact.get(row.artifact_id, 0) + 1
+                )
+
+        if len(batch) < batch_size:
+            break
+
+    # Final byte-budget assembly: reserved (boundary) rows always included,
+    # everything else greedily by score until either max_records or
+    # max_context_bytes is hit - the same "always take at least one" rule
+    # select_bounded_evidence uses so a single oversized record can never
+    # empty the selection entirely.
+    scored_candidates: list[tuple[float, Evidence]] = [
+        (float("inf"), row) for row in reserved_by_id.values()
+    ] + [(score, row) for score, _tiebreak, row in heap]
+    scored_candidates.sort(key=lambda item: item[0], reverse=True)
+
+    selected: list[Evidence] = []
+    selected_bytes = 0
+    for _score, row in scored_candidates:
+        if len(selected) >= max_records:
+            break
+        size = _evidence_context_size_bytes(row)
+        if selected and selected_bytes + size > max_context_bytes:
+            continue
+        selected.append(row)
+        selected_bytes += size
+
+    selected.sort(key=lambda row: (row.first_seen or _DATETIME_MIN_UTC, row.id))
+    return selected, total_count
+
+
 def _count_evidence_by_artifact(evidence_rows: list[Evidence]) -> dict[int, int]:
     counts: dict[int, int] = {}
     for evidence in evidence_rows:
@@ -178,25 +384,23 @@ def _artifacts_outcome_list(
     ]
 
 
-def _artifact_relationship_statuses(
-    components: list[Any],
-) -> dict[int, str]:
-    """Section 14: per-artifact relationship to the PRIMARY correlated
-    incident - linked / partially_linked / not_linked (no_evidence is
-    handled separately in build_artifact_outcome_payload, before this is
-    even consulted).
-
-    The primary incident is the component with the most distinct artifacts
-    represented (a genuine cross-artifact incident), falling back to
-    whichever component has the most nodes when no component spans more
-    than one artifact (e.g. correlation triggered only by a same-artifact
-    burst) - deterministic, ties broken by component order. A component of
-    a single node establishes nothing, so if even the largest component is
-    a singleton, no artifact is classified at all (every artifact with
-    real evidence is equally "not part of anything larger").
+def _select_primary_component(components: list[Any]) -> Any | None:
+    """The single PRIMARY correlated incident - the component with the
+    most distinct artifacts represented (a genuine cross-artifact
+    incident), falling back to whichever component has the most nodes when
+    no component spans more than one artifact (e.g. correlation triggered
+    only by a same-artifact burst) - deterministic, ties broken by
+    component order. A component of a single node establishes nothing, so
+    if even the largest component is a singleton, there is no primary
+    incident at all (None) - every artifact with real evidence is equally
+    "not part of anything larger". Shared by _artifact_relationship_statuses
+    (frontend not_linked/partially_linked/linked labeling) and
+    build_llm_context (Section 3/not_linked isolation: only the primary
+    component's substantive content ever reaches Gemini's primary
+    reasoning) so the two can never define "primary" differently.
     """
     if not components:
-        return {}
+        return None
 
     def _component_key(component: Any) -> tuple[int, int]:
         artifact_ids = {
@@ -205,10 +409,24 @@ def _artifact_relationship_statuses(
         return (len(artifact_ids), len(component.nodes))
 
     primary = max(components, key=_component_key)
-    primary_nodes = primary.nodes
+    if len(primary.nodes) <= 1:
+        return None
+    return primary
 
-    if len(primary_nodes) <= 1:
+
+def _artifact_relationship_statuses(
+    components: list[Any],
+) -> dict[int, str]:
+    """Section 14: per-artifact relationship to the PRIMARY correlated
+    incident - linked / partially_linked / not_linked (no_evidence is
+    handled separately in build_artifact_outcome_payload, before this is
+    even consulted).
+    """
+    primary = _select_primary_component(components)
+    if primary is None:
         return {}
+
+    primary_nodes = primary.nodes
 
     primary_node_counts_by_artifact: dict[int, int] = {}
     for node in primary_nodes:
@@ -244,6 +462,7 @@ def build_correlation_payload(
     artifacts: list[Any] | None = None,
     *,
     total_evidence_count: int | None = None,
+    supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     """total_evidence_count is the REAL, un-bounded evidence count for the
     whole analysis (Section 20) - pass it whenever the caller may have
@@ -300,6 +519,9 @@ def build_correlation_payload(
                     "event_type": node.event_type,
                     "severity": node.severity,
                     "module": node.module,
+                    "host": node.host,
+                    "container": node.container,
+                    "pod": node.pod,
                     "endpoint": node.endpoint,
                     "http_status": node.http_status,
                     "first_seen": (
@@ -323,6 +545,8 @@ def build_correlation_payload(
                     "identity_match_type": node.identity_match_type,
                     "identity_strength": node.identity_strength,
                     "source_matches": node.source_matches,
+                    "representative_line": node.representative_line,
+                    "diagnostic_attributes": node.diagnostic_attributes,
                     "evidence": [
                         _evidence_payload(item)
                         for item in evidence
@@ -333,6 +557,14 @@ def build_correlation_payload(
         components.append(
             {
                 "id": component_index,
+                # Section 9: root_causes is a truthful name - only actual
+                # role=="root" candidates (no incoming causal edge, at
+                # least one outgoing one) ever appear here. A component
+                # with no qualifying root (e.g. association-only, or a
+                # singleton) legitimately has an EMPTY root_causes list -
+                # never fabricated to keep it non-empty. Every node's own
+                # role/root_cause_strength remains available on the node
+                # objects above regardless, for frontend ranking/detail.
                 "root_causes": [
                     {
                         "node_id": candidate.node_id,
@@ -351,6 +583,7 @@ def build_correlation_payload(
                         },
                     }
                     for candidate in root_candidates
+                    if candidate.role == "root"
                 ],
                 "nodes": nodes,
                 # Section 18: built purely from this component's already-
@@ -441,6 +674,17 @@ def build_correlation_payload(
             ),
         )
 
+    # Section 2: bounded, clearly-non-deterministic supplemental context
+    # from artifacts that retained zero structured Evidence but did capture
+    # useful fallback text/OCR content during their own ingestion pass
+    # (never a second read/OCR - see fallback_context.py) - kept out of the
+    # `components` graph entirely (never a correlation participant) so it
+    # can never masquerade as linked incident structure.
+    if supplemental_artifacts:
+        payload["supplemental_low_structure_context"] = _bounded_fallback_context_list(
+            supplemental_artifacts
+        )
+
     return payload
 
 
@@ -449,6 +693,7 @@ def build_simple_payload(
     evidence_rows: list[Evidence],
     *,
     artifacts: list[Any] | None = None,
+    supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Final frontend result for the SIMPLE investigation path - real
     retained evidence and (optionally) per-artifact outcomes only, never a
@@ -490,6 +735,11 @@ def build_simple_payload(
         payload["artifacts"] = _artifacts_outcome_list(
             artifacts,
             evidence_counts_by_artifact,
+        )
+
+    if supplemental_artifacts:
+        payload["supplemental_low_structure_context"] = _bounded_fallback_context_list(
+            supplemental_artifacts
         )
 
     return payload
@@ -619,6 +869,7 @@ def build_simple_llm_context(
     evidence_rows: list[Evidence],
     *,
     artifacts: list[Any] | None = None,
+    supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     # Bounded, deterministic selection (see select_bounded_evidence) - the
     # final frontend/database payload (build_simple_payload) still carries
@@ -657,7 +908,45 @@ def build_simple_llm_context(
             _count_evidence_by_artifact(evidence_rows),
         )
 
+    if supplemental_artifacts:
+        context["supplemental_low_structure_context"] = _bounded_fallback_context_list(
+            supplemental_artifacts
+        )
+        context["supplemental_low_structure_instruction"] = (
+            "The entries in supplemental_low_structure_context are useful "
+            "diagnostic text Devflo captured but could NOT deterministically "
+            "structure or link to the evidence above. You may explain them "
+            "separately, but you must NOT treat them as proof of causality "
+            "or a root cause, and must NOT merge them into the primary "
+            "evidence-based reasoning unless the structured evidence itself "
+            "already establishes the connection."
+        )
+
     return context
+
+def _context_size_bytes(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), default=str).encode("utf-8"))
+
+
+def _llm_component_priority_key(component_dict: dict[str, Any]) -> tuple:
+    """Section 10 ordering for the Gemini byte budget: real roots first,
+    then more causal-relationship_type edges (stronger than inferred
+    propagation), then more overall directed/associated structure. A pure
+    function of the already-built component dict - never re-derives
+    anything from the correlation engine."""
+    root_count = len(component_dict["root_candidates"])
+    causal_edge_count = sum(
+        1
+        for edge in component_dict["propagation"]
+        if edge["relationship_type"] == "causal"
+    )
+    total_structure = (
+        len(component_dict["propagation"])
+        + len(component_dict["associations"])
+        + len(component_dict["root_evidence"])
+    )
+    return (root_count > 0, root_count, causal_edge_count, total_structure)
+
 
 def build_llm_context(
     correlation_run: CorrelationRun,
@@ -666,6 +955,7 @@ def build_llm_context(
     roots_per_component: int = 3,
     max_additional_source_matched_evidence: int = 3,
     artifacts: list[Any] | None = None,
+    supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     evidence_by_id = {
         evidence.id: evidence
@@ -673,18 +963,48 @@ def build_llm_context(
     }
 
     components: list[dict[str, Any]] = []
+    excluded_isolated_component_count = 0
+
+    # Section 3 / not_linked isolation: only the single PRIMARY correlated
+    # component (same definition _artifact_relationship_statuses uses - a
+    # component whose artifacts the frontend would label "linked") ever
+    # reaches Gemini's PRIMARY incident reasoning with its substantive
+    # content (nodes/edges/evidence). Every other component - whether a
+    # true isolated singleton or a smaller, genuinely-correlated but
+    # non-primary group - belongs to artifacts the frontend labels
+    # not_linked/partially_linked; those artifacts' outcome (existed, was
+    # not linked, why) still reaches Gemini via context["artifacts"] below,
+    # but their diagnostic content never contaminates the primary
+    # reasoning, and their nodes can never become a root/propagation/
+    # victim/root-cause candidate for the primary incident.
+    primary_component = _select_primary_component(correlation_run.result.components)
 
     for component_index, component in enumerate(
         correlation_run.result.components
     ):
-        root_candidates = correlation_run.root_causes.get(
+        if component is not primary_component:
+            excluded_isolated_component_count += 1
+            continue
+
+        # Used for EVIDENCE SELECTION (which nodes' evidence Gemini gets to
+        # see) - the top-ranked structural candidates regardless of role,
+        # unchanged from before, so a propagation/victim-heavy component
+        # (no node classifies as "root") still gives Gemini real evidence
+        # to explain rather than an empty context. Section 9's truthful
+        # "root_causes only contains role=='root'" contract only narrows
+        # what is DISPLAYED as root_candidates below, never what evidence
+        # is included.
+        top_ranked_candidates = correlation_run.root_causes.get(
             component_index,
             [],
         )[:roots_per_component]
+        true_root_candidates = [
+            candidate for candidate in top_ranked_candidates if candidate.role == "root"
+        ]
 
         selected_node_ids = {
             candidate.node_id
-            for candidate in root_candidates
+            for candidate in top_ranked_candidates
         }
 
         selected_evidence_ids: set[int] = set()
@@ -723,6 +1043,12 @@ def build_llm_context(
         components.append(
             {
                 "component_id": component_index,
+                # Section 9: truthful naming - only actual role=="root"
+                # candidates (never propagation/victim/uncorrelated), same
+                # contract as build_correlation_payload's root_causes[].
+                # Evidence selection above is intentionally broader (see
+                # top_ranked_candidates) so this narrowing never starves
+                # Gemini of evidence for a component with no true root.
                 "root_candidates": [
                     {
                         "node_id": candidate.node_id,
@@ -732,7 +1058,7 @@ def build_llm_context(
                         ),
                         "role": candidate.role,
                     }
-                    for candidate in root_candidates
+                    for candidate in true_root_candidates
                 ],
                 # Directed relationships only - never an equal-timestamp/
                 # unknown-timestamp association (see associations below).
@@ -786,6 +1112,39 @@ def build_llm_context(
             }
         )
 
+    # Section 10: a final, explicit byte budget for the CORRELATED Gemini
+    # context - separate from and smaller than the frontend/SSE graph
+    # budget (CORRELATED_MAX_CONTEXT_BYTES), since a large bounded graph
+    # (up to CORRELATED_MAX_EVIDENCE_RECORDS) can still be far more than
+    # Gemini needs. Components are included whole, in priority order
+    # (real roots first, then more causal edges, then more overall
+    # structure), never split apart mid-component - simple deterministic
+    # byte-size bin-filling, no tokenization, no LLM-based preselection.
+    total_component_count = len(components)
+    components.sort(key=_llm_component_priority_key, reverse=True)
+
+    included_components: list[dict[str, Any]] = []
+    included_bytes = 0
+    for component_dict in components:
+        size = _context_size_bytes(component_dict)
+        if included_components and included_bytes + size > CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+            break
+        included_components.append(component_dict)
+        included_bytes += size
+    components = included_components
+    context_truncated = len(components) < total_component_count
+
+    # Whole-context signal (not per-component) so Gemini's causal-wording
+    # rule (see the system instruction) is trivial to apply even without
+    # re-deriving it from components[] itself: real reported cases showed
+    # Gemini using "led to"/"cascaded into" wording for an analysis that
+    # was 100% associations (0 directed edges) - the system instruction
+    # alone was not a strong enough signal, so this makes the "any real
+    # direction at all" fact explicit and impossible to miss.
+    has_directed_relationships = any(
+        component["propagation"] for component in components
+    )
+
     context: dict[str, Any] = {
         "analysis_id": correlation_run.result.analysis_id,
         "investigation_path": "correlated",
@@ -794,8 +1153,36 @@ def build_llm_context(
             "debugging/investigation steps. Do not invent evidence "
             "or claim a definitive fix."
         ),
+        "has_directed_relationships": has_directed_relationships,
         "components": components,
+        "component_count_total": total_component_count,
+        "component_count_included": len(components),
     }
+
+    if context_truncated:
+        # Never silently pretend the omitted component(s) do not exist.
+        context["context_truncated"] = True
+
+    if not has_directed_relationships:
+        context["causal_language_instruction"] = (
+            "has_directed_relationships is false: none of the components "
+            "below contain a causal or inferred_propagation edge, only "
+            "associations. Do not use causal/directional wording (\"caused\", "
+            "\"led to\", \"resulted in\", \"propagated to\", \"cascaded "
+            "into\", or equivalents) anywhere in this response, even if the "
+            "co-occurring evidence looks intuitively causal. Describe "
+            "relationships as coinciding/associated/observed-alongside, and "
+            "state plainly that direction was not established."
+        )
+
+    if excluded_isolated_component_count:
+        # Never silently pretend the omitted structure does not exist -
+        # Gemini knows a count of non-primary components (isolated
+        # singletons and any smaller, non-primary correlated groups) were
+        # withheld from primary reasoning, without their content ever
+        # reaching it. Per-artifact not_linked/partially_linked outcomes
+        # for those components still reach Gemini via context["artifacts"].
+        context["excluded_isolated_component_count"] = excluded_isolated_component_count
 
     if artifacts is not None:
         # Whole-analysis provenance summary ("nginx.log produced 8 evidence
@@ -806,6 +1193,20 @@ def build_llm_context(
         context["artifacts"] = _artifacts_outcome_list(
             artifacts,
             _count_evidence_by_artifact(evidence_rows),
+        )
+
+    if supplemental_artifacts:
+        context["supplemental_low_structure_context"] = _bounded_fallback_context_list(
+            supplemental_artifacts
+        )
+        context["supplemental_low_structure_instruction"] = (
+            "The entries in supplemental_low_structure_context are useful "
+            "diagnostic text Devflo captured but could NOT deterministically "
+            "structure or link to the correlated components above. You may "
+            "explain them separately, but you must NOT treat them as proof "
+            "of causality or a root cause, and must NOT merge them into the "
+            "primary incident reasoning unless the structured evidence "
+            "itself already establishes the connection."
         )
 
     return context
@@ -819,6 +1220,9 @@ def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
         "severity": evidence.severity,
         "service": evidence.service,
         "module": evidence.module,
+        "host": evidence.host,
+        "container": evidence.container,
+        "pod": evidence.pod,
         "endpoint": evidence.endpoint,
         "http_status": evidence.http_status,
         "source_format": evidence.source_format,
@@ -848,6 +1252,10 @@ def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
         # Real RapidOCR confidence, preserved as-is - None for anything
         # that isn't source_format="image" evidence, never fabricated.
         "ocr_confidence": evidence.ocr_confidence,
+        # Bounded, non-canonical structured fields (see
+        # diagnostic_adapters.py) - diagnostic context only, never a
+        # correlation signal and never promoted to causal proof on its own.
+        "diagnostic_attributes": evidence.diagnostic_attributes,
     }
 
 
@@ -909,13 +1317,22 @@ def build_artifact_outcome_payload(
     }
 
     if evidence_count == 0:
-        payload["message"] = _NO_EVIDENCE_MESSAGE
-        # Section 14: a supported artifact that simply retained no
-        # evidence is a distinct outcome from one that retained real
-        # evidence but never linked into the correlated incident (see
-        # relationship_status below) - both are honestly reported, never
-        # conflated with "unrelated".
-        payload["relationship_status"] = "no_evidence"
+        if getattr(artifact, "fallback_context", None):
+            # A supported artifact with useful captured text/OCR content
+            # but zero structured Evidence - distinct from true no_evidence
+            # (below) and never framed as "no meaningful diagnostic
+            # evidence" (see build_fallback_payload's own zero-evidence-
+            # analysis-wide case for the same non-fabrication principle).
+            payload["message"] = _LOW_STRUCTURE_MESSAGE
+            payload["relationship_status"] = "low_structure"
+        else:
+            payload["message"] = _NO_EVIDENCE_MESSAGE
+            # Section 14: a supported artifact that simply retained no
+            # evidence is a distinct outcome from one that retained real
+            # evidence but never linked into the correlated incident (see
+            # relationship_status below) - both are honestly reported, never
+            # conflated with "unrelated".
+            payload["relationship_status"] = "no_evidence"
     elif relationship_status is not None:
         payload["relationship_status"] = relationship_status
         if relationship_status == "not_linked":

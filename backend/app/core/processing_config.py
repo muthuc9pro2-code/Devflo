@@ -82,3 +82,27 @@ MAX_SOURCE_CONTEXT_FILE_BYTES = 5 * MEBIBYTE
 SOURCE_CONTEXT_CACHE_BYTES = 32 * MEBIBYTE
 SOURCE_CONTEXT_LINES = 15
 GITHUB_CLONE_TIMEOUT_SECONDS = 30
+
+# Bounded per-event budget for structured JSON fields that are real,
+# diagnostically useful, but not one of the ~20 canonical fields Devflo
+# already extracts (e.g. error_code/available_connections/max_pool_size on
+# a real record) - preserved as ParsedEvent/Evidence.diagnostic_attributes
+# instead of silently dropped, without ever retaining the whole raw event
+# or adding per-field schema columns. Small and fixed: this is context for
+# Gemini/humans, not a second evidence model.
+DIAGNOSTIC_ATTRIBUTES_MAX_BYTES = 2 * 1024
+
+# Small process-local cache of already-built SourceIndex objects, keyed by
+# analysis_id - supplements (never replaces) the persisted index manifest
+# on disk (see source_archive.py) so a single worker process handling
+# several artifacts from the same analysis sequentially does not even need
+# to re-read/re-parse that manifest file per artifact. Bounded so a worker
+# that has processed many different analyses cannot grow this unboundedly.
+SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES = 8
+
+# Section 10: the final byte budget for a CORRELATED investigation's
+# Gemini context (build_llm_context), separate from and smaller than the
+# frontend/SSE graph budget (CORRELATED_MAX_CONTEXT_BYTES above) - a large
+# bounded graph (up to CORRELATED_MAX_EVIDENCE_RECORDS) can still be far
+# more than Gemini needs to explain the incident well.
+CORRELATED_GEMINI_CONTEXT_MAX_BYTES = 3 * MEBIBYTE

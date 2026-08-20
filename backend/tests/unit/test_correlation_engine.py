@@ -50,7 +50,10 @@ def test_indexes_strong_identity_fields() -> None:
 
     assert indexes.trace_ids["trace-1"] == [evidence]
     assert indexes.request_ids["request-1"] == [evidence]
-    assert indexes.span_ids["span-1"] is evidence
+    # Section 7: a list (not a single Evidence) - two different rows can
+    # share a span_id, and both must remain discoverable as parent-span/
+    # identity candidates, not just the last one indexed.
+    assert indexes.span_ids["span-1"] == [evidence]
     assert indexes.resolved_identities["identity-1"] == [evidence]
 
 

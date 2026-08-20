@@ -486,7 +486,7 @@ def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | 
         stack_frames = _parse_stack_frames(raw_text)
     return ParsedEvent(line_number=line_number, raw_line=raw_text, timestamp=parse_timestamp(defaults.get('timestamp') or (timestamp_match.group(0) if timestamp_match else None)), level=level, trace_id=text_defaults.get('trace_id') or fields.get('trace_id'), request_id=text_defaults.get('request_id') or fields.get('request_id'), service=text_defaults.get('service') or fields.get('service'), module=text_defaults.get('module') or fields.get('module'), exception_type=exception_type, exception_message=exception_message, stack_frames=stack_frames, endpoint=text_defaults.get('endpoint') or endpoint, http_status=status, source_file=source_file, span_id=text_defaults.get('span_id') or fields.get('span_id'), parent_span_id=text_defaults.get('parent_span_id') or fields.get('parent_span_id'), host=text_defaults.get('host') or fields.get('host'), container=text_defaults.get('container') or fields.get('container'), pod=text_defaults.get('pod') or fields.get('pod'), source_format=source_format)
 
-def normalize_structured_event(data: Mapping[str, Any], line_number: int, *, source_file: str | None=None, source_format: str | None=None, inherited: Mapping[str, Any] | None=None) -> ParsedEvent:
+def normalize_structured_event(data: Mapping[str, Any], line_number: int, *, source_file: str | None=None, source_format: str | None=None, inherited: Mapping[str, Any] | None=None, diagnostic_attributes: dict[str, Any] | None=None) -> ParsedEvent:
     inherited = inherited or {}
     key_cache: dict[int, dict[str, Any]] = {}
     def first(*paths: tuple[str, ...]) -> Any:
@@ -514,6 +514,7 @@ def normalize_structured_event(data: Mapping[str, Any], line_number: int, *, sou
     event = normalize_text_event(raw_text=message, line_number=line_number, source_file=source_file, source_format=source_format, defaults=defaults)
     if event.level is None:
         event.level = level_from_http_status(status)
+    event.diagnostic_attributes = diagnostic_attributes
     return event
 
 def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Mapping[str, Any] | None=None) -> bool:

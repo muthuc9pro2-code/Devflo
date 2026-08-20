@@ -6,7 +6,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 import ijson
-from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, JSON_STREAM_BUFFER_BYTES, MAX_DIAGNOSTIC_RECORD_BYTES
+from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, DIAGNOSTIC_ATTRIBUTES_MAX_BYTES, JSON_STREAM_BUFFER_BYTES, MAX_DIAGNOSTIC_RECORD_BYTES
 from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
@@ -56,6 +56,13 @@ class _BoundedStructuredCapture:
     values: dict[str, Any] = field(default_factory=dict)
     priorities: dict[str, int] = field(default_factory=dict)
     captured_bytes: int = 0
+    # Non-canonical scalar fields (e.g. error_code/available_connections on
+    # a real record) captured alongside the canonical ones above, bounded
+    # separately - see _BoundedAttributeBudget. Kept out of `values` so
+    # normalize_structured_event never mistakes one for a canonical field.
+    extra: "_BoundedAttributeBudget" = field(
+        default_factory=lambda: _BoundedAttributeBudget(DIAGNOSTIC_ATTRIBUTES_MAX_BYTES)
+    )
 
     def consume(self, prefix: str, event: str, value: Any) -> None:
         if event not in {'string', 'number', 'boolean', 'null'}:
@@ -63,6 +70,7 @@ class _BoundedStructuredCapture:
         relative = prefix[len(self.prefix):].lstrip('.')
         canonical_key = _structured_canonical_key(relative)
         if canonical_key is None:
+            self.extra.offer(relative, value)
             return
         priority = _structured_alias_priority(canonical_key, relative)
         existing_priority = self.priorities.get(canonical_key)
@@ -97,6 +105,105 @@ class _BoundedStructuredCapture:
     @property
     def retained_size_bytes(self) -> int:
         return max(self.captured_bytes, 1)
+
+
+# Keys containing one of these substrings describe something a debugger
+# would actually want when triaging a failure (limits/capacity/counts/
+# error codes/etc.) - not an exhaustive taxonomy, just a cheap deterministic
+# tiebreak so the bounded budget below fills with the most likely-useful
+# fields first when a record has more unknown scalar fields than fit.
+_DIAGNOSTIC_ATTRIBUTE_KEYWORDS = (
+    "error", "fail", "exception", "code", "reason", "retry", "attempt",
+    "timeout", "limit", "threshold", "available", "capacity", "pool",
+    "count", "status", "reject", "denied", "exceeded", "overflow",
+    "duration", "latency", "quota", "max", "min",
+)
+
+
+def _diagnostic_attribute_priority(key: str) -> int:
+    lowered = key.lower()
+    return 2 if any(hint in lowered for hint in _DIAGNOSTIC_ATTRIBUTE_KEYWORDS) else 1
+
+
+@dataclass(slots=True)
+class _BoundedAttributeBudget:
+    """Bounded (by byte size, not entry count) set of scalar key/value
+    pairs, keeping the most diagnostically useful ones (see
+    _diagnostic_attribute_priority) when more candidates arrive than fit -
+    the same "capacity + priority-based eviction" shape
+    _BoundedStructuredCapture already uses for canonical fields, applied
+    here to the non-canonical ones instead of discarding them."""
+
+    max_bytes: int
+    values: dict[str, Any] = field(default_factory=dict)
+    priorities: dict[str, int] = field(default_factory=dict)
+    used_bytes: int = 0
+
+    def _entry_size(self, key: str, value: Any) -> int:
+        return len(key.encode("utf-8", errors="replace")) + len(
+            str(value).encode("utf-8", errors="replace")
+        )
+
+    def offer(self, key: str, value: Any) -> None:
+        if not key or key in self.values:
+            return  # first occurrence of a given path wins, deterministically
+        size = self._entry_size(key, value)
+        if size > self.max_bytes:
+            return  # a single oversized value can never fit, even by evicting everything
+        priority = _diagnostic_attribute_priority(key)
+        if self.used_bytes + size <= self.max_bytes:
+            self.values[key] = value
+            self.priorities[key] = priority
+            self.used_bytes += size
+            return
+        if not self.priorities:
+            return
+        weakest_key = min(self.priorities, key=self.priorities.get)
+        if priority <= self.priorities[weakest_key]:
+            return
+        weakest_value = self.values.pop(weakest_key)
+        self.used_bytes -= self._entry_size(weakest_key, weakest_value)
+        del self.priorities[weakest_key]
+        if self.used_bytes + size <= self.max_bytes:
+            self.values[key] = value
+            self.priorities[key] = priority
+            self.used_bytes += size
+
+    def result(self) -> dict[str, Any] | None:
+        return dict(self.values) if self.values else None
+
+
+def _iter_scalar_leaves(
+    data: Mapping[str, Any], prefix: str = "", depth: int = 0, max_depth: int = 4
+) -> Iterator[tuple[str, Any]]:
+    """Yields (dotted_path, value) for every scalar leaf in a small,
+    already-in-memory mapping - never descends into lists/arrays (could be
+    unbounded) and stops at max_depth (a handful of nested objects is
+    normal for a real log record; anything deeper is not worth chasing)."""
+    if depth > max_depth:
+        return
+    for key, value in data.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            yield from _iter_scalar_leaves(value, path, depth + 1, max_depth)
+        elif value is None or isinstance(value, (str, int, float, bool)):
+            yield path, value
+        # lists/other types: skipped - never recursively copied
+
+
+def _extract_diagnostic_attributes(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    """For an already-fully-parsed structured record (one JSON-lines line,
+    or one container CRI JSON body): every scalar leaf that is NOT one of
+    normalize_structured_event's own canonical fields, bounded to
+    DIAGNOSTIC_ATTRIBUTES_MAX_BYTES and biased toward diagnostically useful
+    names when the budget fills."""
+    budget = _BoundedAttributeBudget(DIAGNOSTIC_ATTRIBUTES_MAX_BYTES)
+    for relative, value in _iter_scalar_leaves(data):
+        if _structured_canonical_key(relative) is not None:
+            continue  # already represented canonically - never duplicated
+        budget.offer(relative, value)
+    return budget.result()
+
 
 def stream_artifact_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int=0, start_artifact_line: int=0, global_line_number: int=0) -> Iterator[ArtifactEvent]:
     if artifact_format == ArtifactFormat.IMAGE:
@@ -601,7 +708,17 @@ def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, sourc
             event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
         else:
             data = value if isinstance(value, Mapping) else {'body': value}
-            event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value) if structured_event_may_be_important(data) else None
+            event = (
+                normalize_structured_event(
+                    data,
+                    global_line,
+                    source_file=source_file,
+                    source_format=artifact_format.value,
+                    diagnostic_attributes=_extract_diagnostic_attributes(data),
+                )
+                if structured_event_may_be_important(data)
+                else None
+            )
         yield ArtifactEvent(event=event, end_offset=end_offset, artifact_line_number=local_line, global_end_line_number=global_line, batch_size_bytes=max(size_bytes, 1))
 
 def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, skip_records: int, start_offset: int, global_line_number: int) -> Iterator[ArtifactEvent]:
@@ -614,6 +731,7 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
             _seek_past_utf8_bom(stream)
             capture: _BoundedStructuredCapture | None = None
             for prefix, event, value in ijson.parse(BoundedJsonStream(stream), buf_size=JSON_STREAM_BUFFER_BYTES, use_float=True):
+                diagnostic_attributes = None
                 if capture is not None:
                     if event in {'start_map', 'start_array'}:
                         capture.depth += 1
@@ -624,6 +742,7 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                         continue
                     data = capture.result()
                     retained_size_bytes = capture.retained_size_bytes
+                    diagnostic_attributes = capture.extra.result()
                     capture = None
                 elif prefix == target_prefix and event in {'start_map', 'start_array'}:
                     capture = _BoundedStructuredCapture(prefix=prefix)
@@ -637,7 +756,17 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                 if local_record <= skip_records:
                     continue
                 global_line += 1
-                event = normalize_structured_event(data, global_line, source_file=source_file, source_format=artifact_format.value) if structured_event_may_be_important(data) else None
+                event = (
+                    normalize_structured_event(
+                        data,
+                        global_line,
+                        source_file=source_file,
+                        source_format=artifact_format.value,
+                        diagnostic_attributes=diagnostic_attributes,
+                    )
+                    if structured_event_may_be_important(data)
+                    else None
+                )
                 emitted = True
                 yield ArtifactEvent(event=event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=max(retained_size_bytes, 1))
     except ijson.JSONError:
@@ -806,12 +935,23 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
     if record.multiline_kind == 'crash_report':
         return True
     stripped = line.strip()
+    # Real tracebacks (any language) follow each frame line with exactly
+    # one plain source-code snippet line - normalize_ocr_text() strips ALL
+    # leading whitespace (raw_line.strip()), so that snippet line never
+    # matches an indentation-based continuation check for OCR-derived
+    # text, and previously fell through to none of the rules below either,
+    # splitting the record and orphaning everything after it (including
+    # the final exception/error summary line) into a dead-end record that
+    # could never continue further. bare_frame_chain already had this
+    # exact allowance (see below); every other traceback kind needs it
+    # too, generically - not specific to any one exception type/language.
+    previous_line_is_frame = bool(record.lines and _contains_stack_frame(record.lines[-1]))
     if record.multiline_kind == 'python_stack':
-        return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith('File ') or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.match(stripped))
+        return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith('File ') or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.match(stripped) or previous_line_is_frame)
     if record.multiline_kind == 'java_stack':
-        return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'Caused by:', 'Suppressed:')))
+        return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'Caused by:', 'Suppressed:')) or previous_line_is_frame)
     if record.multiline_kind == 'language_stack':
-        return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')))
+        return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')) or previous_line_is_frame)
     if record.multiline_kind == 'bare_frame_chain':
         return bool(
             not stripped
@@ -828,9 +968,9 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
             # not this new one), so unrelated OCR noise two lines after a
             # frame still starts its own record rather than being swallowed
             # indefinitely.
-            or (record.lines and _contains_stack_frame(record.lines[-1]))
+            or previous_line_is_frame
         )
-    return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')) or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.search(stripped))
+    return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')) or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.search(stripped) or previous_line_is_frame)
 
 def _stack_trace_may_be_important(raw_text: str) -> bool:
     lowered = raw_text.lower()
@@ -915,7 +1055,14 @@ def _normalize_container_text_event(raw_text: str, line_number: int, source_file
     except json.JSONDecodeError:
         return normalize_text_event(body, line_number, source_file=source_file, source_format=ArtifactFormat.CONTAINER.value, defaults=inherited)
     data = value if isinstance(value, Mapping) else {'body': value}
-    return normalize_structured_event(data, line_number, source_file=source_file, source_format=ArtifactFormat.CONTAINER.value, inherited=inherited)
+    return normalize_structured_event(
+        data,
+        line_number,
+        source_file=source_file,
+        source_format=ArtifactFormat.CONTAINER.value,
+        inherited=inherited,
+        diagnostic_attributes=_extract_diagnostic_attributes(data),
+    )
 def _parse_cloud_gateway_fields(raw_text: str) -> list[str] | None:
     try:
         fields = shlex.split(raw_text)

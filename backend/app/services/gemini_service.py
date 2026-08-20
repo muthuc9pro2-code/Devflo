@@ -45,6 +45,17 @@ Rules:
   timestamps). Never describe an association as one event causing or
   propagating into the other - describe it only as corroborating/co-occurring
   evidence.
+- If a component's "propagation" list is empty (has_directed_relationships is
+  false or absent), that component has NO directed causal or inferred_propagation
+  path at all - only associations. In that case you MUST NOT use causal wording
+  such as "caused", "led to", "resulted in", "propagated to", "cascaded into", or
+  any equivalent phrase implying direction/causation for that component. Use
+  language such as "coincided with", "was associated with", "was observed
+  alongside", or "evidence suggests a relationship, but direction is not
+  established" instead. This applies even if the co-occurring evidence looks
+  intuitively causal (e.g. a database timeout followed by gateway errors) -
+  Devflo's deterministic engine decides direction, not you, and an association
+  is not a causal claim.
 - When multiple correlation components exist, do not merge separate incident
   groups unless the supplied evidence supports doing so.
 - Use artifact filenames and formats when they help explain which evidence

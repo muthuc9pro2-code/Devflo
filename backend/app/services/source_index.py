@@ -1,4 +1,6 @@
 """Deterministic stack-frame -> source-file correlation via one prebuilt index."""
+import json
+import logging
 import os
 import posixpath
 from collections import namedtuple
@@ -10,6 +12,8 @@ from app.core.processing_config import (
     SOURCE_CONTEXT_CACHE_BYTES,
     SOURCE_CONTEXT_LINES,
 )
+
+logger = logging.getLogger(__name__)
 
 IGNORED_DIRS = {".git", "node_modules", ".venv", "venv", "dist", "build", "coverage", "__pycache__"}
 BINARY_EXTENSIONS = {
@@ -97,6 +101,59 @@ def build_index(root: Path) -> SourceIndex:
             for start in range(len(parts) - 1):
                 index.by_suffix.setdefault("/".join(parts[start + 1 :]), []).append(relative_path)
     return index
+
+
+def index_manifest_path(root: Path) -> Path:
+    return root.parent / f"{root.name}.index.json"
+
+
+def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
+    """Persist the expensive-to-build structural index (by_path/by_suffix/
+    by_stem - never the bounded per-file context cache, which stays cheap
+    to (re)populate lazily from the already-prepared source tree) as plain
+    JSON - a safe, deterministic representation, never pickle/unsafe
+    deserialization of user-controlled data. Written atomically (temp file
+    + os.replace, which is atomic on POSIX) so a concurrent reader can
+    never observe a partially-written file."""
+    payload = {
+        "by_path": {
+            relative_path: [source_file.basename, source_file.extension, source_file.size]
+            for relative_path, source_file in index.by_path.items()
+        },
+        "by_suffix": index.by_suffix,
+        "by_stem": index.by_stem,
+    }
+    temp_path = manifest_path.with_name(manifest_path.name + ".tmp")
+    temp_path.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(temp_path, manifest_path)
+
+
+def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None":
+    """Reconstruct a SourceIndex from a manifest save_index_manifest wrote,
+    without re-walking the source tree. Returns None on any read/parse
+    error (missing file, corrupt JSON, unexpected shape) so the caller can
+    always safely fall back to build_index() - a stale/corrupt cache file
+    must never be fatal to source correlation."""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        by_path = {
+            relative_path: SourceFile(relative_path, basename, extension, size)
+            for relative_path, (basename, extension, size) in payload["by_path"].items()
+        }
+        return SourceIndex(
+            root=root,
+            by_path=by_path,
+            by_suffix=payload["by_suffix"],
+            by_stem=payload["by_stem"],
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        logger.warning(
+            "Could not load source index manifest %s; rebuilding",
+            manifest_path,
+            exc_info=True,
+        )
+        return None
+
 
 def _match_frame(frame, index: SourceIndex, module: str | None) -> dict | None:
     normalized = posixpath.normpath(frame.file.replace("\\", "/")).lstrip("./") if frame.file else None

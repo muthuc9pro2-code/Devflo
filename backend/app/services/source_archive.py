@@ -19,7 +19,12 @@ from app.core.processing_config import (
     MAX_SOURCE_TOTAL_BYTES,
     SOURCE_STORAGE_ROOT,
 )
-from app.services.source_index import build_index
+from app.services.source_index import (
+    build_index,
+    index_manifest_path,
+    load_index_manifest,
+    save_index_manifest,
+)
 
 _GITHUB_URL = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 
@@ -90,21 +95,40 @@ def _ready_marker(dest: Path) -> Path:
 
 
 def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
-    """Acquire source into investigation-scoped storage and build its index.
+    """Acquire source into investigation-scoped storage and reuse/build its
+    index.
 
     Idempotent across a resumed process_analysis run: if this analysis's
     source was already fully acquired by a prior invocation (ready marker
-    present), skip re-cloning/re-extracting and just rebuild the index.
-    Without this, resuming a GitHub-sourced analysis always fails outright
-    (`git clone` refuses a non-empty destination), and resuming a
-    ZIP-sourced one fails once the staged upload has been deleted after its
-    first successful use. The marker lives beside `dest`, not inside it, so
-    it is never picked up by build_index as a source file.
+    present), skip re-cloning/re-extracting. Without this, resuming a
+    GitHub-sourced analysis always fails outright (`git clone` refuses a
+    non-empty destination), and resuming a ZIP-sourced one fails once the
+    staged upload has been deleted after its first successful use. The
+    marker lives beside `dest`, not inside it, so it is never picked up by
+    build_index as a source file.
+
+    Index reuse (final hardening pass, Section 6): every artifact task in
+    an analysis previously called this function and got a full
+    os.walk()-based build_index() EVERY time, even though the tree never
+    changes after the first successful acquisition. A small JSON manifest
+    (index_manifest_path) persisted beside `dest` after the first real
+    build lets every subsequent call in this - or a LATER, separate worker
+    process, since Celery workers are not guaranteed to share memory -
+    reconstruct the same index by reading and parsing that manifest
+    instead of re-walking the whole tree. Never sent through a Celery
+    message (each task calls this locally); never pickled (JSON only).
     """
     dest = Path(SOURCE_STORAGE_ROOT) / str(analysis_id)
     marker = _ready_marker(dest)
+    manifest_path = index_manifest_path(dest)
+
     if marker.exists():
-        return build_index(dest)
+        cached = load_index_manifest(manifest_path, dest)
+        if cached is not None:
+            return cached
+        index = build_index(dest)
+        save_index_manifest(index, manifest_path)
+        return index
 
     if dest.exists():
         shutil.rmtree(dest)  # stale/partial remnant of a crashed prior attempt
@@ -118,4 +142,6 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
 
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.touch()
-    return build_index(dest)
+    index = build_index(dest)
+    save_index_manifest(index, manifest_path)
+    return index

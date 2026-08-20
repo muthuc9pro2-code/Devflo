@@ -12,8 +12,19 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.database import Base
+
+# Plain DateTime maps to MySQL's DATETIME (0 fractional-second digits by
+# default) - real sub-second precision already present after parsing
+# (parse_timestamp preserves it) was silently truncated to whole seconds on
+# INSERT, collapsing correlation delta_ms/timeline relative_ms toward 0 for
+# events genuinely milliseconds/microseconds apart. fsp=6 (microseconds)
+# only changes the MySQL DDL - sqlite (used in tests) already preserves
+# full precision with plain DateTime, so this only widens what MySQL
+# stores, never narrows anything.
+_PRECISE_DATETIME = DateTime().with_variant(MySQLDateTime(fsp=6), "mysql")
 
 class Evidence(Base):
     __tablename__ = "evidence"
@@ -123,12 +134,12 @@ class Evidence(Base):
     source_matches: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
 
     first_seen: Mapped[datetime | None] = mapped_column(
-        DateTime,
+        _PRECISE_DATETIME,
         nullable=True,
     )
 
     last_seen: Mapped[datetime | None] = mapped_column(
-        DateTime,
+        _PRECISE_DATETIME,
         nullable=True,
     )
 
@@ -175,5 +186,16 @@ class Evidence(Base):
     # returned no usable score.
     ocr_confidence: Mapped[float | None] = mapped_column(
         Float,
+        nullable=True,
+    )
+
+    # Bounded (DIAGNOSTIC_ATTRIBUTES_MAX_BYTES per event), scalar-only
+    # structured fields that are diagnostically useful but not one of the
+    # canonical columns above - e.g. error_code/available_connections from
+    # a real JSON record (see diagnostic_adapters.py). Never a correlation
+    # signal on its own; never the whole raw event; NULL when nothing
+    # qualified or the source was not structured.
+    diagnostic_attributes: Mapped[dict | None] = mapped_column(
+        JSON,
         nullable=True,
     )
