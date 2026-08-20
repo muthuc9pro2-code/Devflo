@@ -63,11 +63,29 @@ class _BoundedStructuredCapture:
     extra: "_BoundedAttributeBudget" = field(
         default_factory=lambda: _BoundedAttributeBudget(DIAGNOSTIC_ATTRIBUTES_MAX_BYTES)
     )
+    # Browser HAR only (see _stream_json_document): a HAR entry's
+    # request.headers is an array of {"name": ..., "value": ...} pairs, not
+    # a flat mapping, so the generic per-leaf canonical-key scan above can
+    # never see "x-request-id" as a key - it only ever sees the array
+    # field's own literal JSON path (request.headers.item.name/.value),
+    # which is not itself a canonical field. This tracks each header pair
+    # as it streams past and promotes the FIRST one whose name is a
+    # recognized request-id alias (reusing _structured_canonical_key - the
+    # exact same case-insensitive, hyphen/underscore-agnostic aliases
+    # already used everywhere else, no new list) into a real request_id.
+    harvest_har_headers: bool = False
+    _pending_har_header_name: str | None = field(default=None, repr=False)
+    _pending_har_header_value: str | None = field(default=None, repr=False)
+    promoted_request_id: str | None = None
 
     def consume(self, prefix: str, event: str, value: Any) -> None:
         if event not in {'string', 'number', 'boolean', 'null'}:
             return
         relative = prefix[len(self.prefix):].lstrip('.')
+
+        if self.harvest_har_headers and event == 'string':
+            self._consume_har_header_field(relative, value)
+
         canonical_key = _structured_canonical_key(relative)
         if canonical_key is None:
             self.extra.offer(relative, value)
@@ -86,7 +104,33 @@ class _BoundedStructuredCapture:
         self.values[canonical_key] = value
         self.priorities[canonical_key] = priority
 
+    def _consume_har_header_field(self, relative: str, value: Any) -> None:
+        if relative == 'request.headers.item.name':
+            self._pending_har_header_name = value
+        elif relative == 'request.headers.item.value':
+            self._pending_har_header_value = value
+        else:
+            return
+
+        if self._pending_har_header_name is None or self._pending_har_header_value is None:
+            return
+
+        if self.promoted_request_id is None and isinstance(self._pending_har_header_name, str):
+            if _structured_canonical_key(self._pending_har_header_name) == 'request_id':
+                self.promoted_request_id = str(self._pending_har_header_value)
+
+        # One header object fully seen (regardless of match) - reset so the
+        # next {"name": ..., "value": ...} pair in the array isn't
+        # accidentally paired with a stale field from this one.
+        self._pending_har_header_name = None
+        self._pending_har_header_value = None
+
     def result(self) -> dict[str, Any]:
+        if self.promoted_request_id is not None:
+            # Never overrides a request_id already found through the
+            # normal canonical-field scan elsewhere in this same entry -
+            # only fills the gap the array-of-pairs shape otherwise leaves.
+            self.values.setdefault('request_id', self.promoted_request_id)
         if 'message' not in self.values:
             method = self.values.pop('_method', None)
             endpoint = self.values.get('endpoint')
@@ -745,7 +789,10 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                     diagnostic_attributes = capture.extra.result()
                     capture = None
                 elif prefix == target_prefix and event in {'start_map', 'start_array'}:
-                    capture = _BoundedStructuredCapture(prefix=prefix)
+                    capture = _BoundedStructuredCapture(
+                        prefix=prefix,
+                        harvest_har_headers=artifact_format == ArtifactFormat.BROWSER,
+                    )
                     continue
                 elif prefix == target_prefix and event in {'string', 'number', 'boolean', 'null'}:
                     data = {'body': value}

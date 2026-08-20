@@ -388,10 +388,17 @@ def test_multiple_components_remain_separate_and_never_labeled_unrelated():
         _artifact_row(103, "batch.png", "image"),
     ]
     run = run_correlation(analysis_id=1, evidence_rows=rows)
-    assert len(run.result.components) == 2
+    assert len(run.result.components) == 2  # correlation itself still finds both, never merges them
 
     payload = build_correlation_payload(run, rows, artifacts=artifacts)
-    assert payload["component_count"] == 2
+    # Final hardening pass: the frontend graph represents the PRIMARY
+    # incident only - the non-primary (isolated) component is excluded
+    # from components[] but still honestly counted, never silently
+    # claimed as returned, and its artifact still gets a real per-artifact
+    # outcome (never "unrelated").
+    assert payload["component_count"] == 1
+    assert payload["component_count_total"] == 2
+    assert payload["excluded_component_count"] == 1
     assert "unrelated" not in json.dumps(payload).lower()
 
 

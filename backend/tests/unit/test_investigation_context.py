@@ -415,9 +415,21 @@ def test_simple_gemini_context_still_carries_available_evidence_fields():
 
 
 def test_missing_optional_fields_do_not_break_serialization():
+    # A genuinely isolated singleton (a lone sparse row with no correlating
+    # signal at all) is now excluded from build_correlation_payload's
+    # components[] entirely (final hardening pass: components[] is the
+    # PRIMARY incident only) before its node-level serialization could
+    # even be exercised here - so `sparse` gets one same-artifact,
+    # same-service companion (a real structural signal, unrelated to any
+    # of the fields under test below) purely so it lands in a genuine
+    # >1-node primary component. first_seen must be real (not None) for
+    # that correlation to be possible at all; every other field this test
+    # cares about stays None/missing on `sparse` itself.
+    base = datetime.now(timezone.utc)
     sparse = _evidence(
         1,
         artifact_id=1,
+        service="svc",
         trace_id=None,
         request_id=None,
         span_id=None,
@@ -430,14 +442,15 @@ def test_missing_optional_fields_do_not_break_serialization():
         endpoint=None,
         http_status=None,
         module=None,
-        first_seen=None,
+        first_seen=base,
         last_seen=None,
     )
+    companion = _evidence(2, artifact_id=1, service="svc", first_seen=base + timedelta(milliseconds=5))
 
-    run = run_correlation(analysis_id=1, evidence_rows=[sparse])
-    payload = build_correlation_payload(run, [sparse])
-    llm_context = build_llm_context(run, [sparse])
-    simple_context = build_simple_llm_context(analysis_id=1, evidence_rows=[sparse])
+    run = run_correlation(analysis_id=1, evidence_rows=[sparse, companion])
+    payload = build_correlation_payload(run, [sparse, companion])
+    llm_context = build_llm_context(run, [sparse, companion])
+    simple_context = build_simple_llm_context(analysis_id=1, evidence_rows=[sparse, companion])
 
     # Must not raise, and must be genuinely JSON-serializable (datetimes,
     # enums etc. all resolved to plain values already).
@@ -445,14 +458,18 @@ def test_missing_optional_fields_do_not_break_serialization():
     json.dumps(llm_context)
     json.dumps(simple_context)
 
+    assert len(payload["components"]) == 1
+    sparse_node = next(n for n in payload["components"][0]["nodes"] if n["id"] == "evidence-1")
+
     # CorrelationNode (frozen correlation_engine.py) already normalizes a
     # missing source_matches to [] at node-construction time
     # (list(evidence.source_matches or [])) - preserved as-is, not
     # something this task changes.
-    assert payload["components"][0]["nodes"][0]["source_matches"] == []
-    assert payload["components"][0]["nodes"][0]["trace_id"] is None
+    assert sparse_node["source_matches"] == []
+    assert sparse_node["trace_id"] is None
 
     # _evidence_payload() reads Evidence.source_matches directly with no
     # such coalescing, so None survives as None at the evidence level.
-    assert simple_context["evidence"][0]["source_matches"] is None
-    assert simple_context["evidence"][0]["trace_id"] is None
+    sparse_evidence_context = next(e for e in simple_context["evidence"] if e["id"] == 1)
+    assert sparse_evidence_context["source_matches"] is None
+    assert sparse_evidence_context["trace_id"] is None

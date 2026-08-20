@@ -478,10 +478,30 @@ def build_correlation_payload(
     evidence_counts_by_artifact = _count_evidence_by_artifact(evidence_rows)
 
     components: list[dict[str, Any]] = []
+    total_component_count = len(correlation_run.result.components)
 
-    for component_index, component in enumerate(
-        correlation_run.result.components
-    ):
+    # The frontend correlated graph represents the PRIMARY incident only -
+    # the exact same _select_primary_component() definition already used
+    # for relationship-status labeling (linked/partially_linked/not_linked)
+    # and Gemini isolation, so "primary" can never mean something different
+    # here. Any other component (isolated singleton or a smaller, genuinely
+    # correlated but non-primary group) is excluded from components[] -
+    # its artifacts remain fully visible via artifacts[] with
+    # relationship_status="not_linked"/"partially_linked", and its Evidence
+    # remains fully persisted; it simply never renders as extra incident
+    # structure. A "partially_linked" artifact naturally keeps only the
+    # subset of its nodes that belong to the primary component, since a
+    # node can only ever live in the one component it was actually
+    # assigned to.
+    primary_component = _select_primary_component(correlation_run.result.components)
+    primary_entry: tuple[int, Any] | None = None
+    if primary_component is not None:
+        for index, component in enumerate(correlation_run.result.components):
+            if component is primary_component:
+                primary_entry = (index, component)
+                break
+
+    for component_index, component in ([primary_entry] if primary_entry is not None else []):
         root_candidates = correlation_run.root_causes.get(
             component_index,
             [],
@@ -650,7 +670,12 @@ def build_correlation_payload(
         "analysis_id": correlation_run.result.analysis_id,
         "investigation_path": "correlated",
         "evidence_count": real_total,
-        "component_count": len(correlation_run.result.components),
+        # The truthful count of components actually returned in
+        # `components` below (0 or 1 - the primary incident only), never
+        # overloaded to also mean "components found" - see
+        # component_count_total/excluded_component_count for that.
+        "component_count": len(components),
+        "component_count_total": total_component_count,
         # Distinct artifacts represented in RETAINED evidence - not the total
         # number of artifacts processed for this analysis. An artifact that
         # was processed but produced zero retained evidence contributes no
@@ -660,6 +685,10 @@ def build_correlation_payload(
         "evidence_artifact_count": len(evidence_counts_by_artifact),
         "components": components,
     }
+
+    if total_component_count > len(components):
+        # Never silently claim excluded components were returned.
+        payload["excluded_component_count"] = total_component_count - len(components)
 
     if real_total > len(evidence_rows):
         payload["evidence_count_returned"] = len(evidence_rows)

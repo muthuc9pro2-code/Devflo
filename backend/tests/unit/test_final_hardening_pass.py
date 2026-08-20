@@ -176,7 +176,15 @@ def test_association_only_component_has_empty_root_causes_not_fabricated():
 # --- not_linked isolation from Gemini's primary reasoning -------------------
 
 
-def test_non_primary_component_excluded_from_gemini_primary_reasoning():
+def test_non_primary_component_excluded_from_gemini_and_frontend_primary_graph():
+    """Two locked fixes, same underlying _select_primary_component()
+    definition: Gemini's primary reasoning AND the frontend correlated
+    graph payload (build_correlation_payload) both represent only the
+    primary incident component - a genuinely-correlated but non-primary
+    component is excluded from both, honestly counted in both, and its
+    Evidence stays fully persisted (never deleted, never in the fixture
+    to begin with - this only proves it's excluded from the RETURNED
+    graph)."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, span_id="root", trace_id="primary", first_seen=base),
@@ -200,8 +208,20 @@ def test_non_primary_component_excluded_from_gemini_primary_reasoning():
     }
     assert 4 not in gemini_evidence_ids and 5 not in gemini_evidence_ids
 
-    # Frontend deterministic payload still carries both components in full.
-    assert len(frontend["components"]) == 2
+    # Frontend correlated graph is ALSO restricted to the primary
+    # component only (final hardening pass) - honestly counted, not
+    # silently claimed as returned.
+    assert len(frontend["components"]) == 1
+    assert frontend["component_count"] == 1
+    assert frontend["component_count_total"] == 2
+    assert frontend["excluded_component_count"] == 1
+    frontend_node_evidence_ids = {
+        e["id"]
+        for c in frontend["components"]
+        for n in c["nodes"]
+        for e in n["evidence"]
+    }
+    assert 4 not in frontend_node_evidence_ids and 5 not in frontend_node_evidence_ids
 
 
 def test_isolated_singleton_component_never_becomes_a_root_cause():
