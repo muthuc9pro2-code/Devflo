@@ -550,10 +550,10 @@ def test_association_only_relationship_does_not_inflate_downstream_causal_counts
     assert roles["evidence-3"] == "uncorrelated"
 
 
-# --- Section 16: causal vs inferred_propagation vs association ------------
+# --- Section 16: explicit_parent_child vs inferred_propagation vs association --
 
 
-def test_scenario_n_exact_parent_span_is_relationship_type_causal():
+def test_scenario_n_exact_parent_span_is_relationship_type_explicit_parent_child():
     same_time = datetime.now(timezone.utc)
     parent = _evidence(
         1, source_format="opentelemetry", trace_id="trace-n", span_id="span-parent",
@@ -564,14 +564,16 @@ def test_scenario_n_exact_parent_span_is_relationship_type_causal():
         first_seen=same_time, last_seen=same_time,
     )
 
-    causal_edges, associations = build_correlation_edges(
+    directed_edges, associations = build_correlation_edges(
         [parent, child], build_correlation_indexes([parent, child])
     )
 
-    assert len(causal_edges) == 1
+    assert len(directed_edges) == 1
     assert associations == []
-    edge = causal_edges[0]
-    assert edge.relationship_type == "causal"
+    edge = directed_edges[0]
+    # Exact parent.span_id == child.parent_span_id proves DIRECTION, not
+    # physical failure causation - see correlation_engine.CorrelationEdge.
+    assert edge.relationship_type == "explicit_parent_child"
     assert edge.direction_confidence == 1.0
 
 
@@ -584,20 +586,20 @@ def test_scenario_q_positive_time_shared_identity_is_inferred_propagation_with_e
         last_seen=base + timedelta(milliseconds=27.4),
     )
 
-    causal_edges, associations = build_correlation_edges(
+    directed_edges, associations = build_correlation_edges(
         [earlier, later], build_correlation_indexes([earlier, later])
     )
 
-    assert len(causal_edges) == 1
+    assert len(directed_edges) == 1
     assert associations == []
-    edge = causal_edges[0]
+    edge = directed_edges[0]
     assert edge.relationship_type == "inferred_propagation"
     assert edge.delta_ms == pytest.approx(27.4)
     assert edge.direction_confidence is not None
     assert 0.0 < edge.direction_confidence <= 1.0
-    # Not mislabeled as proven causality - "causal" is reserved for
-    # verified parent-span relationships only.
-    assert edge.relationship_type != "causal"
+    # Not mislabeled as an explicit, proven relationship - that value is
+    # reserved for verified parent-span relationships only.
+    assert edge.relationship_type != "explicit_parent_child"
 
 
 def test_associations_never_carry_a_relationship_type_or_direction_confidence():

@@ -1,8 +1,12 @@
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from app.core.processing_config import TEMPORAL_CANDIDATE_MAX_NEIGHBORS
+from app.core.processing_config import (
+    IDENTITY_CANDIDATE_MAX_NEIGHBORS,
+    IDENTITY_FULL_PAIRWISE_MAX_GROUP_SIZE,
+    TEMPORAL_CANDIDATE_MAX_NEIGHBORS,
+)
 from app.models.evidence import Evidence
 from time import perf_counter
 
@@ -88,41 +92,47 @@ class CorrelationEdge:
     score: float
     delta_ms: float | None
     signals: list[CorrelationSignal] = field(default_factory=list)
-    # "causal" (exact parent.span_id == child.parent_span_id match - the
-    # strongest, definitionally-certain relationship) vs
-    # "inferred_propagation" (a strictly positive time delta between two
-    # otherwise-correlated records - directional, but a deterministic
-    # hypothesis, never proven physical causation). None for associations
-    # (this same dataclass shape is reused there; associations are never
-    # directional so relationship_type/direction_confidence do not apply).
+    # "explicit_parent_child" (exact parent.span_id == child.parent_span_id
+    # match - the strongest, definitionally-certain DIRECTED relationship:
+    # trace topology and direction are proven, physical failure causation
+    # is NOT) vs "inferred_propagation" (a strictly positive time delta
+    # between two otherwise-correlated records - directional, but a
+    # deterministic hypothesis, never proven physical causation either).
+    # None for associations (this same dataclass shape is reused there;
+    # associations are never directional so relationship_type/
+    # direction_confidence do not apply).
     relationship_type: str | None = None
-    # How confident Devflo is in the DIRECTION/causality claim itself, as
-    # opposed to `score` (how confident the two records are related AT
-    # ALL). 1.0 for causal (parent-span is definitionally certain);
-    # temporal_score(delta_ms) for inferred_propagation - the same decay
-    # function scoring already uses, reused rather than inventing a new
-    # confidence number: two records 5ms apart support a directional
-    # propagation hypothesis far more than the same pair 5 seconds apart.
+    # How confident Devflo is in the DIRECTION claim itself (parent/child,
+    # earlier/later), as opposed to `score` (how confident the two records
+    # are related AT ALL) - never a claim about physical causation either
+    # way. 1.0 for explicit_parent_child (topology/direction is
+    # definitionally certain); temporal_score(delta_ms) for
+    # inferred_propagation - the same decay function scoring already uses,
+    # reused rather than inventing a new confidence number: two records 5ms
+    # apart support a directional propagation hypothesis far more than the
+    # same pair 5 seconds apart.
     direction_confidence: float | None = None
 
 @dataclass(slots=True)
 class CorrelationComponent:
     nodes: list[CorrelationNode] = field(default_factory=list)
-    # Directed, causal relationships only (a genuine parent-span match, or a
-    # real strictly-positive time delta between two otherwise-correlated
+    # Directed relationships only (an explicit parent-span match, or a real
+    # strictly-positive time delta between two otherwise-correlated
     # records) - the ONLY edges build_graph_stats/root_cause_score/
     # classify_node_role ever read, so incoming/outgoing/downstream counts
     # and root/propagation/victim roles are always derived from real
-    # directed causal structure, never from association order.
+    # directed structure, never from association order. Neither edge kind
+    # is proof of physical causation on its own - see relationship_type
+    # above.
     edges: list[CorrelationEdge] = field(default_factory=list)
     # Non-directional "same incident" relationships: two records correlate
     # (shared trace/request/resolved identity, or a structural+temporal
-    # match) but no real signal establishes which one came first/caused the
-    # other - equal timestamps, or a timestamp missing on either side. Used
-    # only for component membership (see build_correlation_components) and
-    # for a bounded LLM context - never for graph stats/roles/root-cause
-    # ranking, so association-only evidence can never masquerade as a
-    # causal root/propagation/victim.
+    # match) but no real signal establishes which one came first - equal
+    # timestamps, or a timestamp missing on either side. Used only for
+    # component membership (see build_correlation_components) and for a
+    # bounded LLM context - never for graph stats/roles/root-cause ranking,
+    # so association-only evidence can never masquerade as directed
+    # root/propagation/victim structure.
     associations: list[CorrelationEdge] = field(default_factory=list)
 
 
@@ -244,17 +254,13 @@ def match_correlation_signals(
         # A real equal span_id is a genuine identity/correlation signal
         # (Section 7) - configured with format weights in
         # FORMAT_SIGNAL_PRIORITY for years but never actually emitted here.
-        # This alone can never become a causal direction: only an exact
-        # parent.span_id == child.parent_span_id match (match_parent_span/
-        # build_correlation_edge) is treated as causal - resolve_pair()
-        # (build_correlation_edges) decides direction purely from a real
-        # positive time delta, never from which signal matched.
+        # This alone can never become an explicit_parent_child direction:
+        # only an exact parent.span_id == child.parent_span_id match
+        # (match_parent_span/build_correlation_edge) is treated that way -
+        # resolve_pair() (build_correlation_edges) decides
+        # inferred_propagation direction purely from a real positive time
+        # delta, never from which signal matched.
         (CorrelationSignal.SPAN_ID, left.span_id, right.span_id),
-        (
-            CorrelationSignal.RESOLVED_IDENTITY,
-            left.resolved_identity,
-            right.resolved_identity,
-        ),
         (CorrelationSignal.SERVICE, left.service, right.service),
         (CorrelationSignal.MODULE, left.module, right.module),
         (CorrelationSignal.HOST, left.host, right.host),
@@ -277,6 +283,25 @@ def match_correlation_signals(
             signal,
             left_value,
             right_value,
+        )
+
+    # RESOLVED_IDENTITY is a FALLBACK correlation signal only. resolved_
+    # identity is itself DERIVED from trace_id first, then request_id (see
+    # persist_resolved_identities/persistent_identity_resolver.py) - so a
+    # pair that already shares a real trace_id or request_id would
+    # otherwise receive credit for the SAME underlying identity fact twice
+    # under noisy-OR (once as TRACE_ID/REQUEST_ID above, again here). Only
+    # emit it when neither raw identifier already represents the match.
+    if not _shared_value(left.trace_id, right.trace_id) and not _shared_value(
+        left.request_id, right.request_id
+    ):
+        _append_shared_signal(
+            matches,
+            left.source_format,
+            right.source_format,
+            CorrelationSignal.RESOLVED_IDENTITY,
+            left.resolved_identity,
+            right.resolved_identity,
         )
 
     # A real, unambiguous match to the SAME source-code location on both
@@ -408,42 +433,79 @@ def find_parent_span_candidate(
 
     return None
 
-def iter_identity_candidates(
-    evidence: Evidence,
-    indexes: CorrelationIndexes,
-):
-    seen_ids: set[int] = {evidence.id}
+_IDENTITY_GROUP_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
 
-    groups = (
-        indexes.trace_ids.get(evidence.trace_id, [])
-        if evidence.trace_id is not None
-        else []
-    ), (
-        indexes.request_ids.get(evidence.request_id, [])
-        if evidence.request_id is not None
-        else []
-    ), (
-        indexes.resolved_identities.get(evidence.resolved_identity, [])
-        if evidence.resolved_identity is not None
-        else []
-    ), (
-        # A real equal span_id (Section 7) - never causal on its own (see
-        # match_correlation_signals), but a genuine identity-tier candidate
-        # like trace_id/request_id, so it must actually be discoverable as
-        # a candidate pair, not just scoreable if it happened to already be
-        # one.
-        indexes.span_ids.get(evidence.span_id, [])
-        if evidence.span_id is not None
-        else []
-    )
 
-    for group in groups:
-        for candidate in group:
-            if candidate.id in seen_ids:
+def _identity_group_sort_key(evidence: Evidence):
+    """Stable (first_seen, id) ordering for a shared-identity group -
+    deterministic regardless of naive/aware timestamps or input list order,
+    and regardless of whether first_seen is even known (falls back to the
+    earliest possible sentinel, then evidence.id)."""
+    first_seen = evidence.first_seen
+    if first_seen is not None and first_seen.tzinfo is None:
+        first_seen = first_seen.replace(tzinfo=timezone.utc)
+    return (first_seen or _IDENTITY_GROUP_MIN_TIMESTAMP, evidence.id)
+
+
+def iter_identity_candidate_pairs(indexes: CorrelationIndexes):
+    """Bounded replacement for the previous per-source full-group scan: a
+    shared identity (trace_id/request_id/resolved_identity/span_id) group
+    of size N used to cost O(N^2) candidate pairs to discover (a single
+    5000-row shared trace could imply ~12.5M pairs) - unnecessary for an
+    investigation graph, whose real goals are: the group stays one
+    connected component, near-in-time relationships stay linked, and work
+    is deterministically bounded.
+
+    Each group is scanned once, in stable (first_seen, id) order:
+    - at or under IDENTITY_FULL_PAIRWISE_MAX_GROUP_SIZE, every pair in the
+      group is still yielded (today's behavior, unchanged for small/normal
+      incidents);
+    - above it, each row is paired only with its next
+      IDENTITY_CANDIDATE_MAX_NEIGHBORS rows in that stable order, bounding
+      candidate-pair generation to O(n*K). Every row still shares a
+      neighbor with the row before and after it in the ordering, so the
+      whole group remains transitively connected as one component even
+      though not every pair within it is individually scored.
+
+    Deterministic and input-order-invariant: only intra-group temporal/id
+    order decides pairing, never the order evidence_rows/indexes were
+    built from. Explicit parent-span relationships never go through this
+    path at all (see find_parent_span_candidate, called separately and
+    unconditionally before this iterator in build_correlation_edges/
+    has_genuine_correlatable_structure), so they can never be affected by
+    the neighbor bound below.
+    """
+    seen_pairs: set[frozenset[int]] = set()
+
+    for index in (
+        indexes.trace_ids,
+        indexes.request_ids,
+        indexes.resolved_identities,
+        # A real equal span_id (Section 7) - never a directed relationship
+        # on its own (see match_correlation_signals), but a genuine
+        # identity-tier candidate like trace_id/request_id, so it must
+        # actually be discoverable as a candidate pair, not just scoreable
+        # if it happened to already be one.
+        indexes.span_ids,
+    ):
+        for group in index.values():
+            if len(group) < 2:
                 continue
 
-            seen_ids.add(candidate.id)
-            yield candidate
+            ordered = sorted(group, key=_identity_group_sort_key)
+            neighbor_span = (
+                len(ordered)
+                if len(ordered) <= IDENTITY_FULL_PAIRWISE_MAX_GROUP_SIZE
+                else IDENTITY_CANDIDATE_MAX_NEIGHBORS
+            )
+
+            for position, left in enumerate(ordered):
+                for right in ordered[position + 1:position + 1 + neighbor_span]:
+                    key = frozenset((left.id, right.id))
+                    if key in seen_pairs:
+                        continue
+                    seen_pairs.add(key)
+                    yield left, right
 
 def score_signal_matches(
     matches: list[CorrelationSignalMatch],
@@ -469,20 +531,6 @@ def evidence_delta_ms(
         target.first_seen - source.first_seen
     ).total_seconds() * 1000.0
 
-def _resolved_identity_support(source: Evidence, target: Evidence) -> float:
-    if (
-        source.resolved_identity is None
-        or source.resolved_identity != target.resolved_identity
-    ):
-        return 0.0
-
-    left = source.identity_strength
-    right = target.identity_strength
-    if left is None or right is None:
-        return 0.0
-
-    return min(max(float(left), 0.0), max(float(right), 0.0), 1.0)
-
 def score_candidate_pair(
     source: Evidence,
     target: Evidence,
@@ -497,10 +545,6 @@ def score_candidate_pair(
     delta_ms = evidence_delta_ms(source, target)
 
     score = score_signal_matches(matches)
-
-    identity_support = _resolved_identity_support(source, target)
-    if identity_support > 0.0:
-        score = 1.0 - ((1.0 - score) * (1.0 - (0.20 * identity_support)))
 
     if delta_ms is not None and delta_ms >= 0:
         temporal_support = temporal_score(delta_ms) * SignalStrength.LOW.value
@@ -535,7 +579,7 @@ _STRUCTURAL_SIGNALS = frozenset({
     # A genuine same-file+line source match (Section 7) is real structural
     # relatedness, never fabricated (see _shared_source_location) - SPAN_ID
     # is deliberately NOT included here, it is treated as an identity-tier
-    # signal (see iter_identity_candidates) like trace_id/request_id.
+    # signal (see iter_identity_candidate_pairs) like trace_id/request_id.
     CorrelationSignal.SOURCE,
 })
 
@@ -727,9 +771,11 @@ def build_correlation_edge(
         delta_ms=delta_ms,
         signals=[match.signal for match in matches],
         # This function is only ever called for a verified parent.span_id
-        # == child.parent_span_id match (see the caller below) - exact
-        # parent-span identity, the strongest possible relationship.
-        relationship_type="causal",
+        # == child.parent_span_id match (see the caller below) - an
+        # explicit, proven trace-topology parent/child relationship. That
+        # proves DIRECTION, not physical failure causation (see
+        # CorrelationEdge.relationship_type above).
+        relationship_type="explicit_parent_child",
         direction_confidence=1.0,
     )
 
@@ -743,7 +789,7 @@ def _pair_key(
     # relationship, resolved exactly once.
     return frozenset((left.id, right.id))
 
-def _causal_direction_delta(delta_ms: float | None) -> bool:
+def _has_strict_time_direction(delta_ms: float | None) -> bool:
     """True only when there is a real, strictly positive time separation.
     Equal timestamps (delta_ms == 0.0) or unknown timestamps (delta_ms is
     None, i.e. first_seen missing on either side) establish no direction on
@@ -759,9 +805,9 @@ def _canonical_pair_order(
     only to decide which side is scored as "source" for
     evidence_delta_ms()/temporal support in score_candidate_pair() - this
     is bookkeeping for a stable, reproducible score/delta_ms, never itself
-    a claim of causality (see _causal_direction_delta, which is what
-    actually decides causal-vs-association). Falls back to evidence.id when
-    timestamps tie or are missing so the SAME unordered pair always
+    a claim of direction (see _has_strict_time_direction, which is what
+    actually decides inferred_propagation-vs-association). Falls back to
+    evidence.id when timestamps tie or are missing so the SAME unordered pair always
     canonicalizes to the SAME order regardless of which iteration
     direction - or which shuffled input order - encounters it first;
     required for correlation to stay invariant to evidence input order.
@@ -778,15 +824,17 @@ def build_correlation_edges(
     indexes: CorrelationIndexes,
     temporal_window_ms: float = 5000.0,
 ) -> tuple[list[CorrelationEdge], list[CorrelationEdge]]:
-    """Returns (causal_edges, associations).
+    """Returns (directed_edges, associations).
 
-    Causal edges carry real directional evidence - either a genuine
+    Directed edges carry real directional evidence - either an explicit
     parent-span relationship (always directional, even at equal
     timestamps: an exact parent.span_id == child.parent_span_id match with
-    compatible trace identity), or a strictly positive time delta between
-    two otherwise-correlated records. These alone feed
+    compatible trace identity - relationship_type="explicit_parent_child"),
+    or a strictly positive time delta between two otherwise-correlated
+    records (relationship_type="inferred_propagation"). These alone feed
     build_graph_stats/root_cause_score/classify_node_role (all read
-    component.edges only).
+    component.edges only). Neither kind is proof of physical failure
+    causation on its own - see CorrelationEdge.relationship_type.
 
     Associations record the same underlying correlating signal (shared
     trace_id/request_id/resolved_identity/fingerprint/service/exception/
@@ -796,7 +844,7 @@ def build_correlation_edges(
     Devflo underclaims rather than fabricates causality. Both kinds still
     connect nodes into the same component (build_correlation_components).
     """
-    causal_edges: list[CorrelationEdge] = []
+    directed_edges: list[CorrelationEdge] = []
     associations: list[CorrelationEdge] = []
     seen_pairs: set[frozenset[int]] = set()
 
@@ -817,7 +865,7 @@ def build_correlation_edges(
             continue
 
         seen_pairs.add(key)
-        causal_edges.append(edge)
+        directed_edges.append(edge)
 
     def resolve_pair(a: Evidence, b: Evidence) -> None:
         key = _pair_key(a, b)
@@ -833,7 +881,7 @@ def build_correlation_edges(
         if not matches or score <= 0.0:
             return
 
-        is_time_ordered = _causal_direction_delta(delta_ms)
+        is_time_ordered = _has_strict_time_direction(delta_ms)
 
         relationship = CorrelationEdge(
             source_id=f"evidence-{source.id}",
@@ -842,22 +890,22 @@ def build_correlation_edges(
             delta_ms=delta_ms,
             signals=[match.signal for match in matches],
             # A strictly positive delta_ms between two otherwise-correlated
-            # records is a directional HYPOTHESIS (inferred_propagation),
-            # never proven physical causation the way an exact parent-span
-            # match is - direction_confidence reuses the same temporal
-            # decay scoring already applies, not a new number.
+            # records is a directional HYPOTHESIS (inferred_propagation) -
+            # never proven physical causation, exactly like an explicit
+            # parent-span match proves direction but not causation -
+            # direction_confidence reuses the same temporal decay scoring
+            # already applies, not a new number.
             relationship_type="inferred_propagation" if is_time_ordered else None,
             direction_confidence=temporal_score(delta_ms) if is_time_ordered else None,
         )
 
         if is_time_ordered:
-            causal_edges.append(relationship)
+            directed_edges.append(relationship)
         else:
             associations.append(relationship)
 
-    for source in evidence_rows:
-        for target in iter_identity_candidates(source, indexes):
-            resolve_pair(source, target)
+    for source, target in iter_identity_candidate_pairs(indexes):
+        resolve_pair(source, target)
 
     for source, target in iter_valid_temporal_candidates(
         evidence_rows,
@@ -865,7 +913,7 @@ def build_correlation_edges(
     ):
         resolve_pair(source, target)
 
-    return causal_edges, associations
+    return directed_edges, associations
 
 def build_correlation_nodes(
     evidence_rows: list[Evidence],
@@ -916,9 +964,9 @@ def build_correlation_components(
     associations: list[CorrelationEdge] | None = None,
 ) -> list[CorrelationComponent]:
     """Connectivity (which nodes end up grouped into the same component) is
-    determined by BOTH causal edges and associations - two records that
+    determined by BOTH directed edges and associations - two records that
     correlate but establish no direction (e.g. equal timestamps) must still
-    be recognized as part of the same incident. Only `edges` (causal) is
+    be recognized as part of the same incident. Only `edges` (directed) is
     ever used for graph stats/roles/root-cause ranking; `associations` is
     carried on each resulting component purely for display/LLM context.
     """
@@ -1027,10 +1075,10 @@ def enforce_dag(
     majority in practice - every inferred_propagation edge) is safe to
     include unconditionally, skipping the expensive incremental
     reachability check (would_create_cycle) for it entirely. Only edges
-    without that guarantee (parent-span edges at an equal/unknown/non-
-    positive delta - the only way a causal edge can lack strictly-positive
-    delta_ms) need real cycle detection, evaluated against the adjacency
-    already built from every time-ordered edge.
+    without that guarantee (explicit_parent_child edges at an equal/
+    unknown/non-positive delta - the only way a directed edge can lack
+    strictly-positive delta_ms) need real cycle detection, evaluated
+    against the adjacency already built from every time-ordered edge.
 
     This was a genuine, measured bottleneck: enforce_dag's original
     "check every edge against the whole graph so far" cost degrades toward
@@ -1168,13 +1216,13 @@ def root_cause_score(
         return 1.0
 
     root_position = (
-        # No causal edge touches this node at all (it may still sit in a
+        # No directed edge touches this node at all (it may still sit in a
         # larger component purely via association - e.g. equal-timestamp
         # "same incident" evidence) - that is not a root signal, it is the
         # same "uncorrelated" position classify_node_role already assigns
         # for this exact condition. Without this, an association-only node
         # would read as maximally root-like merely for having no incoming
-        # CAUSAL edge, even though it has no outgoing one either.
+        # DIRECTED edge, even though it has no outgoing one either.
         0.0
         if stats.incoming_count == 0 and stats.outgoing_count == 0
         else 1.0
@@ -1540,11 +1588,10 @@ def has_genuine_correlatable_structure(evidence_rows: list[Evidence]) -> bool:
         if find_parent_span_candidate(child, indexes) is not None:
             return True
 
-    for source in evidence_rows:
-        for target in iter_identity_candidates(source, indexes):
-            score, _delta_ms, matches = score_candidate_pair(source, target)
-            if matches and score > 0.0:
-                return True
+    for source, target in iter_identity_candidate_pairs(indexes):
+        score, _delta_ms, matches = score_candidate_pair(source, target)
+        if matches and score > 0.0:
+            return True
 
     for source, target in iter_valid_temporal_candidates(evidence_rows):
         score, _delta_ms, matches = score_candidate_pair(source, target)
@@ -1577,8 +1624,8 @@ def run_correlation(
     edge_seconds = perf_counter() - edge_start
 
     dag_start = perf_counter()
-    # enforce_dag only makes sense for directed causal edges - associations
-    # are non-directional by definition, so there is no "cycle" for them.
+    # enforce_dag only makes sense for directed edges - associations are
+    # non-directional by definition, so there is no "cycle" for them.
     dag_edges = enforce_dag(edges)
     dag_seconds = perf_counter() - dag_start
 

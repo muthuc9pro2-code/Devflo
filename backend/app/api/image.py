@@ -1,8 +1,14 @@
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from app.core.processing_config import MAX_OCR_IMAGE_BYTES, MEBIBYTE
 from app.schemas.image import ImageInvestigationResponse
-from app.services.image_text_extractor import extract_text_from_image
+from app.services.image_text_extractor import (
+    InvalidOcrImageError,
+    OcrImageTooLargeError,
+    extract_text_from_image,
+    validate_ocr_image,
+)
 from app.services.ocr_normalizer import normalize_ocr_text
 
 router = APIRouter(
@@ -15,8 +21,6 @@ _ALLOWED_CONTENT_TYPES = {
     "image/jpeg",
     "image/webp",
 }
-
-_MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
 
 @router.post(
@@ -32,12 +36,12 @@ async def extract_image_text(
             detail="Unsupported image format",
         )
 
-    content = await image.read(_MAX_IMAGE_SIZE + 1)
+    content = await image.read(MAX_OCR_IMAGE_BYTES + 1)
 
-    if len(content) > _MAX_IMAGE_SIZE:
+    if len(content) > MAX_OCR_IMAGE_BYTES:
         raise HTTPException(
             status_code=413,
-            detail="Image exceeds 10 MB limit",
+            detail=f"Image exceeds the {MAX_OCR_IMAGE_BYTES // MEBIBYTE} MiB limit",
         )
 
     suffix = Path(image.filename or "").suffix.lower()
@@ -48,6 +52,17 @@ async def extract_image_text(
     ) as temp_file:
         temp_file.write(content)
         temp_file.flush()
+
+        # Same shared validator every investigation upload path runs
+        # (app/api/analysis.py, and again as defense-in-depth inside
+        # image_text_extractor._run_ocr itself) - no second/parallel image
+        # validation implementation.
+        try:
+            validate_ocr_image(temp_file.name)
+        except OcrImageTooLargeError as error:
+            raise HTTPException(status_code=413, detail=str(error)) from error
+        except InvalidOcrImageError as error:
+            raise HTTPException(status_code=415, detail=str(error)) from error
 
         extracted_text = extract_text_from_image(
             temp_file.name

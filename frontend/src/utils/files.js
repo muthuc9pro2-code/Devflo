@@ -16,11 +16,26 @@ export const DIAGNOSTIC_ACCEPT = [
 export const MAX_DIAGNOSTIC_BYTES = 1024 ** 3
 export const MAX_SOURCE_ZIP_BYTES = 200 * 1024 ** 2
 
+// Mirrors backend app/core/processing_config.py's upload/OCR resource
+// limits (MAX_DIAGNOSTIC_ARTIFACTS, MAX_OCR_IMAGES_PER_INVESTIGATION,
+// MAX_OCR_IMAGE_BYTES) - only the ones cheaply knowable from browser File
+// metadata (count, name, size). The 25 MP decoded-pixel check stays
+// backend-authoritative; the browser never decodes every selected image
+// just to count pixels.
+export const MAX_DIAGNOSTIC_ARTIFACTS = 200
+export const MAX_OCR_IMAGES_PER_INVESTIGATION = 20
+export const MAX_OCR_IMAGE_BYTES = 20 * 1024 ** 2
+
 const EXPLICIT_DIAGNOSTIC_SUFFIX = /\.(?:log|txt|json|jsonl|ndjson|har|out|err|png|jpe?g|webp)$/i
 const ROTATED_TEXT_SUFFIX = /\.(?:log|txt|json|jsonl|ndjson|har|out|err)\.\d+$/i
+const SUPPORTED_IMAGE_SUFFIX = /\.(?:png|jpe?g|webp)$/i
 
 export function isSupportedDiagnosticFilename(filename) {
   return EXPLICIT_DIAGNOSTIC_SUFFIX.test(filename) || ROTATED_TEXT_SUFFIX.test(filename)
+}
+
+export function isSupportedImageFilename(filename) {
+  return SUPPORTED_IMAGE_SUFFIX.test(filename)
 }
 
 export function diagnosticRejectionReason(filename) {

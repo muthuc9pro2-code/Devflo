@@ -325,7 +325,12 @@ function buildFlowEdges(component, showAssociations, nodeIndex) {
     const target = String(edge.target_id ?? edge.target)
     if (!validNodeIds.has(source) || !validNodeIds.has(target)) return
     const revealAt = Math.max(nodeIndex.get(source) || 0, nodeIndex.get(target) || 0)
-    const isCausal = edge.relationship_type === 'causal'
+    // Backend now generates "explicit_parent_child" for an exact parent-span
+    // match; legacy persisted result_snapshot JSON from before that rename
+    // may still contain "causal" for the exact same relationship - both get
+    // the same strongest-directed-edge visual treatment.
+    const isExplicitParentChild = edge.relationship_type === 'explicit_parent_child'
+      || edge.relationship_type === 'causal'
     const lane = ((nodeIndex.get(source) || 0) + (nodeIndex.get(target) || 0)) % DIRECTED_EDGE_LANES.length
     directedEdges.push({
       id: `directed:${index}:${source}:${target}`,
@@ -333,10 +338,10 @@ function buildFlowEdges(component, showAssociations, nodeIndex) {
       target,
       type: 'timing',
       className: `graph-reveal-edge edge-${edge.relationship_type || 'inferred'}`,
-      markerEnd: { type: MarkerType.ArrowClosed, color: isCausal ? '#62d8ca' : '#91a0b8' },
+      markerEnd: { type: MarkerType.ArrowClosed, color: isExplicitParentChild ? '#62d8ca' : '#91a0b8' },
       style: {
-        stroke: isCausal ? '#62d8ca' : '#91a0b8',
-        strokeWidth: isCausal ? 1.8 : 1.45,
+        stroke: isExplicitParentChild ? '#62d8ca' : '#91a0b8',
+        strokeWidth: isExplicitParentChild ? 1.8 : 1.45,
         '--reveal-delay': `${Math.min(680, 180 + revealAt * 44)}ms`,
       },
       pathOptions: {
@@ -526,13 +531,26 @@ function NodeDetails({ node, timelineEntry }) {
   )
 }
 
+// "explicit_parent_child" (current) and legacy persisted "causal" (old
+// analyses, never generated anymore - see buildFlowEdges) both name the
+// same exact-parent-span relationship: proven DIRECTION, not proven
+// physical causation, so both get this same truthful label rather than
+// generic humanize() (which would otherwise render legacy data as bare
+// "Causal").
+function relationshipTypeLabel(relationshipType) {
+  if (relationshipType === 'explicit_parent_child' || relationshipType === 'causal') {
+    return 'Explicit parent-child'
+  }
+  return humanize(relationshipType)
+}
+
 function RelationshipDetails({ kind, relationship }) {
   const directed = kind === 'edge'
   return (
     <>
       <p className="detail-kicker">{directed ? 'Directed relationship' : 'Non-directional association'}</p>
       <h3 id="graph-detail-heading">
-        {directed ? humanize(relationship.relationship_type) : 'Associated evidence'}
+        {directed ? relationshipTypeLabel(relationship.relationship_type) : 'Associated evidence'}
       </h3>
       {!directed && <p className="detail-note">This relationship links evidence from the same incident without implying causation or direction.</p>}
       <div className="detail-grid">

@@ -1,5 +1,7 @@
 from pathlib import Path
+from PIL import Image, UnidentifiedImageError
 from rapidocr_onnxruntime import RapidOCR
+from app.core.processing_config import MAX_OCR_IMAGE_BYTES, MAX_OCR_IMAGE_PIXELS, MEBIBYTE
 _ocr = RapidOCR()
 
 _ALLOWED_IMAGE_EXTENSIONS = {
@@ -10,14 +12,82 @@ _ALLOWED_IMAGE_EXTENSIONS = {
 }
 
 
+class OcrImageError(Exception):
+    """Base class for shared pre-OCR image validation failures - never
+    raised by RapidOCR itself, only by validate_ocr_image() below."""
+
+
+class OcrImageTooLargeError(OcrImageError):
+    """File size or decoded pixel count exceeds the configured OCR
+    resource bounds (MAX_OCR_IMAGE_BYTES / MAX_OCR_IMAGE_PIXELS)."""
+
+
+class InvalidOcrImageError(OcrImageError):
+    """Not a real, decodable image in a supported format."""
+
+
+def validate_ocr_image(file_path: str | Path) -> None:
+    """Shared resource-limit + integrity gate that must run before ANY
+    RapidOCR call (see _run_ocr below, the sole caller-independent entry
+    point) - RapidOCR itself must never be the first place Devflo discovers
+    an oversized or absurdly-dense image. Runs no OCR itself; returns
+    normally only when the image is safe to hand to RapidOCR."""
+    path = Path(file_path)
+
+    if not path.is_file():
+        raise InvalidOcrImageError("Image file not found")
+
+    if path.suffix.lower() not in _ALLOWED_IMAGE_EXTENSIONS:
+        raise InvalidOcrImageError("Unsupported image format")
+
+    size = path.stat().st_size
+    if size > MAX_OCR_IMAGE_BYTES:
+        raise OcrImageTooLargeError(
+            f"Image exceeds the {MAX_OCR_IMAGE_BYTES // MEBIBYTE} MiB image size limit"
+        )
+
+    # Pillow's own PIL.Image.MAX_IMAGE_PIXELS is a process-global mutable
+    # default - deliberately never read or reassigned here (that would
+    # affect every other concurrent Pillow use in this process). Image.open
+    # still performs Pillow's OWN decompression-bomb check internally
+    # against that unmodified global default while parsing the header, so
+    # an extreme (multi-hundred-megapixel) image can still raise
+    # DecompressionBombError before width/height are even available below;
+    # everything under that default is instead enforced by Devflo's own,
+    # much stricter MAX_OCR_IMAGE_PIXELS comparison after open() returns.
+    try:
+        with Image.open(path) as probe:
+            width, height = probe.size
+        with Image.open(path) as probe:
+            probe.verify()
+    except Image.DecompressionBombError as error:
+        raise OcrImageTooLargeError(
+            "Image exceeds the maximum decoded pixel count"
+        ) from error
+    except (UnidentifiedImageError, OSError, ValueError) as error:
+        raise InvalidOcrImageError("Image could not be read") from error
+
+    pixel_count = width * height
+    if pixel_count > MAX_OCR_IMAGE_PIXELS:
+        raise OcrImageTooLargeError(
+            "Image exceeds the maximum decoded pixel count"
+        )
+
+
 def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
     """Single shared entry point into the RapidOCR engine: each result is
     RapidOCR's own (box, text, confidence) triple. Both public functions
-    below read from this same call - there is no second/parallel OCR path."""
+    below read from this same call - there is no second/parallel OCR path.
+    validate_ocr_image() runs here too (defense-in-depth) even though
+    callers upstream (app/api/analysis.py, app/api/image.py) already
+    validate before staging/dispatch - so there is no RapidOCR path,
+    present or future, that can bypass the resource-limit gate."""
     path = Path(file_path)
 
     if path.suffix.lower() not in _ALLOWED_IMAGE_EXTENSIONS:
         raise ValueError("Unsupported image format")
+
+    validate_ocr_image(path)
 
     results, _ = _ocr(str(path))
 

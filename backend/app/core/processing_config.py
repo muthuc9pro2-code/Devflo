@@ -12,6 +12,16 @@ JSON_STREAM_BUFFER_BYTES = 64 * 1024
 MAX_FINGERPRINT_LENGTH = 255
 MAX_REPRESENTATIVE_LINE_BYTES = 64 * 1024 - 1
 
+# Upload & OCR resource limits: separate from MAX_INVESTIGATION_UPLOAD_BYTES
+# (the 1 GiB combined diagnostic byte budget, unchanged) - these instead
+# bound artifact/task/DB fan-out (a huge batch of tiny files) and RapidOCR's
+# own CPU/memory cost specifically, which the byte budget alone does not
+# protect against on the 2 vCPU deployment target.
+MAX_DIAGNOSTIC_ARTIFACTS = 200
+MAX_OCR_IMAGES_PER_INVESTIGATION = 20
+MAX_OCR_IMAGE_BYTES = 20 * MEBIBYTE
+MAX_OCR_IMAGE_PIXELS = 25_000_000
+
 # Bounds for the SIMPLE-path Gemini context (build_simple_llm_context) -
 # a large uncorrelated investigation can retain thousands of Evidence rows
 # under bounded-memory ingestion, but that guarantee is worthless if every
@@ -60,6 +70,26 @@ SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES = 256 * 1024
 # this scale, after the TEMPORAL_CANDIDATE_MAX_NEIGHBORS/enforce_dag fixes).
 CORRELATED_MAX_EVIDENCE_RECORDS = 5000
 CORRELATED_MAX_CONTEXT_BYTES = 20 * MEBIBYTE
+
+# select_bounded_evidence_from_db's own Python-side aggregate lookups
+# (repeated-fingerprint counts, cross-artifact trace/request-id bridges)
+# still scale with the number of DISTINCT values in an analysis, not the
+# bounded max_records above - bounded separately so a pathological analysis
+# with huge fingerprint/identity cardinality (but few repeats/bridges each)
+# still can't grow these Python dict/set aggregates unboundedly.
+BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS = CORRELATED_MAX_EVIDENCE_RECORDS * 4
+
+# iter_identity_candidate_pairs (correlation_engine.py): a shared identity
+# (trace_id/request_id/resolved_identity/span_id) group at or under this
+# size keeps today's full pairwise candidate behavior; a larger group falls
+# back to pairing each row (in stable temporal order) with only its next
+# IDENTITY_CANDIDATE_MAX_NEIGHBORS neighbors, bounding candidate-pair work
+# to O(n*K) instead of O(n^2) for a giant shared-identity group while still
+# keeping the whole group transitively connected as one component. Distinct
+# from TEMPORAL_CANDIDATE_MAX_NEIGHBORS above, which bounds the SEPARATE
+# temporal-fallback path only.
+IDENTITY_FULL_PAIRWISE_MAX_GROUP_SIZE = 128
+IDENTITY_CANDIDATE_MAX_NEIGHBORS = 32
 
 # Section 21: same idea for the SIMPLE path's frontend/SSE result
 # (build_simple_payload) - Gemini's own SIMPLE context is already bounded

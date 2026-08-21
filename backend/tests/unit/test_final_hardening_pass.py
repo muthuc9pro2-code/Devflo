@@ -339,7 +339,7 @@ def test_relative_ms_and_delta_ms_reflect_real_sub_second_differences():
 
     edge = payload["components"][0]["edges"][0]
     assert edge["delta_ms"] == pytest.approx(27.4)
-    assert edge["relationship_type"] == "causal"
+    assert edge["relationship_type"] == "explicit_parent_child"
 
 
 def test_equal_timestamps_remain_associations_not_a_fabricated_edge():

@@ -17,6 +17,11 @@ Regression coverage for two real bugs in the previous router:
      router now calls has_genuine_correlatable_structure(), which verifies
      a real parent.span_id == child.parent_span_id match via
      find_parent_span_candidate().
+
+Section 4 hardening: choose_investigation_path() no longer queries the DB
+itself - it is a thin policy wrapper over an already-loaded evidence_rows
+list. _route() below does the query these tests still need (a real sqlite
+DB is still the most direct way to build/persist Evidence fixtures).
 """
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -29,6 +34,11 @@ def _db():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Evidence.__table__.create(engine)
     return Session(engine)
+
+
+def _route(db, analysis_id: int = 1) -> InvestigationPath:
+    evidence_rows = db.query(Evidence).filter(Evidence.analysis_id == analysis_id).all()
+    return choose_investigation_path(evidence_rows)
 
 
 def _evidence(identifier, **overrides):
@@ -58,7 +68,7 @@ def _evidence(identifier, **overrides):
 
 def test_no_evidence_stops_before_correlated_processing():
     with _db() as db:
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.SIMPLE
+        assert _route(db) == InvestigationPath.SIMPLE
 
 
 def test_single_evidence_row_is_simple():
@@ -66,7 +76,7 @@ def test_single_evidence_row_is_simple():
         db.add(_evidence(1))
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.SIMPLE
+        assert _route(db) == InvestigationPath.SIMPLE
 
 
 def test_shared_trace_id_across_rows_is_correlated():
@@ -74,7 +84,7 @@ def test_shared_trace_id_across_rows_is_correlated():
         db.add_all([_evidence(1, trace_id="trace-a"), _evidence(2, trace_id="trace-a")])
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.CORRELATED
+        assert _route(db) == InvestigationPath.CORRELATED
 
 
 def test_shared_request_id_across_rows_is_correlated():
@@ -84,7 +94,7 @@ def test_shared_request_id_across_rows_is_correlated():
         )
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.CORRELATED
+        assert _route(db) == InvestigationPath.CORRELATED
 
 
 def test_real_parent_child_span_is_correlated():
@@ -100,7 +110,7 @@ def test_real_parent_child_span_is_correlated():
         )
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.CORRELATED
+        assert _route(db) == InvestigationPath.CORRELATED
 
 
 # --- Scenario O: parent_span_id present but the actual parent row is absent
@@ -121,7 +131,7 @@ def test_parent_span_id_present_without_a_matching_parent_row_stays_simple():
         )
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.SIMPLE
+        assert _route(db) == InvestigationPath.SIMPLE
 
 
 # --- Scenario M: the correlation_key sentinel bug -------------------------
@@ -147,7 +157,7 @@ def test_shared_sentinel_correlation_key_alone_does_not_route_correlated():
         )
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.SIMPLE
+        assert _route(db) == InvestigationPath.SIMPLE
 
 
 def test_two_unrelated_untraced_rows_with_different_ids_stay_simple():
@@ -162,4 +172,24 @@ def test_two_unrelated_untraced_rows_with_different_ids_stay_simple():
         )
         db.commit()
 
-        assert choose_investigation_path(db=db, analysis_id=1) == InvestigationPath.SIMPLE
+        assert _route(db) == InvestigationPath.SIMPLE
+
+
+# --- Section 4 hardening: no DB query of its own ---------------------------
+
+
+def test_choose_investigation_path_performs_no_db_query():
+    """A thin policy wrapper over an already-loaded evidence_rows list -
+    the caller (_finalize_analysis_task) selects the bounded working set
+    exactly once, before routing; routing itself must never re-query."""
+    evidence_rows = [
+        _evidence(1, trace_id="trace-a"),
+        _evidence(2, trace_id="trace-a"),
+    ]
+
+    # A bare object with no query/session behavior at all - if
+    # choose_investigation_path touched a db/session argument (it takes
+    # none), this would fail loudly rather than silently pass.
+    result = choose_investigation_path(evidence_rows)
+
+    assert result == InvestigationPath.CORRELATED

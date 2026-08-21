@@ -47,10 +47,17 @@ Rules:
   a root cause.
 - Within a correlated investigation's components, "propagation" entries are
   directed relationships, each labeled relationship_type:
-    - "causal": an exact parent-span match (parent.span_id ==
-      child.parent_span_id) - a strongly evidenced, proven directional
-      relationship. You may describe this as one event causing or leading to
-      the other.
+    - "explicit_parent_child": an exact parent-span match (parent.span_id ==
+      child.parent_span_id) - a strong, explicit trace-topology relationship.
+      This proves DIRECTION (parent/child, upstream/downstream) with
+      certainty. It does NOT by itself prove that the parent's failure
+      physically caused the child's failure. You may describe it as an
+      explicit parent/child or upstream/downstream trace relationship (e.g.
+      "the parent span for this request"), but you must NOT say one event
+      "caused" or "led to" the other solely because of this relationship
+      type - treat it the same as inferred_propagation for causal wording
+      purposes, distinguishing only that its direction is explicitly proven
+      rather than a time-ordered hypothesis.
     - "inferred_propagation": a real positive time delta between two
       otherwise-correlated records - a directional HYPOTHESIS Devflo
       established deterministically, never proven physical causation. Use

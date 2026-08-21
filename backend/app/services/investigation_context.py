@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.core.processing_config import (
+    BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS,
     CORRELATED_GEMINI_CONTEXT_MAX_BYTES,
     SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES,
     SIMPLE_FRONTEND_MAX_CONTEXT_BYTES,
@@ -175,6 +176,7 @@ def _bounded_evidence_priority(
     *,
     fingerprint_counts: dict[str, int],
     bridging_trace_ids: set[str],
+    bridging_request_ids: set[str],
 ) -> float:
     """Section 4: a single-row, single-pass priority score (no second
     root-cause engine) biased toward the same signals that actually build
@@ -184,14 +186,26 @@ def _bounded_evidence_priority(
     score = 0.0
     if evidence.span_id is not None or evidence.parent_span_id is not None:
         score += 5.0  # actual parent-span participant (potential)
-    if evidence.trace_id is not None and evidence.trace_id in bridging_trace_ids:
+
+    is_trace_bridge = evidence.trace_id is not None and evidence.trace_id in bridging_trace_ids
+    is_request_bridge = evidence.request_id is not None and evidence.request_id in bridging_request_ids
+    # persist_resolved_identities() writes resolved_identity="unresolved:
+    # <this row's own id>"/identity_match_type="unresolved"/
+    # identity_strength=0.0 for a row with neither a real trace_id nor
+    # request_id (identity_persister.py). That value can never match any
+    # OTHER row's resolved_identity - it is provenance, not a correlation
+    # signal, and must not receive the identity-bearing bonus below.
+    has_real_resolved_identity = (
+        evidence.resolved_identity is not None
+        and evidence.identity_match_type != "unresolved"
+        and (evidence.identity_strength or 0) > 0
+    )
+
+    if is_trace_bridge or is_request_bridge:
         score += 4.0  # cross-artifact identity bridge evidence
-    elif (
-        evidence.trace_id is not None
-        or evidence.request_id is not None
-        or evidence.resolved_identity is not None
-    ):
+    elif evidence.trace_id is not None or evidence.request_id is not None or has_real_resolved_identity:
         score += 3.0  # trace/request/identity-bearing evidence
+
     score += _SEVERITY_PRIORITY_RANK.get((evidence.severity or "").upper(), 0)
     if evidence.source_matches:
         score += 2.0  # source-code matched evidence
@@ -213,11 +227,13 @@ def select_bounded_evidence_from_db(
     max_records. Never loads the whole Evidence result set into memory
     merely to truncate it afterward - reads the table in bounded batches
     (keyset-paginated by id) and maintains only a bounded max_records-sized
-    working set (a small max-heap) plus two small bounded aggregate
-    lookups, so memory stays O(max_records + batch_size + distinct
-    fingerprints/bridging trace_ids), never O(total Evidence rows).
+    working set (a small max-heap) plus three small, capped
+    (BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS) aggregate lookups (repeated
+    fingerprints, cross-artifact trace/request-id bridges), so memory stays
+    O(max_records + batch_size + BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS),
+    never O(total Evidence rows or total distinct fingerprints/identities).
     Evidence itself is never touched/deleted in MySQL either way - this
-    only bounds what one CORRELATED graph/payload has to build.
+    only bounds what one CORRELATED/SIMPLE graph/payload has to build.
 
     Returns (selected_rows, total_count) - total_count is the real,
     unbounded count for the whole analysis (never silently understated by
@@ -239,24 +255,41 @@ def select_bounded_evidence_from_db(
         )
         return rows, total_count
 
-    # Two small, bounded (O(distinct values), never O(rows)) aggregate
-    # passes that inform per-row scoring without a second full materialize.
+    # Small, bounded (O(BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS), never
+    # O(distinct values in the table)) aggregate passes that inform
+    # per-row scoring without a second full materialize. Only repeated
+    # fingerprints need an exact penalty (a singleton already defaults to
+    # count=1 via fingerprint_counts.get(..., 1) below) - HAVING count > 1
+    # keeps the query itself from ever returning every distinct
+    # fingerprint, and ordering by count DESC before capping keeps the
+    # MOST-repeated fingerprints (the ones the repeat penalty matters most
+    # for) when a pathological analysis has more distinct repeated
+    # fingerprints than the cap.
     fingerprint_counts = dict(
         db.query(Evidence.fingerprint, func.count(Evidence.id))
         .filter(Evidence.analysis_id == analysis_id, Evidence.fingerprint.isnot(None))
         .group_by(Evidence.fingerprint)
+        .having(func.count(Evidence.id) > 1)
+        .order_by(func.count(Evidence.id).desc(), Evidence.fingerprint.asc())
+        .limit(BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS)
         .all()
     )
-    bridging_trace_ids = {
-        trace_id
-        for trace_id, artifact_count in (
-            db.query(Evidence.trace_id, func.count(func.distinct(Evidence.artifact_id)))
-            .filter(Evidence.analysis_id == analysis_id, Evidence.trace_id.isnot(None))
-            .group_by(Evidence.trace_id)
+
+    def _bridging_ids(column) -> set[str]:
+        distinct_artifacts = func.count(func.distinct(Evidence.artifact_id))
+        rows = (
+            db.query(column, distinct_artifacts)
+            .filter(Evidence.analysis_id == analysis_id, column.isnot(None))
+            .group_by(column)
+            .having(distinct_artifacts > 1)
+            .order_by(distinct_artifacts.desc(), column.asc())
+            .limit(BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS)
             .all()
         )
-        if artifact_count > 1
-    }
+        return {value for value, _artifact_count in rows}
+
+    bridging_trace_ids = _bridging_ids(Evidence.trace_id)
+    bridging_request_ids = _bridging_ids(Evidence.request_id)
 
     # Stable temporal boundary/ordering: the earliest/latest few records by
     # first_seen are always reserved a seat regardless of score - cheap and
@@ -307,6 +340,7 @@ def select_bounded_evidence_from_db(
                     row,
                     fingerprint_counts=fingerprint_counts,
                     bridging_trace_ids=bridging_trace_ids,
+                    bridging_request_ids=bridging_request_ids,
                 )
                 - diversity_penalty
             )
@@ -351,6 +385,28 @@ def select_bounded_evidence_from_db(
 
     selected.sort(key=lambda row: (row.first_seen or _DATETIME_MIN_UTC, row.id))
     return selected, total_count
+
+
+def select_evidence_counts_by_artifact(
+    db: Session,
+    *,
+    analysis_id: int,
+) -> dict[int, int]:
+    """REAL per-artifact Evidence counts from MySQL, independent of any
+    bounded working-set selection (select_bounded_evidence_from_db) - a
+    bounded 5000/20MiB working set may not include every row from every
+    artifact, so deriving "how much Evidence does this artifact really
+    have" (or worse, "does this artifact have any structured Evidence at
+    all") from that subset alone would understate/misreport it. Bounded by
+    MAX_DIAGNOSTIC_ARTIFACTS (at most one GROUP BY row per artifact in this
+    analysis), so materializing this result is always safe."""
+    rows = (
+        db.query(Evidence.artifact_id, func.count(Evidence.id))
+        .filter(Evidence.analysis_id == analysis_id)
+        .group_by(Evidence.artifact_id)
+        .all()
+    )
+    return dict(rows)
 
 
 def _count_evidence_by_artifact(evidence_rows: list[Evidence]) -> dict[int, int]:
@@ -462,6 +518,7 @@ def build_correlation_payload(
     artifacts: list[Any] | None = None,
     *,
     total_evidence_count: int | None = None,
+    evidence_counts_by_artifact: dict[int, int] | None = None,
     supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     """total_evidence_count is the REAL, un-bounded evidence count for the
@@ -470,12 +527,25 @@ def build_correlation_payload(
     (evidence itself is never deleted, only what one graph/payload has to
     carry is capped). When omitted, or equal to len(evidence_rows), no
     truncation occurred and evidence_count_total/evidence_truncated are
-    simply not exposed."""
+    simply not exposed.
+
+    evidence_counts_by_artifact (Section 4 hardening) is the REAL
+    per-artifact count for the whole analysis (select_evidence_counts_by_
+    artifact) - pass it for the same reason: a bounded working set of
+    evidence_rows may not include every row from every artifact, so
+    deriving evidence_artifact_count/artifacts[].evidence_count from
+    evidence_rows alone would understate them. When omitted, falls back to
+    counting evidence_rows itself (existing direct callers/tests unchanged).
+    """
     evidence_by_id = {
         evidence.id: evidence
         for evidence in evidence_rows
     }
-    evidence_counts_by_artifact = _count_evidence_by_artifact(evidence_rows)
+    real_evidence_counts_by_artifact = (
+        evidence_counts_by_artifact
+        if evidence_counts_by_artifact is not None
+        else _count_evidence_by_artifact(evidence_rows)
+    )
 
     components: list[dict[str, Any]] = []
     total_component_count = len(correlation_run.result.components)
@@ -578,7 +648,7 @@ def build_correlation_payload(
             {
                 "id": component_index,
                 # Section 9: root_causes is a truthful name - only actual
-                # role=="root" candidates (no incoming causal edge, at
+                # role=="root" candidates (no incoming directed edge, at
                 # least one outgoing one) ever appear here. A component
                 # with no qualifying root (e.g. association-only, or a
                 # singleton) legitimately has an EMPTY root_causes list -
@@ -613,10 +683,11 @@ def build_correlation_payload(
                 "timeline": build_component_timeline(component, root_candidates),
                 # Directed relationships only - see CorrelationComponent.
                 # edges' docstring in correlation_engine.py.
-                # relationship_type distinguishes "causal" (exact parent-
-                # span match - proven direction) from "inferred_propagation"
+                # relationship_type distinguishes "explicit_parent_child"
+                # (exact parent-span match - proven DIRECTION, not proven
+                # physical failure causation) from "inferred_propagation"
                 # (a real positive time delta between correlated records -
-                # a directional HYPOTHESIS, not proven physical causation).
+                # a directional HYPOTHESIS, also not proven causation).
                 "edges": [
                     {
                         "source_id": edge.source_id,
@@ -682,7 +753,7 @@ def build_correlation_payload(
         # rows to evidence_rows and so is not counted here; see `artifacts`
         # (when provided) for the full per-artifact outcome, including
         # zero-evidence artifacts.
-        "evidence_artifact_count": len(evidence_counts_by_artifact),
+        "evidence_artifact_count": len(real_evidence_counts_by_artifact),
         "components": components,
     }
 
@@ -697,7 +768,7 @@ def build_correlation_payload(
     if artifacts is not None:
         payload["artifacts"] = _artifacts_outcome_list(
             artifacts,
-            evidence_counts_by_artifact,
+            real_evidence_counts_by_artifact,
             relationship_status_by_artifact=_artifact_relationship_statuses(
                 correlation_run.result.components
             ),
@@ -721,6 +792,8 @@ def build_simple_payload(
     analysis_id: int,
     evidence_rows: list[Evidence],
     *,
+    total_evidence_count: int | None = None,
+    evidence_counts_by_artifact: dict[int, int] | None = None,
     artifacts: list[Any] | None = None,
     supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -733,12 +806,28 @@ def build_simple_payload(
     (build_simple_llm_context); this bounds the SSE/frontend evidence array
     the same way for a giant uncorrelated investigation - Evidence itself
     stays fully persisted in MySQL regardless (evidence_count is always the
-    real total, never understated)."""
-    evidence_counts_by_artifact = _count_evidence_by_artifact(evidence_rows)
-    total_evidence_count = len(evidence_rows)
+    real total, never understated).
+
+    total_evidence_count/evidence_counts_by_artifact mirror build_
+    correlation_payload's same-named optional overrides (Section 4
+    hardening) - pass them whenever the caller already selected a bounded
+    working set of evidence_rows before calling this
+    (select_bounded_evidence_from_db/select_evidence_counts_by_artifact),
+    so evidence_count/evidence_artifact_count stay truthful for the WHOLE
+    analysis rather than just the working subset. When omitted, both fall
+    back to deriving from evidence_rows itself (existing direct
+    callers/tests unchanged)."""
+    real_evidence_counts_by_artifact = (
+        evidence_counts_by_artifact
+        if evidence_counts_by_artifact is not None
+        else _count_evidence_by_artifact(evidence_rows)
+    )
+    real_total_evidence_count = (
+        total_evidence_count if total_evidence_count is not None else len(evidence_rows)
+    )
 
     included_evidence_rows = evidence_rows
-    if total_evidence_count > SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS:
+    if len(evidence_rows) > SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS:
         included_evidence_rows = select_bounded_evidence(
             evidence_rows,
             max_records=SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS,
@@ -748,22 +837,22 @@ def build_simple_payload(
     payload: dict[str, Any] = {
         "analysis_id": analysis_id,
         "investigation_path": "simple",
-        "evidence_count": total_evidence_count,
-        "evidence_artifact_count": len(evidence_counts_by_artifact),
+        "evidence_count": real_total_evidence_count,
+        "evidence_artifact_count": len(real_evidence_counts_by_artifact),
         "evidence": [
             _evidence_payload(evidence)
             for evidence in included_evidence_rows
         ],
     }
 
-    if total_evidence_count > len(included_evidence_rows):
+    if real_total_evidence_count > len(included_evidence_rows):
         payload["evidence_count_returned"] = len(included_evidence_rows)
         payload["evidence_truncated"] = True
 
     if artifacts is not None:
         payload["artifacts"] = _artifacts_outcome_list(
             artifacts,
-            evidence_counts_by_artifact,
+            real_evidence_counts_by_artifact,
         )
 
     if supplemental_artifacts:
@@ -959,22 +1048,23 @@ def _context_size_bytes(value: Any) -> int:
 
 def _llm_component_priority_key(component_dict: dict[str, Any]) -> tuple:
     """Section 10 ordering for the Gemini byte budget: real roots first,
-    then more causal-relationship_type edges (stronger than inferred
-    propagation), then more overall directed/associated structure. A pure
+    then more explicit_parent_child-relationship_type edges (explicit,
+    proven trace topology - stronger evidence than an inferred propagation
+    hypothesis), then more overall directed/associated structure. A pure
     function of the already-built component dict - never re-derives
     anything from the correlation engine."""
     root_count = len(component_dict["root_candidates"])
-    causal_edge_count = sum(
+    explicit_parent_child_count = sum(
         1
         for edge in component_dict["propagation"]
-        if edge["relationship_type"] == "causal"
+        if edge["relationship_type"] == "explicit_parent_child"
     )
     total_structure = (
         len(component_dict["propagation"])
         + len(component_dict["associations"])
         + len(component_dict["root_evidence"])
     )
-    return (root_count > 0, root_count, causal_edge_count, total_structure)
+    return (root_count > 0, root_count, explicit_parent_child_count, total_structure)
 
 
 def build_llm_context(
@@ -1092,10 +1182,11 @@ def build_llm_context(
                 # Directed relationships only - never an equal-timestamp/
                 # unknown-timestamp association (see associations below).
                 # Gemini must not be told an association is propagation,
-                # and must distinguish relationship_type "causal" (exact
-                # parent-span match, proven direction) from
+                # and must distinguish relationship_type
+                # "explicit_parent_child" (exact parent-span match, proven
+                # DIRECTION - not proven physical failure causation) from
                 # "inferred_propagation" (a real time-ordered signal - a
-                # directional hypothesis, not proven physical causation).
+                # directional hypothesis, also not proven causation).
                 "propagation": [
                     {
                         "source": edge.source_id,
@@ -1146,8 +1237,8 @@ def build_llm_context(
     # budget (CORRELATED_MAX_CONTEXT_BYTES), since a large bounded graph
     # (up to CORRELATED_MAX_EVIDENCE_RECORDS) can still be far more than
     # Gemini needs. Components are included whole, in priority order
-    # (real roots first, then more causal edges, then more overall
-    # structure), never split apart mid-component - simple deterministic
+    # (real roots first, then more explicit_parent_child edges, then more
+    # overall structure), never split apart mid-component - simple deterministic
     # byte-size bin-filling, no tokenization, no LLM-based preselection.
     total_component_count = len(components)
     components.sort(key=_llm_component_priority_key, reverse=True)

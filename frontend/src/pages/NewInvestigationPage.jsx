@@ -7,7 +7,11 @@ import {
   diagnosticRejectionReason,
   formatBytes,
   isSupportedDiagnosticFilename,
+  isSupportedImageFilename,
+  MAX_DIAGNOSTIC_ARTIFACTS,
   MAX_DIAGNOSTIC_BYTES,
+  MAX_OCR_IMAGE_BYTES,
+  MAX_OCR_IMAGES_PER_INVESTIGATION,
   MAX_SOURCE_ZIP_BYTES,
   selectionKey,
 } from '../utils/files'
@@ -51,6 +55,32 @@ export default function NewInvestigationPage({ onUploaded }) {
     [files],
   )
   const diagnosticsTooLarge = totalBytes > MAX_DIAGNOSTIC_BYTES
+
+  const imageCount = useMemo(
+    () => files.filter((selection) => isSupportedImageFilename(selection.file.name)).length,
+    [files],
+  )
+  const oversizedImage = useMemo(
+    () => files.find((selection) => (
+      isSupportedImageFilename(selection.file.name) && selection.file.size > MAX_OCR_IMAGE_BYTES
+    )),
+    [files],
+  )
+  const tooManyFiles = files.length > MAX_DIAGNOSTIC_ARTIFACTS
+  const tooManyImages = imageCount > MAX_OCR_IMAGES_PER_INVESTIGATION
+
+  const selectionLimitReason = useMemo(() => {
+    if (tooManyFiles) {
+      return `Selected ${files.length} files exceed the ${MAX_DIAGNOSTIC_ARTIFACTS}-file limit per investigation.`
+    }
+    if (tooManyImages) {
+      return `Selected ${imageCount} images exceed the ${MAX_OCR_IMAGES_PER_INVESTIGATION}-image limit per investigation.`
+    }
+    if (oversizedImage) {
+      return `${oversizedImage.displayPath} exceeds the ${formatBytes(MAX_OCR_IMAGE_BYTES)} per-image limit.`
+    }
+    return ''
+  }, [tooManyFiles, tooManyImages, oversizedImage, files.length, imageCount])
 
   const handleScanningChange = useCallback((scanning) => {
     selectionScanningRef.current = scanning
@@ -148,6 +178,10 @@ export default function NewInvestigationPage({ onUploaded }) {
       setErrorMessage('Selected diagnostics exceed the 1 GiB combined upload limit.')
       return
     }
+    if (selectionLimitReason) {
+      setErrorMessage(selectionLimitReason)
+      return
+    }
 
     const repositoryUrl = githubUrl.trim()
     if (repositoryUrl && !GITHUB_REPOSITORY_URL.test(repositoryUrl)) {
@@ -213,6 +247,9 @@ export default function NewInvestigationPage({ onUploaded }) {
           Selected diagnostics total {formatBytes(totalBytes)} and exceed the 1 GiB limit.
         </div>
       )}
+      {!diagnosticsTooLarge && selectionLimitReason && (
+        <div className="alert-error" role="alert">{selectionLimitReason}</div>
+      )}
       {errorMessage && <div className="alert-error" role="alert">{errorMessage}</div>}
       {uploadState === 'uploading' && (
         <div className="upload-status" role="status">
@@ -229,7 +266,12 @@ export default function NewInvestigationPage({ onUploaded }) {
           className="btn-primary"
           type="button"
           onClick={startInvestigation}
-          disabled={uploadState === 'uploading' || selectionScanning || diagnosticsTooLarge}
+          disabled={
+            uploadState === 'uploading'
+            || selectionScanning
+            || diagnosticsTooLarge
+            || Boolean(selectionLimitReason)
+          }
         >
           {uploadState === 'uploading'
             ? 'Uploading…'

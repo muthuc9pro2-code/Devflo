@@ -8,6 +8,9 @@ RapidOCR didn't actually score, no fabricated confidence on non-image
 evidence.
 """
 from datetime import datetime, timezone
+from io import BytesIO
+
+from PIL import Image
 
 from app.models.evidence import Evidence
 from app.services import diagnostic_adapters, evidence_store, image_text_extractor
@@ -20,6 +23,18 @@ from app.services.investigation_context import (
     build_simple_llm_context,
     build_simple_payload,
 )
+
+
+def _write_tiny_png(path):
+    """A real, tiny, decodable image on disk - item 1's shared
+    validate_ocr_image() now runs inside _run_ocr() itself (defense in
+    depth) before any mocked/real RapidOCR call, so tests exercising
+    _run_ocr()/extract_text_from_image[_with_confidence] need a genuine
+    file at the given path rather than an arbitrary placeholder string."""
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
+    path.write_bytes(buffer.getvalue())
+    return str(path)
 
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
@@ -44,45 +59,49 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
 # --- image_text_extractor: real RapidOCR confidence, mean-of-lines, no fabrication --
 
 
-def test_extract_with_confidence_reuses_the_same_ocr_call_and_returns_mean_confidence(monkeypatch):
+def test_extract_with_confidence_reuses_the_same_ocr_call_and_returns_mean_confidence(monkeypatch, tmp_path):
     fake_results = [
         (None, "ERROR something failed", 0.95),
         (None, "  at handler (App.tsx:42)", 0.61),
         (None, "   ", 0.99),  # blank text after strip -> excluded, like extract_text_from_image already does
     ]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
+    image_path = _write_tiny_png(tmp_path / "shot.png")
 
-    text, confidence = image_text_extractor.extract_text_from_image_with_confidence("shot.png")
+    text, confidence = image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
     assert text == "ERROR something failed\nat handler (App.tsx:42)"
     # mean of the two retained lines' confidences (0.95, 0.61), not min/max/fabricated
     assert confidence == (0.95 + 0.61) / 2
 
 
-def test_extract_text_from_image_output_is_unchanged_by_the_new_function(monkeypatch):
+def test_extract_text_from_image_output_is_unchanged_by_the_new_function(monkeypatch, tmp_path):
     """Backward compatibility: the pre-existing plain-text function must
     return byte-identical output to before this change."""
     fake_results = [(None, "line one", 0.9), (None, "line two", 0.5)]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
+    image_path = _write_tiny_png(tmp_path / "shot.png")
 
-    assert image_text_extractor.extract_text_from_image("shot.png") == "line one\nline two"
+    assert image_text_extractor.extract_text_from_image(image_path) == "line one\nline two"
 
 
-def test_no_usable_confidence_returns_none_not_fabricated(monkeypatch):
+def test_no_usable_confidence_returns_none_not_fabricated(monkeypatch, tmp_path):
     # RapidOCR result tuples without a third (confidence) element.
     fake_results = [(None, "some text")]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
+    image_path = _write_tiny_png(tmp_path / "shot.png")
 
-    text, confidence = image_text_extractor.extract_text_from_image_with_confidence("shot.png")
+    text, confidence = image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
     assert text == "some text"
     assert confidence is None
 
 
-def test_no_ocr_results_at_all_returns_empty_text_and_none_confidence(monkeypatch):
+def test_no_ocr_results_at_all_returns_empty_text_and_none_confidence(monkeypatch, tmp_path):
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: ([], None))
+    image_path = _write_tiny_png(tmp_path / "shot.png")
 
-    text, confidence = image_text_extractor.extract_text_from_image_with_confidence("shot.png")
+    text, confidence = image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
     assert text == ""
     assert confidence is None

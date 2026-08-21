@@ -47,6 +47,7 @@ from app.services.investigation_context import (
     build_simple_payload,
     build_zero_evidence_payload,
     select_bounded_evidence_from_db,
+    select_evidence_counts_by_artifact,
 )
 from app.services.analysis_events import (
     publish_artifact_outcome,
@@ -482,25 +483,61 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
             return
 
-        investigation_path = choose_investigation_path(
-            db=db,
-            analysis_id=analysis_id,
+        # Section 4 (final hardening pass): persist identities once, then
+        # select ONE bounded working Evidence set from MySQL - used
+        # identically for routing, correlation (CORRELATED), and the
+        # frontend/Gemini payload (SIMPLE), so route/graph/payload can
+        # never silently disagree about which Evidence this investigation
+        # actually covers. Never a second, unbounded Evidence .all() in
+        # either branch below. Below CORRELATED_MAX_EVIDENCE_RECORDS
+        # (== SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS) this is exactly one
+        # query, identical to before. Evidence itself remains fully
+        # persisted in MySQL either way; this only bounds what one
+        # investigation response has to build and transmit.
+        identity_start = perf_counter()
+        persist_resolved_identities(db=db, analysis_id=analysis_id)
+        logger.info("Analysis %s | evidence identities resolved", analysis_id)
+        logger.info(
+            "Analysis %s | identity resolution completed in %.2fs",
+            analysis_id,
+            perf_counter() - identity_start,
         )
+
+        evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
+            db,
+            analysis_id=analysis_id,
+            max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
+            max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
+        )
+        if total_evidence_count > len(evidence_rows):
+            logger.warning(
+                "Analysis %s | %s evidence rows exceed "
+                "CORRELATED_MAX_EVIDENCE_RECORDS (%s); using a "
+                "deterministically-selected bounded working set of %s",
+                analysis_id,
+                total_evidence_count,
+                CORRELATED_MAX_EVIDENCE_RECORDS,
+                len(evidence_rows),
+            )
+
+        # REAL per-artifact Evidence counts for the WHOLE analysis (Section
+        # 4 hardening) - the bounded working set above may not include
+        # every row from every artifact, so "how much Evidence does this
+        # artifact really have" (and, in each branch below, "does this
+        # artifact have any structured Evidence at all") must never be
+        # decided from that working subset alone. Bounded by
+        # MAX_DIAGNOSTIC_ARTIFACTS, so always safe to materialize.
+        evidence_counts_by_artifact = select_evidence_counts_by_artifact(
+            db, analysis_id=analysis_id
+        )
+
+        investigation_path = choose_investigation_path(evidence_rows)
         logger.info(
             "Analysis %s | investigation_path=%s",
             analysis_id,
             investigation_path.value,
         )
         if investigation_path == InvestigationPath.CORRELATED:
-            identity_start = perf_counter()
-            persist_resolved_identities(db=db, analysis_id=analysis_id)
-            logger.info("Analysis %s | evidence identities resolved", analysis_id)
-            logger.info(
-                "Analysis %s | identity resolution completed in %.2fs",
-                analysis_id,
-                perf_counter() - identity_start,
-            )
-
             publish_progress(
                 analysis_id,
                 "identity",
@@ -516,30 +553,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             )
 
             correlation_start = perf_counter()
-
-            # Section 4 (final hardening pass): genuinely end-to-end
-            # bounded selection - never materializes the whole Evidence
-            # result set into memory merely to truncate it afterward.
-            # Below CORRELATED_MAX_EVIDENCE_RECORDS this is exactly one
-            # query, identical to before. Evidence itself remains fully
-            # persisted in MySQL either way; this only bounds what one
-            # CORRELATED graph/SSE payload has to build and transmit.
-            evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
-                db,
-                analysis_id=analysis_id,
-                max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
-                max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
-            )
-            if total_evidence_count > len(evidence_rows):
-                logger.warning(
-                    "Analysis %s | %s evidence rows exceed "
-                    "CORRELATED_MAX_EVIDENCE_RECORDS (%s); correlating a "
-                    "deterministically-selected bounded subset of %s",
-                    analysis_id,
-                    total_evidence_count,
-                    CORRELATED_MAX_EVIDENCE_RECORDS,
-                    len(evidence_rows),
-                )
 
             correlation_run = run_correlation(
                 analysis_id=analysis_id,
@@ -571,7 +584,12 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             # not silently disappear just because OTHER artifacts in this
             # same analysis have real structured Evidence - it becomes
             # bounded, clearly-non-causal supplemental context instead.
-            artifact_ids_with_evidence = {evidence.artifact_id for evidence in evidence_rows}
+            # Section 4 hardening: membership comes from the REAL per-
+            # artifact map, not the bounded evidence_rows working set - an
+            # artifact whose Evidence exists in MySQL but did not survive
+            # the bounded selection must never be mislabeled as
+            # zero-structured-evidence supplemental context.
+            artifact_ids_with_evidence = set(evidence_counts_by_artifact.keys())
             supplemental_artifacts = [
                 artifact
                 for artifact in artifact_outcomes
@@ -582,6 +600,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 correlation_run,
                 evidence_rows,
                 artifacts=artifact_outcomes,
+                evidence_counts_by_artifact=evidence_counts_by_artifact,
                 total_evidence_count=total_evidence_count,
                 supplemental_artifacts=supplemental_artifacts,
             )
@@ -673,13 +692,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 correlation_payload,
             )
         else:
-            evidence_rows = (
-                db.query(Evidence)
-                .filter(Evidence.analysis_id == analysis_id)
-                .order_by(Evidence.first_seen, Evidence.id)
-                .all()
-            )
-
+            # Reuses the SAME bounded working set selected above (before
+            # routing) - never a second, unbounded Evidence .all() here.
             simple_artifacts = (
                 db.query(
                     AnalysisArtifact.id,
@@ -694,10 +708,10 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             )
 
             # Section 2: same low-structure-survives-a-mixed-investigation
-            # treatment as the CORRELATED branch above.
-            simple_artifact_ids_with_evidence = {
-                evidence.artifact_id for evidence in evidence_rows
-            }
+            # treatment as the CORRELATED branch above - membership from the
+            # REAL per-artifact map (Section 4 hardening), not the bounded
+            # evidence_rows working set.
+            simple_artifact_ids_with_evidence = set(evidence_counts_by_artifact.keys())
             simple_supplemental_artifacts = [
                 artifact
                 for artifact in simple_artifacts
@@ -708,6 +722,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             simple_payload = build_simple_payload(
                 analysis_id,
                 evidence_rows,
+                total_evidence_count=total_evidence_count,
+                evidence_counts_by_artifact=evidence_counts_by_artifact,
                 artifacts=simple_artifacts,
                 supplemental_artifacts=simple_supplemental_artifacts,
             )
@@ -1222,33 +1238,30 @@ def reconstruct_current_investigation_result(
             return payload
         return build_zero_evidence_payload(analysis_id, artifacts=artifacts)
 
-    investigation_path = choose_investigation_path(db=db, analysis_id=analysis_id)
-
-    # A cheap, bounded (O(distinct artifacts), never O(rows)) query rather
-    # than deriving this from a full evidence_rows fetch - keeps this
-    # legacy-reconnect path end-to-end bounded too (Section 4).
-    artifact_ids_with_evidence = {
-        row[0]
-        for row in (
-            db.query(Evidence.artifact_id)
-            .filter(Evidence.analysis_id == analysis_id)
-            .distinct()
-            .all()
-        )
-    }
+    # Section 4 hardening: this read/reconstruction path gets the same
+    # bounded-selection-before-route treatment as the live finalize path -
+    # ONE bounded working Evidence set, used identically for routing,
+    # correlation, and the SIMPLE payload (never a second, unbounded
+    # Evidence .all()). Pure read logic: never persists identities or
+    # mutates the historical analysis merely to reconstruct its view.
+    evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
+        db,
+        analysis_id=analysis_id,
+        max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
+        max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
+    )
+    legacy_evidence_counts_by_artifact = select_evidence_counts_by_artifact(
+        db, analysis_id=analysis_id
+    )
     legacy_supplemental_artifacts = [
         artifact
         for artifact in artifacts
-        if artifact.fallback_context and artifact.id not in artifact_ids_with_evidence
+        if artifact.fallback_context and artifact.id not in legacy_evidence_counts_by_artifact
     ]
 
+    investigation_path = choose_investigation_path(evidence_rows)
+
     if investigation_path == InvestigationPath.CORRELATED:
-        evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
-            db,
-            analysis_id=analysis_id,
-            max_records=CORRELATED_MAX_EVIDENCE_RECORDS,
-            max_context_bytes=CORRELATED_MAX_CONTEXT_BYTES,
-        )
         correlation_run = run_correlation(
             analysis_id=analysis_id,
             evidence_rows=evidence_rows,
@@ -1258,18 +1271,15 @@ def reconstruct_current_investigation_result(
             evidence_rows,
             artifacts=artifacts,
             total_evidence_count=total_evidence_count,
+            evidence_counts_by_artifact=legacy_evidence_counts_by_artifact,
             supplemental_artifacts=legacy_supplemental_artifacts,
         )
     else:
-        evidence_rows = (
-            db.query(Evidence)
-            .filter(Evidence.analysis_id == analysis_id)
-            .order_by(Evidence.first_seen, Evidence.id)
-            .all()
-        )
         payload = build_simple_payload(
             analysis_id,
             evidence_rows,
+            total_evidence_count=total_evidence_count,
+            evidence_counts_by_artifact=legacy_evidence_counts_by_artifact,
             artifacts=artifacts,
             supplemental_artifacts=legacy_supplemental_artifacts,
         )

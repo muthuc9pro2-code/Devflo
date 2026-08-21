@@ -9,8 +9,12 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_verified_user
 from app.core.processing_config import (
+    MAX_DIAGNOSTIC_ARTIFACTS,
     MAX_INVESTIGATION_UPLOAD_BYTES,
+    MAX_OCR_IMAGE_BYTES,
+    MAX_OCR_IMAGES_PER_INVESTIGATION,
     MAX_SOURCE_ARCHIVE_BYTES,
+    MEBIBYTE,
     UPLOAD_COPY_CHUNK_BYTES,
 )
 from app.crud.analysis import create_analysis
@@ -26,10 +30,18 @@ from app.services.source_archive import (
 )
 from app.services.upload_staging import UploadTooLarge, copy_upload
 from app.services.artifact_detector import (
+    ArtifactFormat,
+    SUPPORTED_IMAGE_MIME_TYPES,
+    SUPPORTED_IMAGE_SUFFIXES,
     detect_artifact_sample,
     is_supported_diagnostic_sample
 )
 from app.services.analysis_events import publish_artifact_outcome
+from app.services.image_text_extractor import (
+    InvalidOcrImageError,
+    OcrImageTooLargeError,
+    validate_ocr_image,
+)
 from app.services.investigation_context import build_artifact_outcome_payload
 from app.tasks.analysis import compute_current_analysis_state, process_analysis
 
@@ -62,6 +74,15 @@ def upload_file(
             detail="At least one diagnostic artifact is required",
         )
 
+    if len(uploads) > MAX_DIAGNOSTIC_ARTIFACTS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"At most {MAX_DIAGNOSTIC_ARTIFACTS} diagnostic artifacts "
+                "are supported per investigation"
+            ),
+        )
+
     github_url = (github_url or "").strip() or None
     if github_url and source_zip:
         raise HTTPException(
@@ -73,6 +94,7 @@ def upload_file(
     staged_paths: list[Path] = []
     artifact_rows: list[dict[str, object]] = []
     total_bytes = 0
+    image_count = 0
     source_kind = source_reference = None
 
     try:
@@ -99,11 +121,32 @@ def upload_file(
             storage_filename = _safe_storage_filename(original_filename)
             saved_path = UPLOAD_DIR / (f"{upload_group}_{position}_{storage_filename}")
             staged_paths.append(saved_path)
+
+            # MIME/extension is only an early resource hint here - a normal
+            # 50 MiB PNG should not first be fully written to disk before
+            # being rejected. The artifact detector below remains the
+            # authoritative format decision, and a disguised image that
+            # slips past this hint is still caught by the real
+            # size/pixel validation (validate_ocr_image) once
+            # detect_artifact_sample() confirms IMAGE.
+            looks_like_image = (
+                Path(original_filename).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+                or (upload.content_type or "").split(";", 1)[0].strip().lower()
+                in SUPPORTED_IMAGE_MIME_TYPES
+            )
+            remaining_combined_budget = MAX_INVESTIGATION_UPLOAD_BYTES - total_bytes
+            if looks_like_image and MAX_OCR_IMAGE_BYTES < remaining_combined_budget:
+                copy_max_bytes = MAX_OCR_IMAGE_BYTES
+                copy_detail = f"Image exceeds the {MAX_OCR_IMAGE_BYTES // MEBIBYTE} MiB per-image limit"
+            else:
+                copy_max_bytes = remaining_combined_budget
+                copy_detail = "Combined diagnostic upload exceeds 1 GiB"
+
             artifact_size, sample, content_sha256 = copy_upload(
                 upload,
                 saved_path,
-                MAX_INVESTIGATION_UPLOAD_BYTES - total_bytes,
-                "Combined diagnostic upload exceeds 1 GiB",
+                copy_max_bytes,
+                copy_detail,
                 UPLOAD_COPY_CHUNK_BYTES,
             )
             total_bytes += artifact_size
@@ -139,6 +182,31 @@ def upload_file(
                 filename=original_filename,
                 mime_type=upload.content_type,
             )
+
+            if artifact_format == ArtifactFormat.IMAGE:
+                image_count += 1
+                if image_count > MAX_OCR_IMAGES_PER_INVESTIGATION:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"At most {MAX_OCR_IMAGES_PER_INVESTIGATION} images "
+                            "are supported per investigation"
+                        ),
+                    )
+
+                # Real size/pixel validation against the file actually
+                # staged on disk - the same shared validator every OCR call
+                # runs (image_text_extractor._run_ocr), so even a disguised
+                # image that escaped the early filename/MIME hint above
+                # cannot reach OCR unvalidated. A resource-invalid image is
+                # an invalid investigation input, not zero-evidence
+                # "unsupported" evidence - the whole request is rejected.
+                try:
+                    validate_ocr_image(saved_path)
+                except OcrImageTooLargeError as error:
+                    raise HTTPException(status_code=413, detail=str(error)) from error
+                except InvalidOcrImageError as error:
+                    raise HTTPException(status_code=415, detail=str(error)) from error
 
             artifact_rows.append(
                 {

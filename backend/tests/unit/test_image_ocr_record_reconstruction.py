@@ -15,9 +15,12 @@ and gated for importance independently - not a second/parallel evidence
 model, the same one every other format already goes through.
 """
 import json
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+from PIL import Image
 
 from app.services import diagnostic_adapters, image_text_extractor
 from app.services.artifact_detector import ArtifactFormat
@@ -389,7 +392,13 @@ def test_ocr_runs_at_most_once_per_uploaded_image(monkeypatch, tmp_path):
     monkeypatch.setattr(analysis_task, "publish_artifact_outcome", lambda *a, **k: None)
 
     image_path = tmp_path / "shot.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    # A real, tiny, decodable image - item 1's shared validate_ocr_image()
+    # now runs inside _run_ocr() itself (defense in depth) before this
+    # mocked _ocr call, so a placeholder PNG-magic-bytes-only file (which
+    # the old suffix-only check accepted) no longer decodes.
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
+    image_path.write_bytes(buffer.getvalue())
 
     db = Mock()
     db.query.return_value.filter.return_value.scalar.return_value = 1
