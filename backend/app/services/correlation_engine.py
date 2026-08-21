@@ -388,6 +388,25 @@ class CorrelationIndexes:
     resolved_identities: dict[str, list[Evidence]] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class CorrelationPreparation:
+    """One prepared correlation pass shared by routing and graph building.
+
+    Building relationships is the expensive candidate traversal.  The
+    finalizer prepares it once, the router only asks whether any genuine
+    relationship exists, and run_correlation() consumes the exact same
+    directed/association lists instead of rescanning candidates.
+    """
+
+    indexes: CorrelationIndexes
+    directed_edges: list[CorrelationEdge]
+    associations: list[CorrelationEdge]
+
+    @property
+    def has_relationships(self) -> bool:
+        return bool(self.directed_edges or self.associations)
+
+
 def _append_index(
     index: dict[str, list[Evidence]],
     key: str | None,
@@ -914,6 +933,27 @@ def build_correlation_edges(
         resolve_pair(source, target)
 
     return directed_edges, associations
+
+
+def prepare_correlation(
+    evidence_rows: list[Evidence],
+    *,
+    indexes: CorrelationIndexes | None = None,
+) -> CorrelationPreparation:
+    """Build indexes and resolve candidate relationships exactly once."""
+    if indexes is None:
+        indexes = build_correlation_indexes(evidence_rows)
+
+    directed_edges, associations = build_correlation_edges(
+        evidence_rows,
+        indexes,
+    )
+    return CorrelationPreparation(
+        indexes=indexes,
+        directed_edges=directed_edges,
+        associations=associations,
+    )
+
 
 def build_correlation_nodes(
     evidence_rows: list[Evidence],
@@ -1571,7 +1611,11 @@ def temporal_score(
 
     return 1.0 / (1.0 + (delta_ms / decay_ms))
 
-def has_genuine_correlatable_structure(evidence_rows: list[Evidence]) -> bool:
+def has_genuine_correlatable_structure(
+    evidence_rows: list[Evidence],
+    *,
+    indexes: CorrelationIndexes | None = None,
+) -> bool:
     """Early-exit yes/no check reusing the EXACT relationship semantics
     build_correlation_edges uses (parent-span, identity-candidate, and
     bounded temporal+structural matching) - so investigation routing can
@@ -1582,7 +1626,8 @@ def has_genuine_correlatable_structure(evidence_rows: list[Evidence]) -> bool:
     if len(evidence_rows) <= 1:
         return False
 
-    indexes = build_correlation_indexes(evidence_rows)
+    if indexes is None:
+        indexes = build_correlation_indexes(evidence_rows)
 
     for child in evidence_rows:
         if find_parent_span_candidate(child, indexes) is not None:
@@ -1604,6 +1649,9 @@ def has_genuine_correlatable_structure(evidence_rows: list[Evidence]) -> bool:
 def run_correlation(
     analysis_id: int,
     evidence_rows: list[Evidence],
+    *,
+    indexes: CorrelationIndexes | None = None,
+    preparation: CorrelationPreparation | None = None,
 ) -> CorrelationRun:
     total_start = perf_counter()
 
@@ -1612,16 +1660,28 @@ def run_correlation(
         for evidence in evidence_rows
     }
 
+    # Normal finalization passes a CorrelationPreparation that routing has
+    # already inspected, so candidate generation/scoring is not repeated.
+    # The indexes-only path remains for compatibility with direct callers;
+    # callers that pass neither still get the original self-contained API.
     index_start = perf_counter()
-    indexes = build_correlation_indexes(evidence_rows)
-    index_seconds = perf_counter() - index_start
+    if preparation is None:
+        if indexes is None:
+            indexes = build_correlation_indexes(evidence_rows)
+        index_seconds = perf_counter() - index_start
 
-    edge_start = perf_counter()
-    edges, associations = build_correlation_edges(
-        evidence_rows,
-        indexes,
-    )
-    edge_seconds = perf_counter() - edge_start
+        edge_start = perf_counter()
+        edges, associations = build_correlation_edges(
+            evidence_rows,
+            indexes,
+        )
+        edge_seconds = perf_counter() - edge_start
+    else:
+        indexes = preparation.indexes
+        index_seconds = 0.0
+        edges = preparation.directed_edges
+        associations = preparation.associations
+        edge_seconds = 0.0
 
     dag_start = perf_counter()
     # enforce_dag only makes sense for directed edges - associations are

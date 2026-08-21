@@ -1415,7 +1415,114 @@ def build_llm_context(
             "itself already establishes the connection."
         )
 
+    _enforce_correlated_context_byte_budget(context)
     return context
+
+
+def _largest_prefix_that_fits(
+    context: dict[str, Any],
+    items: list[Any],
+    assign_prefix,
+) -> bool:
+    """Keep the largest deterministic prefix that fits the hard Gemini budget.
+
+    Returns True when the list had to be shortened. Whole-context JSON size is
+    measured on every probe, so the configured byte cap applies to what is
+    actually sent rather than to an isolated component fragment.
+    """
+    if not items:
+        return False
+
+    assign_prefix([])
+    if _context_size_bytes(context) > CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+        return True
+
+    low = 0
+    high = len(items)
+    while low < high:
+        mid = (low + high + 1) // 2
+        assign_prefix(items[:mid])
+        if _context_size_bytes(context) <= CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+            low = mid
+        else:
+            high = mid - 1
+
+    assign_prefix(items[:low])
+    return low < len(items)
+
+
+def _enforce_correlated_context_byte_budget(context: dict[str, Any]) -> None:
+    """Mutate a correlated Gemini context until the serialized payload fits.
+
+    Trimming order preserves the most valuable deterministic material: drop
+    non-directional associations first, then excess propagation edges, then
+    supplemental low-structure text/artifact summaries, and root evidence last.
+    Every retained list is a stable prefix of the already-deterministic ordering.
+    """
+    if _context_size_bytes(context) <= CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+        return
+
+    context["context_truncated"] = True
+    component = context.get("components", [None])[0] if context.get("components") else None
+
+    if component is not None:
+        associations = list(component.get("associations", []))
+        _largest_prefix_that_fits(
+            context,
+            associations,
+            lambda prefix: component.__setitem__("associations", prefix),
+        )
+        if _context_size_bytes(context) <= CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+            return
+
+        propagation = list(component.get("propagation", []))
+        _largest_prefix_that_fits(
+            context,
+            propagation,
+            lambda prefix: component.__setitem__("propagation", prefix),
+        )
+
+    for key in ("supplemental_low_structure_context", "artifacts"):
+        if _context_size_bytes(context) <= CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+            break
+        items = list(context.get(key, []))
+        _largest_prefix_that_fits(
+            context,
+            items,
+            lambda prefix, key=key: context.__setitem__(key, prefix),
+        )
+
+    if (
+        _context_size_bytes(context) > CORRELATED_GEMINI_CONTEXT_MAX_BYTES
+        and component is not None
+    ):
+        root_evidence = list(component.get("root_evidence", []))
+        _largest_prefix_that_fits(
+            context,
+            root_evidence,
+            lambda prefix: component.__setitem__("root_evidence", prefix),
+        )
+
+    # Relationship wording must describe the payload Gemini actually receives,
+    # not directed edges that were omitted solely to satisfy the hard byte cap.
+    has_directed_relationships = any(
+        component_dict.get("propagation")
+        for component_dict in context.get("components", [])
+    )
+    context["has_directed_relationships"] = has_directed_relationships
+    if not has_directed_relationships:
+        context["causal_language_instruction"] = (
+            "has_directed_relationships is false: the included context contains "
+            "no explicit_parent_child or inferred_propagation edge. Do not use "
+            "causal/directional wording; describe retained relationships as "
+            "associated/co-occurring unless direction is explicitly present."
+        )
+
+    # A deliberately tiny configured/test budget can be smaller than the
+    # irreducible primary-component envelope itself. Preserve that one primary
+    # component rather than turning a valid deterministic investigation into a
+    # failure. With the production 3 MiB budget, dense variable-size material
+    # above has already been trimmed against the serialized whole-context size.
 
 
 def _evidence_payload(evidence: Evidence) -> dict[str, Any]:

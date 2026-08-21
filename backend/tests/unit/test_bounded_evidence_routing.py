@@ -161,15 +161,17 @@ def test_route_and_correlation_receive_the_exact_same_evidence_ids(monkeypatch):
     captured = {}
     real_route = analysis_task.choose_investigation_path
 
-    def spy_route(evidence_rows):
+    def spy_route(evidence_rows, **kwargs):
         captured["route_ids"] = {e.id for e in evidence_rows}
-        return real_route(evidence_rows)
+        captured["preparation"] = kwargs.get("preparation")
+        return real_route(evidence_rows, **kwargs)
 
     real_correlate = analysis_task.run_correlation
 
-    def spy_correlate(*, analysis_id, evidence_rows):
+    def spy_correlate(*, analysis_id, evidence_rows, **kwargs):
         captured["correlate_ids"] = {e.id for e in evidence_rows}
-        return real_correlate(analysis_id=analysis_id, evidence_rows=evidence_rows)
+        captured["correlate_preparation"] = kwargs.get("preparation")
+        return real_correlate(analysis_id=analysis_id, evidence_rows=evidence_rows, **kwargs)
 
     monkeypatch.setattr(analysis_task, "choose_investigation_path", spy_route)
     monkeypatch.setattr(analysis_task, "run_correlation", spy_correlate)
@@ -178,6 +180,7 @@ def test_route_and_correlation_receive_the_exact_same_evidence_ids(monkeypatch):
 
     assert captured["route_ids"]
     assert captured["route_ids"] == captured["correlate_ids"]
+    assert captured["preparation"] is captured["correlate_preparation"]
 
 
 # --- 6: real total evidence_count survives truncation (CORRELATED) --------

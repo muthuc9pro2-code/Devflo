@@ -36,7 +36,7 @@ from app.services.image_text_extractor import extract_text_from_image_with_confi
 from app.services.source_archive import cleanup_prepared_source, prepare_source
 from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
-from app.services.correlation_engine import run_correlation
+from app.services.correlation_engine import prepare_correlation, run_correlation
 from app.services.investigation_context import (
     build_artifact_outcome_payload,
     build_correlation_payload,
@@ -558,7 +558,11 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             db, analysis_id=analysis_id
         )
 
-        investigation_path = choose_investigation_path(evidence_rows)
+        correlation_preparation = prepare_correlation(evidence_rows)
+        investigation_path = choose_investigation_path(
+            evidence_rows,
+            preparation=correlation_preparation,
+        )
         logger.info(
             "Analysis %s | investigation_path=%s",
             analysis_id,
@@ -584,6 +588,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             correlation_run = run_correlation(
                 analysis_id=analysis_id,
                 evidence_rows=evidence_rows,
+                preparation=correlation_preparation,
             )
 
             # Per-artifact outcome for the frontend (including artifacts that
@@ -879,6 +884,11 @@ def _process_artifact(
 
     parsed_count = 0
     last_published_progress = -1
+    # Progress is authoritative only when _publish_ingestion_progress() runs.
+    # Use this artifact's known size solely as a local throttle so we do not
+    # issue a global SUM query after every parser batch.
+    progress_query_step = _progress_query_step_bytes(artifact.size_bytes)
+    last_progress_query_offset = artifact.processed_bytes
 
     if artifact_format == ArtifactFormat.IMAGE:
         # OCR still runs exactly once per image: this SAME extraction
@@ -924,7 +934,22 @@ def _process_artifact(
             batch=batch,
             source_index=source_index,
         )
-        last_published_progress = _publish_ingestion_progress(
+        if (
+            artifact.processed_bytes - last_progress_query_offset >= progress_query_step
+            or artifact.processed_bytes >= artifact.size_bytes
+        ):
+            last_published_progress = _publish_ingestion_progress(
+                db=db,
+                analysis_id=analysis.id,
+                last_published=last_published_progress,
+            )
+            last_progress_query_offset = artifact.processed_bytes
+
+    # A tiny final batch may not cross the byte threshold. Refresh once at the
+    # terminal checkpoint so the global progress stream never depends on batch
+    # geometry.
+    if artifact.processed_bytes > last_progress_query_offset:
+        _publish_ingestion_progress(
             db=db,
             analysis_id=analysis.id,
             last_published=last_published_progress,
@@ -985,6 +1010,16 @@ def _ingestion_percentage(processed_bytes: int | None, total_bytes: int) -> int:
     drift apart. Caller is responsible for only calling this with a
     truthy total_bytes; this only computes the clamped ratio."""
     return min(98, max(0, int((processed_bytes or 0) * 100 // total_bytes)))
+
+
+def _progress_query_step_bytes(total_bytes: int) -> int:
+    """At most roughly 100 aggregate refreshes per active artifact task.
+
+    Small investigations retain responsive progress because the threshold can
+    fall below a normal batch size; large investigations stop issuing one SUM
+    query for every parser batch.
+    """
+    return max(1, total_bytes // 100)
 
 
 def _publish_ingestion_progress(
@@ -1290,12 +1325,17 @@ def reconstruct_current_investigation_result(
         if artifact.fallback_context and artifact.id not in legacy_evidence_counts_by_artifact
     ]
 
-    investigation_path = choose_investigation_path(evidence_rows)
+    correlation_preparation = prepare_correlation(evidence_rows)
+    investigation_path = choose_investigation_path(
+        evidence_rows,
+        preparation=correlation_preparation,
+    )
 
     if investigation_path == InvestigationPath.CORRELATED:
         correlation_run = run_correlation(
             analysis_id=analysis_id,
             evidence_rows=evidence_rows,
+            preparation=correlation_preparation,
         )
         payload = build_correlation_payload(
             correlation_run,

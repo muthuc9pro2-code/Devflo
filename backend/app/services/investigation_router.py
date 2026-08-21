@@ -1,6 +1,10 @@
 from enum import Enum
 from app.models.evidence import Evidence
-from app.services.correlation_engine import has_genuine_correlatable_structure
+from app.services.correlation_engine import (
+    CorrelationIndexes,
+    CorrelationPreparation,
+    has_genuine_correlatable_structure,
+)
 
 
 class InvestigationPath(str, Enum):
@@ -10,32 +14,25 @@ class InvestigationPath(str, Enum):
 
 def choose_investigation_path(
     evidence_rows: list[Evidence],
+    *,
+    indexes: CorrelationIndexes | None = None,
+    preparation: CorrelationPreparation | None = None,
 ) -> InvestigationPath:
-    """CORRELATED is chosen only when has_genuine_correlatable_structure()
-    (correlation_engine.py) finds at least one real relationship - the
-    SAME relationship semantics build_correlation_edges itself uses, never
-    a second, independently-drifting heuristic here.
+    """Choose SIMPLE/CORRELATED from the same correlation semantics.
 
-    A thin policy wrapper only: no DB query of its own. The caller
-    (_finalize_analysis_task) selects ONE bounded working Evidence set
-    (select_bounded_evidence_from_db) before routing, and routing decides
-    from exactly that same set - never a separate, unbounded materialize
-    merely to route (Section 4 hardening).
-
-    Two previous router-only signals were removed as unsound:
-      - a shared correlation_key: that hash is generated from sentinel
-        placeholders ("__none__") whenever trace_id/request_id/span_id are
-        ALL missing, so every untraced evidence row in an analysis shares
-        the identical hash regardless of whether they are actually
-        related - a persistence/dedup grouping key, never trustworthy
-        incident identity.
-      - "this row has both span_id and parent_span_id set": that only
-        proves the row itself looks like a child span: it says nothing
-        about whether the actual PARENT row (matching span_id, compatible
-        trace) exists at all. has_genuine_correlatable_structure() instead
-        calls find_parent_span_candidate(), which verifies a real match.
+    The production finalizer passes a fully prepared relationship set, so
+    routing is O(1) and run_correlation() can reuse that exact set without a
+    second candidate traversal.  The indexes/evidence fallback is retained
+    for compatibility with direct callers and focused tests.
     """
-    if has_genuine_correlatable_structure(evidence_rows):
+    if preparation is not None:
+        return (
+            InvestigationPath.CORRELATED
+            if preparation.has_relationships
+            else InvestigationPath.SIMPLE
+        )
+
+    if has_genuine_correlatable_structure(evidence_rows, indexes=indexes):
         return InvestigationPath.CORRELATED
 
     return InvestigationPath.SIMPLE
