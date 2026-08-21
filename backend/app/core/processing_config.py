@@ -111,7 +111,7 @@ MAX_SOURCE_CONTEXT_FILE_BYTES = 5 * MEBIBYTE
 # don't re-read/re-split it from disk each time. Bounded, not evicted.
 SOURCE_CONTEXT_CACHE_BYTES = 32 * MEBIBYTE
 SOURCE_CONTEXT_LINES = 15
-GITHUB_CLONE_TIMEOUT_SECONDS = 30
+GITHUB_CLONE_TIMEOUT_SECONDS = 60
 
 # Bounded per-event budget for structured JSON fields that are real,
 # diagnostically useful, but not one of the ~20 canonical fields Devflo

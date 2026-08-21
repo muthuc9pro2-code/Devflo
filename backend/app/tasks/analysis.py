@@ -33,7 +33,7 @@ from app.services.fallback_context import (
     capture_text_fallback_context,
 )
 from app.services.image_text_extractor import extract_text_from_image_with_confidence
-from app.services.source_archive import prepare_source
+from app.services.source_archive import cleanup_prepared_source, prepare_source
 from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
 from app.services.correlation_engine import run_correlation
@@ -308,6 +308,33 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 incomplete.status,
             )
             return
+
+        # Section 9: every artifact task that could ever use the physical
+        # prepared source tree (to correlate stack frames and persist
+        # source_matches into Evidence) has now finished - the tree itself
+        # is no longer needed for anything below, including a later
+        # reconstruction from persisted Evidence/result_snapshot. Removed
+        # once, here, before the remaining correlation/Gemini work, not
+        # earlier (artifact tasks still in flight need the real files) and
+        # not deferred until after this run (this IS the one point every
+        # outcome below - zero-evidence, SIMPLE, CORRELATED - passes
+        # through). Best-effort: a failure to delete temporary files must
+        # never turn an otherwise-successful investigation into a failed
+        # one. Also drops this worker process's own SourceIndex cache
+        # entry (if any) for this now-complete analysis - other worker
+        # processes may still hold a stale entry, but there are no
+        # legitimate future artifact tasks left to reuse it, and the
+        # existing bounded cache naturally evicts it eventually; no IPC.
+        if analysis.source_kind:
+            _source_index_process_cache.pop(analysis_id, None)
+            try:
+                cleanup_prepared_source(analysis_id)
+            except OSError:
+                logger.warning(
+                    "Analysis %s | could not clean up prepared source",
+                    analysis_id,
+                    exc_info=True,
+                )
 
         total_start = perf_counter()
         parsed_event_count = sum(results) if results else 0
@@ -634,6 +661,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             llm_context = build_llm_context(
                 correlation_run,
                 evidence_rows,
+                total_evidence_count=total_evidence_count,
+                evidence_counts_by_artifact=evidence_counts_by_artifact,
                 artifacts=artifact_outcomes,
                 supplemental_artifacts=supplemental_artifacts,
             )
@@ -734,6 +763,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             simple_llm_context = build_simple_llm_context(
                 analysis_id,
                 evidence_rows,
+                total_evidence_count=total_evidence_count,
+                evidence_counts_by_artifact=evidence_counts_by_artifact,
                 artifacts=simple_artifacts,
                 supplemental_artifacts=simple_supplemental_artifacts,
             )

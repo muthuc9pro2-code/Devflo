@@ -14,6 +14,7 @@ from app.api.dependencies import get_current_verified_user_id_for_stream
 from app.db.database import sessionLocal
 from app.models.analysis import Analysis
 from app.tasks.analysis import compute_current_analysis_state
+from starlette.concurrency import run_in_threadpool
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,38 @@ def _sse_event(event: str, data: dict) -> str:
         f"data: {json.dumps(data, separators=(',', ':'), default=str)}\n\n"
     )
 
+def _load_analysis_state(
+    analysis_id: int,
+) -> dict | None:
+    with sessionLocal() as db:
+        analysis = (
+            db.query(Analysis)
+            .filter(Analysis.id == analysis_id)
+            .first()
+        )
+
+        if analysis is None:
+            return None
+
+        return compute_current_analysis_state(
+            db,
+            analysis,
+        )
+
+def _analysis_owned_by_user(
+    analysis_id: int,
+    user_id: int,
+) -> bool:
+    with sessionLocal() as db:
+        return (
+            db.query(Analysis.id)
+            .filter(
+                Analysis.id == analysis_id,
+                Analysis.user_id == user_id,
+            )
+            .first()
+            is not None
+        )
 
 async def _analysis_event_stream(analysis_id: int):
     """No DB Session or Analysis ORM object is passed in - both are only
@@ -73,22 +106,27 @@ async def _analysis_event_stream(analysis_id: int):
                 analysis_id,
                 exc_info=True,
             )
-            with sessionLocal() as db:
-                analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-                if analysis is None:
-                    return
-                initial_state = compute_current_analysis_state(db, analysis)
+            initial_state = await run_in_threadpool(
+                _load_analysis_state,
+                analysis_id,
+            )
+
+            if initial_state is None:
+                return
+
             yield _sse_event("state", initial_state)
             return
 
         # The DB Session below is scoped to this `with` block only - it is
         # already closed by the time the generator starts waiting for
         # future Redis messages further down.
-        with sessionLocal() as db:
-            analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-            if analysis is None:
-                return
-            initial_state = compute_current_analysis_state(db, analysis)
+        initial_state = await run_in_threadpool(
+            _load_analysis_state,
+            analysis_id,
+        )
+
+        if initial_state is None:
+            return
 
         yield _sse_event("state", initial_state)
 
@@ -186,15 +224,15 @@ async def _analysis_event_stream(analysis_id: int):
                     analysis_id,
                     exc_info=True,
                 )
-            try:
-                await pubsub.aclose()
-            except Exception:
-                logger.warning(
-                    "Redis pubsub close failed for analysis_id=%s",
-                    analysis_id,
-                    exc_info=True,
-                )
 
+        try:
+            await pubsub.aclose()
+        except Exception:
+            logger.warning(
+                "Redis pubsub close failed for analysis_id=%s",
+                analysis_id,
+                exc_info=True,
+            )
 
 @router.get(
     "/analyses/{analysis_id}/events",
@@ -206,17 +244,13 @@ async def stream_analysis_events(
 ) -> StreamingResponse:
     # Short-lived ownership check only - this Session is closed well
     # before the (potentially minutes-long) StreamingResponse begins.
-    with sessionLocal() as db:
-        owned_analysis = (
-            db.query(Analysis)
-            .filter(
-                Analysis.id == analysis_id,
-                Analysis.user_id == current_user_id,
-            )
-            .first()
-        )
+    is_owned = await run_in_threadpool(
+        _analysis_owned_by_user,
+        analysis_id,
+        current_user_id,
+    )
 
-    if owned_analysis is None:
+    if not is_owned:
         raise HTTPException(
             status_code=404,
             detail="Analysis not found",

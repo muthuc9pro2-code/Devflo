@@ -103,13 +103,13 @@ export default function HistorySidebar({
             return (
               <li key={item.analysis_id}>
                 <a
-                  href={`/analysis/${item.analysis_id}`}
+                  href={`/investigation/${item.analysis_id}`}
                   className={`history-item${isActive ? ' active' : ''}`}
                   aria-current={isActive ? 'page' : undefined}
                   title={title}
                   onClick={(event) => {
                     event.preventDefault()
-                    onNavigate(`/analysis/${item.analysis_id}`)
+                    onNavigate(`/investigation/${item.analysis_id}`)
                   }}
                 >
                   <span className="history-item-title">{title}</span>

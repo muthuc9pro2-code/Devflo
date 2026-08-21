@@ -58,6 +58,24 @@ _SIMPLE_LLM_SEVERITY_RANK = {
 }
 _DATETIME_MIN_UTC = datetime.min.replace(tzinfo=timezone.utc)
 
+def _normalized_evidence_time(value: datetime | None) -> datetime:
+    if value is None:
+        return _DATETIME_MIN_UTC
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def _evidence_chronological_key(
+    evidence: Evidence,
+) -> tuple[datetime, int]:
+    return (
+        _normalized_evidence_time(evidence.first_seen),
+        evidence.id,
+    )
+
 
 def _simple_llm_priority_key(evidence: Evidence) -> tuple:
     """Deterministic priority for SIMPLE-mode Gemini context selection -
@@ -259,12 +277,8 @@ def select_bounded_evidence_from_db(
             max_records=max_records,
             max_context_bytes=max_context_bytes,
         )
-        rows.sort(
-            key=lambda row: (
-                row.first_seen or _DATETIME_MIN_UTC,
-                row.id,
-            )
-        )
+        rows.sort(key=_evidence_chronological_key)
+
         return rows, total_count
 
     # Small, bounded (O(BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS), never
@@ -395,7 +409,7 @@ def select_bounded_evidence_from_db(
         selected.append(row)
         selected_bytes += size
 
-    selected.sort(key=lambda row: (row.first_seen or _DATETIME_MIN_UTC, row.id))
+    selected.sort(key=_evidence_chronological_key)
     return selected, total_count
 
 
@@ -998,6 +1012,8 @@ def build_simple_llm_context(
     analysis_id: int,
     evidence_rows: list[Evidence],
     *,
+    total_evidence_count: int | None = None,
+    evidence_counts_by_artifact: dict[int, int] | None = None,
     artifacts: list[Any] | None = None,
     supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -1005,8 +1021,24 @@ def build_simple_llm_context(
     # final frontend/database payload (build_simple_payload) still carries
     # every retained evidence row; only what reaches Gemini in one request
     # is capped.
+    real_total_evidence_count = (
+    total_evidence_count
+    if total_evidence_count is not None
+    else len(evidence_rows)
+)
+
+    real_evidence_counts_by_artifact = (
+        evidence_counts_by_artifact
+        if evidence_counts_by_artifact is not None
+        else _count_evidence_by_artifact(evidence_rows)
+    )
+
     selected_evidence = select_bounded_evidence(evidence_rows)
-    truncated = len(selected_evidence) < len(evidence_rows)
+
+    truncated = (
+        len(selected_evidence)
+        < real_total_evidence_count
+    )
 
     instruction = (
         "Explain the available diagnostic evidence and suggest "
@@ -1024,7 +1056,7 @@ def build_simple_llm_context(
         "analysis_id": analysis_id,
         "investigation_path": "simple",
         "instruction": instruction,
-        "evidence_count_total": len(evidence_rows),
+        "evidence_count_total": real_total_evidence_count,
         "evidence_count_included": len(selected_evidence),
         "evidence": [
             _evidence_payload(evidence)
@@ -1035,7 +1067,7 @@ def build_simple_llm_context(
     if artifacts is not None:
         context["artifacts"] = _artifacts_outcome_list(
             artifacts,
-            _count_evidence_by_artifact(evidence_rows),
+            real_evidence_counts_by_artifact,
         )
 
     if supplemental_artifacts:
@@ -1085,9 +1117,29 @@ def build_llm_context(
     *,
     roots_per_component: int = 3,
     max_additional_source_matched_evidence: int = 3,
+    total_evidence_count: int | None = None,
+    evidence_counts_by_artifact: dict[int, int] | None = None,
     artifacts: list[Any] | None = None,
     supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
+    real_total_evidence_count = (
+        total_evidence_count
+        if total_evidence_count is not None
+        else len(evidence_rows)
+    )
+
+    real_evidence_counts_by_artifact = (
+        evidence_counts_by_artifact
+        if evidence_counts_by_artifact is not None
+        else _count_evidence_by_artifact(evidence_rows)
+    )
+
+    working_evidence_count = len(evidence_rows)
+
+    working_set_truncated = (
+        real_total_evidence_count
+        > working_evidence_count
+    )
     evidence_by_id = {
         evidence.id: evidence
         for evidence in evidence_rows
@@ -1277,19 +1329,41 @@ def build_llm_context(
         component["propagation"] for component in components
     )
 
+    instruction = (
+        "Explain the deterministic findings and suggest "
+        "debugging/investigation steps. Do not invent evidence "
+        "or claim a definitive fix."
+    )
+
+    if working_set_truncated:
+        instruction += (
+            f" The deterministic correlation below was computed from "
+            f"a bounded working set of {working_evidence_count} out of "
+            f"{real_total_evidence_count} persisted Evidence records. "
+            "Do not assume omitted Evidence was absent, unrelated, "
+            "or non-diagnostic."
+        )
+
     context: dict[str, Any] = {
         "analysis_id": correlation_run.result.analysis_id,
         "investigation_path": "correlated",
-        "instruction": (
-            "Explain the deterministic findings and suggest "
-            "debugging/investigation steps. Do not invent evidence "
-            "or claim a definitive fix."
-        ),
+        "instruction": instruction,
         "has_directed_relationships": has_directed_relationships,
         "components": components,
         "component_count_total": total_component_count,
         "component_count_included": len(components),
     }
+
+    if total_evidence_count is not None:
+        context["evidence_count_total"] = (
+            real_total_evidence_count
+        )
+        context["evidence_count_in_working_set"] = (
+            working_evidence_count
+        )
+
+    if working_set_truncated:
+        context["evidence_working_set_truncated"] = True
 
     if context_truncated:
         # Never silently pretend the omitted component(s) do not exist.
@@ -1324,7 +1398,7 @@ def build_llm_context(
         # list, not a raw-line dump.
         context["artifacts"] = _artifacts_outcome_list(
             artifacts,
-            _count_evidence_by_artifact(evidence_rows),
+            real_evidence_counts_by_artifact,
         )
 
     if supplemental_artifacts:

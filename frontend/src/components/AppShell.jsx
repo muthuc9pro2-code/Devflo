@@ -151,7 +151,7 @@ export default function AppShell({ pathname, navigate }) {
     }
   }, [drawerOpen, isMobile])
 
-  const analysisMatch = pathname.match(/^\/analysis\/(\d+)\/?$/)
+  const analysisMatch = pathname.match(/^\/investigation\/(\d+)\/?$/)
   const analysisId = analysisMatch?.[1] || null
   const historyItem = useMemo(
     () => history.find((item) => Number(item.analysis_id) === Number(analysisId)) || null,
@@ -171,7 +171,7 @@ export default function AppShell({ pathname, navigate }) {
   }, [navigate])
 
   const handleUploaded = useCallback((analysis) => {
-    navigate(`/analysis/${analysis.id}`)
+    navigate(`/investigation/${analysis.id}`)
   }, [navigate])
 
   const handleSettled = useCallback(() => {
