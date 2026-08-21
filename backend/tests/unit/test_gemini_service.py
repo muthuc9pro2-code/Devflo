@@ -18,6 +18,19 @@ def _server_error(status_code=503):
         None,
     )
 
+
+def _client_error(status_code):
+    return genai_errors.ClientError(
+        status_code, {"message": "client error", "status": "ERROR"}, None
+    )
+
+
+def _mock_response(text=_MINIMAL_GEMINI_JSON):
+    mock_response = MagicMock()
+    mock_response.text = text
+    return mock_response
+
+
 def test_generate_investigation_explanation_returns_structured_response():
     gemini_json = """
     {
@@ -92,12 +105,9 @@ def test_generate_investigation_explanation_disables_automatic_function_calling(
     explicitly disabled rather than left at the SDK's default-enabled
     behavior (which otherwise logs an AFC warning and recommends
     Chat.send_message for no reason here)."""
-    mock_response = MagicMock()
-    mock_response.text = '{"title": "t", "summary": "s", "probable_root_causes": [], "what_happened": [], "source_code_findings": [], "recommended_actions": [], "uncertainties": []}'
-
     with patch(
         "app.services.gemini_service._client.models.generate_content",
-        return_value=mock_response,
+        return_value=_mock_response(),
     ) as generate_content:
         generate_investigation_explanation({"analysis_id": 1})
 
@@ -105,17 +115,18 @@ def test_generate_investigation_explanation_disables_automatic_function_calling(
     assert kwargs["config"].automatic_function_calling.disable is True
 
 
+# --- 1/2: 5xx (ServerError) retry policy --------------------------------
+
+
 def test_generate_investigation_explanation_retries_transient_server_error(monkeypatch):
     """A 503 ("high demand") is transient - a subsequent attempt within the
     bounded retry budget that succeeds must return the real result, not
     fail the caller."""
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
-    mock_response = MagicMock()
-    mock_response.text = _MINIMAL_GEMINI_JSON
 
     with patch(
         "app.services.gemini_service._client.models.generate_content",
-        side_effect=[_server_error(), mock_response],
+        side_effect=[_server_error(), _mock_response()],
     ) as generate_content:
         result = generate_investigation_explanation({"analysis_id": 1})
 
@@ -140,17 +151,169 @@ def test_generate_investigation_explanation_raises_unavailable_after_exhausting_
     assert generate_content.call_count == 3
 
 
-def test_generate_investigation_explanation_does_not_retry_client_error():
-    """A 4xx (bad request, auth, quota) is not transient - retrying it
-    cannot succeed, so it must propagate immediately rather than burn the
-    retry budget or be mistaken for a temporary-unavailability signal."""
-    client_error = genai_errors.ClientError(400, {"message": "bad request", "status": "INVALID_ARGUMENT"}, None)
+# --- 3/4: 429 (ClientError) is now retried, unlike other 4xx ------------
+
+
+def test_generate_investigation_explanation_retries_429_client_error(monkeypatch):
+    """429 (rate limiting) is a ClientError in google.genai, but it IS
+    transient - it must be retried like a 5xx, not treated as an ordinary
+    non-retryable 4xx."""
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
 
     with patch(
         "app.services.gemini_service._client.models.generate_content",
-        side_effect=client_error,
+        side_effect=[_client_error(429), _mock_response()],
     ) as generate_content:
-        with pytest.raises(genai_errors.ClientError):
+        result = generate_investigation_explanation({"analysis_id": 1})
+
+    assert isinstance(result, GeminiInvestigationResponse)
+    assert generate_content.call_count == 2
+
+
+def test_generate_investigation_explanation_raises_unavailable_after_exhausting_429_retries(monkeypatch):
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=[_client_error(429), _client_error(429), _client_error(429)],
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError):
+            generate_investigation_explanation({"analysis_id": 1})
+
+    assert generate_content.call_count == 3
+
+
+# --- 5/6: ordinary non-429 4xx is NOT retried, but IS converted ---------
+
+
+def test_generate_investigation_explanation_does_not_retry_400_but_raises_unavailable():
+    """A 400 (bad request) is not transient - retrying it cannot succeed,
+    so it must NOT burn the retry budget. But it must also never escape as
+    a raw SDK exception - the finalizer only catches GeminiUnavailableError,
+    so anything else would incorrectly fail an otherwise-complete
+    deterministic investigation."""
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=_client_error(400),
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError):
             generate_investigation_explanation({"analysis_id": 1})
 
     generate_content.assert_called_once()
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_generate_investigation_explanation_does_not_retry_auth_errors(status_code):
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=_client_error(status_code),
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError):
+            generate_investigation_explanation({"analysis_id": 1})
+
+    generate_content.assert_called_once()
+
+
+# --- 7/8: unexpected transport/SDK exceptions from generate_content ----
+
+
+def test_generate_investigation_explanation_retries_unexpected_transport_error(monkeypatch):
+    """A generic network/timeout/SDK exception (not a genai_errors type at
+    all) raised by the external generate_content(...) call must still be
+    bounded-retried, then converted - never left to propagate raw."""
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=[ConnectionError("connection reset"), ConnectionError("connection reset"), ConnectionError("connection reset")],
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError):
+            generate_investigation_explanation({"analysis_id": 1})
+
+    assert generate_content.call_count == 3
+
+
+def test_generate_investigation_explanation_transport_error_then_success(monkeypatch):
+    """A transport exception followed by a successful call within the
+    retry budget must return the real, valid result."""
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=[TimeoutError("timed out"), _mock_response()],
+    ) as generate_content:
+        result = generate_investigation_explanation({"analysis_id": 1})
+
+    assert isinstance(result, GeminiInvestigationResponse)
+    assert generate_content.call_count == 2
+
+
+# --- 9/10: response validation ------------------------------------------
+
+
+def test_malformed_json_response_raises_unavailable_not_retried(monkeypatch):
+    """A response body that isn't even valid JSON must not be retried in
+    this V1 - it converts straight to GeminiUnavailableError."""
+    sleep_calls = []
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(text="not valid json{{{"),
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError):
+            generate_investigation_explanation({"analysis_id": 1})
+
+    generate_content.assert_called_once()
+    assert sleep_calls == []
+
+
+def test_schema_invalid_json_response_raises_unavailable_not_retried(monkeypatch):
+    """Valid JSON that does not satisfy GeminiInvestigationResponse's
+    schema (e.g. missing required fields) must also convert to
+    GeminiUnavailableError without being retried, and without loosening
+    the schema or accepting a partial result."""
+    sleep_calls = []
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(text='{"title": "t"}'),
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError):
+            generate_investigation_explanation({"analysis_id": 1})
+
+    generate_content.assert_called_once()
+    assert sleep_calls == []
+
+
+# --- 11: successful valid response remains unchanged --------------------
+
+
+def test_successful_valid_response_returns_parsed_result_unchanged():
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        result = generate_investigation_explanation({"analysis_id": 1})
+
+    assert isinstance(result, GeminiInvestigationResponse)
+    assert result.title == "t"
+    assert result.summary == "s"
+    generate_content.assert_called_once()
+
+
+# --- 12: automatic function calling remains disabled (also covered above) -
+
+
+def test_automatic_function_calling_disabled_even_after_a_retry(monkeypatch):
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=[_server_error(), _mock_response()],
+    ) as generate_content:
+        generate_investigation_explanation({"analysis_id": 1})
+
+    _, kwargs = generate_content.call_args
+    assert kwargs["config"].automatic_function_calling.disable is True

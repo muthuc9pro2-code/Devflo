@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from redis import Redis
+from redis import asyncio as redis_asyncio
+from redis.exceptions import RedisError
 
+logger = logging.getLogger(__name__)
 
+_REDIS_URL = "redis://localhost:6379/0"
+
+# Synchronous client: used by normal request handlers and Celery worker code
+# (publishing is a fire-and-forget side effect of already-committed DB state,
+# never awaited from an async context).
 redis_client = Redis.from_url(
-    "redis://localhost:6379/0",
+    _REDIS_URL,
+    decode_responses=True,
+)
+
+# Separate async client: used ONLY by the FastAPI SSE subscriber
+# (analysis_stream.py). A sync Redis call from an async generator would
+# block the event loop for every other concurrent request this worker is
+# serving - this client exists purely to avoid that, not to change what is
+# published or how.
+async_redis_client = redis_asyncio.Redis.from_url(
+    _REDIS_URL,
     decode_responses=True,
 )
 
@@ -21,20 +40,37 @@ def publish_analysis_event(
     event: str,
     data: dict[str, Any],
 ) -> None:
+    """Best-effort live notification only. Devflo's deterministic result is
+    always persisted (result_snapshot + status="completed") BEFORE this is
+    ever called - see _finalize_analysis_task's persist-before-publish
+    ordering. So a Redis/transport failure here must never propagate: it
+    would otherwise turn an already-successful, already-persisted
+    deterministic result into a failed analysis for a reason that has
+    nothing to do with the computation itself. SSE is ephemeral - the
+    frontend's durable DB-backed reconnect path is what actually recovers
+    from this, not a retry here."""
     payload = {
         "analysis_id": analysis_id,
         "event": event,
         "data": data,
     }
 
-    redis_client.publish(
-        analysis_event_channel(analysis_id),
-        json.dumps(
-            payload,
-            separators=(",", ":"),
-            default=str,
-        ),
-    )
+    try:
+        redis_client.publish(
+            analysis_event_channel(analysis_id),
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    except RedisError:
+        logger.warning(
+            "Redis publish failed | analysis_id=%s | event=%s",
+            analysis_id,
+            event,
+            exc_info=True,
+        )
 
 
 def publish_progress(

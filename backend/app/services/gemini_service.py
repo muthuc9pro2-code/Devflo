@@ -1,6 +1,7 @@
 import json
 import logging
 from time import perf_counter, sleep
+from pydantic import ValidationError
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -9,21 +10,58 @@ from app.schemas.gemini import GeminiInvestigationResponse
 
 logger = logging.getLogger(__name__)
 
-# Bounded retry for transient Gemini server-side unavailability (e.g. the
-# "This model is currently experiencing high demand" 503). google.genai
-# raises errors.ServerError specifically for 5xx responses - a 4xx
-# ClientError (bad request, auth, quota) is never retried since retrying it
-# cannot succeed. 3 total attempts with a short linear backoff is enough to
-# ride out a brief outage without materially delaying finalize on a real one.
+# Bounded retry for transient Gemini/provider failures: 5xx (ServerError),
+# 429 (ClientError, rate limiting), and unexpected transport/SDK exceptions
+# raised by the external generate_content(...) call itself. An ordinary
+# non-429 4xx ClientError (bad request, auth, quota) is never retried since
+# retrying it cannot succeed - it is converted to GeminiUnavailableError
+# immediately instead. 3 total attempts with a short linear backoff is
+# enough to ride out a brief outage without materially delaying finalize on
+# a real one.
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 1.5
 
+_RETRYABLE_CLIENT_ERROR_STATUS_CODES = {429}
+
 
 class GeminiUnavailableError(RuntimeError):
-    """Gemini's explanation layer did not return a result after bounded
-    retries. Callers must treat this as "no explanation available", never
-    as a deterministic-pipeline failure - the caller's already-computed
-    deterministic result must still be persisted/completed."""
+    """Gemini's explanation layer did not return a usable result after
+    bounded retries (or hit a non-retryable failure). Callers must treat
+    this as "no explanation available", never as a deterministic-pipeline
+    failure - the caller's already-computed deterministic result must
+    still be persisted/completed. Raised for every expected Gemini/provider
+    failure mode: transient 5xx/429 exhausted after retry, a non-retryable
+    4xx, an unexpected transport/SDK exception from the external call, or a
+    malformed/schema-invalid response body."""
+
+
+def _client_error_status_code(exc: genai_errors.ClientError) -> int | None:
+    """google-genai's ClientError/APIError exposes the HTTP status as
+    `.code` (see errors.APIError.__init__) - `.status_code` is checked too
+    defensively, in case a differently-shaped exception (or a future SDK
+    version) surfaces it under that name instead."""
+    for attribute in ("code", "status_code"):
+        value = getattr(exc, attribute, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _log_retry_attempt(attempt: int, exc: Exception) -> None:
+    """Shared log+backoff for a bounded retry attempt that is NOT yet
+    exhausted - never raises. Each except clause below decides for itself
+    when the fixed _MAX_ATTEMPTS budget is exhausted and raises
+    GeminiUnavailableError directly, so that decision (and the resulting
+    `raise`) stays visible at each retryable-failure call site rather than
+    hidden behind a shared helper."""
+    logger.warning(
+        "Gemini request attempt %s/%s failed (%s); retrying in %.1fs",
+        attempt,
+        _MAX_ATTEMPTS,
+        exc,
+        _RETRY_BACKOFF_SECONDS * attempt,
+    )
+    sleep(_RETRY_BACKOFF_SECONDS * attempt)
 
 _SYSTEM_INSTRUCTION = """
 You are Devflo's AI debugging explanation layer.
@@ -70,8 +108,8 @@ Rules:
   propagating into the other - describe it only as corroborating/co-occurring
   evidence.
 - If a component's "propagation" list is empty (has_directed_relationships is
-  false or absent), that component has NO directed causal or inferred_propagation
-  path at all - only associations. In that case you MUST NOT use causal wording
+  false or absent), that component has NO explicit_parent_child or
+  inferred_propagation path at all - only associations. In that case you MUST NOT use causal wording
   such as "caused", "led to", "resulted in", "propagated to", "cascaded into", or
   any equivalent phrase implying direction/causation for that component. Use
   language such as "coincided with", "was associated with", "was observed
@@ -173,26 +211,58 @@ def generate_investigation_explanation(
                 config=config,
             )
             break
-        except genai_errors.ServerError as exc:
-            if attempt >= _MAX_ATTEMPTS:
+        except genai_errors.ClientError as exc:
+            status_code = _client_error_status_code(exc)
+            if status_code not in _RETRYABLE_CLIENT_ERROR_STATUS_CODES:
+                # An ordinary non-429 4xx (bad request, auth, quota) is not
+                # transient - retrying it cannot succeed. Converted
+                # immediately so it can never escape into the finalizer as
+                # a raw SDK exception.
                 logger.warning(
-                    "Gemini request unavailable after %s attempt(s): %s",
-                    attempt,
+                    "Gemini request failed with a non-retryable client "
+                    "error (status=%s): %s",
+                    status_code,
                     exc,
                 )
                 raise GeminiUnavailableError(str(exc)) from exc
-            logger.warning(
-                "Gemini request attempt %s/%s failed (%s); retrying in %.1fs",
-                attempt,
-                _MAX_ATTEMPTS,
-                exc,
-                _RETRY_BACKOFF_SECONDS * attempt,
-            )
-            sleep(_RETRY_BACKOFF_SECONDS * attempt)
+            if attempt >= _MAX_ATTEMPTS:
+                logger.warning(
+                    "Gemini request unavailable after %s attempt(s): %s", attempt, exc
+                )
+                raise GeminiUnavailableError(str(exc)) from exc
+            _log_retry_attempt(attempt, exc)
+        except genai_errors.ServerError as exc:
+            if attempt >= _MAX_ATTEMPTS:
+                logger.warning(
+                    "Gemini request unavailable after %s attempt(s): %s", attempt, exc
+                )
+                raise GeminiUnavailableError(str(exc)) from exc
+            _log_retry_attempt(attempt, exc)
+        except Exception as exc:
+            # Any other exception raised specifically by this external
+            # generate_content(...) call (network/timeout/SDK-internal) is
+            # contained here too: bounded retry, then GeminiUnavailableError
+            # if it still fails. Deliberately not BaseException -
+            # KeyboardInterrupt/SystemExit must still propagate normally.
+            if attempt >= _MAX_ATTEMPTS:
+                logger.warning(
+                    "Gemini request unavailable after %s attempt(s): %s", attempt, exc
+                )
+                raise GeminiUnavailableError(str(exc)) from exc
+            _log_retry_attempt(attempt, exc)
     api_call_seconds = perf_counter() - api_call_start
 
     processing_start = perf_counter()
-    result = GeminiInvestigationResponse.model_validate_json(response.text)
+    try:
+        result = GeminiInvestigationResponse.model_validate_json(response.text)
+    except ValidationError as exc:
+        # Malformed JSON and schema-invalid JSON both raise pydantic's
+        # ValidationError here (pydantic v2 wraps JSON decode failures into
+        # it too) - never retried in this V1, and never loosened into a
+        # partial/best-effort result: malformed AI output must not fail an
+        # otherwise-complete deterministic investigation.
+        logger.warning("Gemini response failed schema validation: %s", exc)
+        raise GeminiUnavailableError(str(exc)) from exc
     processing_seconds = perf_counter() - processing_start
 
     total_seconds = perf_counter() - stage_start

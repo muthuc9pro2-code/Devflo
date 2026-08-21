@@ -253,6 +253,18 @@ def select_bounded_evidence_from_db(
             .order_by(Evidence.first_seen, Evidence.id)
             .all()
         )
+
+        rows = select_bounded_evidence(
+            rows,
+            max_records=max_records,
+            max_context_bytes=max_context_bytes,
+        )
+        rows.sort(
+            key=lambda row: (
+                row.first_seen or _DATETIME_MIN_UTC,
+                row.id,
+            )
+        )
         return rows, total_count
 
     # Small, bounded (O(BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS), never
@@ -1286,7 +1298,7 @@ def build_llm_context(
     if not has_directed_relationships:
         context["causal_language_instruction"] = (
             "has_directed_relationships is false: none of the components "
-            "below contain a causal or inferred_propagation edge, only "
+            "below contain an explicit_parent_child or inferred_propagation edge, only "
             "associations. Do not use causal/directional wording (\"caused\", "
             "\"led to\", \"resulted in\", \"propagated to\", \"cascaded "
             "into\", or equivalents) anywhere in this response, even if the "

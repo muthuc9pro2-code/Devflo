@@ -11,6 +11,13 @@ _ALLOWED_IMAGE_EXTENSIONS = {
     ".webp",
 }
 
+_ALLOWED_PIL_FORMATS = {
+    "PNG",
+    "JPEG",
+    "WEBP",
+}
+
+
 
 class OcrImageError(Exception):
     """Base class for shared pre-OCR image validation failures - never
@@ -58,12 +65,18 @@ def validate_ocr_image(file_path: str | Path) -> None:
     try:
         with Image.open(path) as probe:
             width, height = probe.size
-        with Image.open(path) as probe:
+            decoded_format = (probe.format or "").upper()
+
+            if decoded_format not in _ALLOWED_PIL_FORMATS:
+                raise InvalidOcrImageError("Unsupported image format")
+
             probe.verify()
     except Image.DecompressionBombError as error:
         raise OcrImageTooLargeError(
             "Image exceeds the maximum decoded pixel count"
         ) from error
+    except InvalidOcrImageError:
+        raise
     except (UnidentifiedImageError, OSError, ValueError) as error:
         raise InvalidOcrImageError("Image could not be read") from error
 

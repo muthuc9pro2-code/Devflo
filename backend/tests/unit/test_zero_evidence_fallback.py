@@ -299,3 +299,42 @@ def test_fallback_never_fires_when_the_whole_analysis_already_has_real_evidence(
     # evidence row) - never a second "fallback" call for notes.txt.
     assert len(calls) == 1
     assert calls[0].get("context_kind") != "unstructured_fallback"
+
+
+# --- Gemini failure isolation: the unstructured-fallback call site -------
+
+
+def test_fallback_path_survives_gemini_unavailable(monkeypatch):
+    """The third of the finalizer's three Gemini call sites (zero-
+    structured-evidence unstructured fallback, alongside CORRELATED and
+    SIMPLE in test_ai_analysis_persistence.py) must also complete with the
+    deterministic fallback payload persisted and status="completed" when
+    generate_investigation_explanation raises GeminiUnavailableError -
+    never fail the analysis merely because the explanation layer is
+    unavailable."""
+    from app.services.gemini_service import GeminiUnavailableError
+
+    session_factory = _db_with_schema(monkeypatch)
+    analysis_id = _seed_zero_evidence_analysis(
+        session_factory,
+        artifact_fallback_contexts=[
+            {"kind": "text", "text": "payment worker stops after restart"}
+        ],
+    )
+
+    def _raise_unavailable(context):
+        raise GeminiUnavailableError("This model is currently experiencing high demand.")
+
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_unavailable)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.status == "completed"
+    assert analysis.ai_analysis is None
+    assert analysis.result_snapshot["context_kind"] == "unstructured_fallback"
+    assert "ai_analysis" not in analysis.result_snapshot
+    db.close()
