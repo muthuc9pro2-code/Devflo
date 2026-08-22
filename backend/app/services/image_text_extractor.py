@@ -18,7 +18,6 @@ _ALLOWED_PIL_FORMATS = {
 }
 
 
-
 class OcrImageError(Exception):
     """Base class for shared pre-OCR image validation failures - never
     raised by RapidOCR itself, only by validate_ocr_image() below."""
@@ -31,6 +30,10 @@ class OcrImageTooLargeError(OcrImageError):
 
 class InvalidOcrImageError(OcrImageError):
     """Not a real, decodable image in a supported format."""
+
+
+class OcrProcessingError(Exception):
+    """RapidOCR failed after the image passed Devflo's validation gates."""
 
 
 def validate_ocr_image(file_path: str | Path) -> None:
@@ -102,7 +105,14 @@ def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
 
     validate_ocr_image(path)
 
-    results, _ = _ocr(str(path))
+    try:
+        results, _ = _ocr(str(path))
+    except Exception as error:
+        # The image has already passed Devflo's size/integrity validation.
+        # Convert only the external OCR-engine call into a domain failure so
+        # the artifact task can isolate this image without hiding bugs in the
+        # surrounding Devflo parsing/persistence code.
+        raise OcrProcessingError("Image OCR could not be completed") from error
 
     if not results:
         return []

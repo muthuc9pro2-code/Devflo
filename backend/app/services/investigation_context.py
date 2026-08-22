@@ -1594,6 +1594,21 @@ def build_artifact_outcome_payload(
             "message": _UNSUPPORTED_MESSAGE,
         }
 
+    if status in ("resource_limited", "processing_error"):
+        failure_reason = getattr(artifact, "failure_reason", None)
+        return {
+            "artifact_id": artifact.id,
+            "source_file": artifact.original_filename,
+            "source_format": artifact.detected_format,
+            "evidence_count": 0,
+            "status": status,
+            "message": failure_reason or (
+                "Artifact exceeded a supported processing limit."
+                if status == "resource_limited"
+                else "Artifact could not be analyzed."
+            ),
+        }
+
     duplicate_of_artifact_id = getattr(artifact, "duplicate_of_artifact_id", None)
 
     if status == "duplicate" and duplicate_of_artifact_id is not None:
@@ -1654,3 +1669,23 @@ def build_artifact_outcome_payload(
             payload["message"] = _PARTIALLY_LINKED_MESSAGE
 
     return payload
+
+
+def build_source_outcome_payload(analysis: Any) -> dict[str, Any] | None:
+    """Small, existing-style outcome presentation for OPTIONAL source-code
+    enrichment (uploaded ZIP or GitHub URL) - never included in artifacts[]
+    since source code is not a diagnostic artifact. Returns None when no
+    source was ever requested for this analysis (nothing to show), or when
+    this analysis predates the source_status column (also nothing
+    meaningful to show)."""
+    if not getattr(analysis, "source_kind", None):
+        return None
+
+    status = getattr(analysis, "source_status", None)
+    if status is None:
+        return None
+
+    return {
+        "status": status,  # "ready" | "unavailable"
+        "failure_reason": getattr(analysis, "source_failure_reason", None),
+    }

@@ -23,6 +23,13 @@ class Analysis(Base):
     saved_file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     source_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
     source_reference: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Optional source-code enrichment is deliberately non-fatal. These fields
+    # persist its preparation outcome so live SSE, reconnects, and History can
+    # all tell the same truth when a ZIP/repository cannot be prepared.
+    source_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    source_failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     status: Mapped[str] = mapped_column(
         Enum("pending", "processing", "completed", "failed", name="analysis_status"),
         default="pending",

@@ -32,8 +32,15 @@ from app.services.fallback_context import (
     capture_ocr_fallback_context,
     capture_text_fallback_context,
 )
-from app.services.image_text_extractor import extract_text_from_image_with_confidence
-from app.services.source_archive import cleanup_prepared_source, prepare_source
+from app.services.image_text_extractor import (
+    OcrProcessingError,
+    extract_text_from_image_with_confidence,
+)
+from app.services.source_archive import (
+    SourceInputError,
+    cleanup_prepared_source,
+    prepare_source,
+)
 from app.services.source_index import correlate_event
 from app.services.investigation_router import choose_investigation_path, InvestigationPath
 from app.services.correlation_engine import prepare_correlation, run_correlation
@@ -45,6 +52,7 @@ from app.services.investigation_context import (
     build_llm_context,
     build_simple_llm_context,
     build_simple_payload,
+    build_source_outcome_payload,
     build_zero_evidence_payload,
     select_bounded_evidence_from_db,
     select_evidence_counts_by_artifact,
@@ -54,6 +62,7 @@ from app.services.analysis_events import (
     publish_investigation_result,
     publish_progress,
 )
+from app.utils.bounded_json import OversizedJsonScalarError
 from app.services.gemini_service import (
     GeminiUnavailableError,
     generate_investigation_explanation,
@@ -219,7 +228,41 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             source_index=source_index,
             global_line_number=global_line_number,
         )
+    except OversizedJsonScalarError:
+        db.rollback()
+        logger.warning(
+            "Analysis %s | artifact %s exceeded the supported JSON scalar limit",
+            analysis_id,
+            artifact_id,
+        )
+        _record_controlled_artifact_failure(
+            db=db,
+            analysis_id=analysis_id,
+            artifact_id=artifact_id,
+            status="resource_limited",
+            reason="JSON value exceeded the supported 1 MiB per-value limit.",
+        )
+        return 0
+    except OcrProcessingError:
+        db.rollback()
+        logger.warning(
+            "Analysis %s | artifact %s OCR processing could not be completed",
+            analysis_id,
+            artifact_id,
+            exc_info=True,
+        )
+        _record_controlled_artifact_failure(
+            db=db,
+            analysis_id=analysis_id,
+            artifact_id=artifact_id,
+            status="processing_error",
+            reason="Image OCR could not be completed.",
+        )
+        return 0
     except Exception:
+        # Unknown/internal failures remain fatal. Do not turn DB errors,
+        # programming bugs, changed-on-disk artifacts, or broken invariants
+        # into fake successful artifact outcomes.
         db.rollback()
         logger.exception(
             "Analysis %s | artifact %s processing failed",
@@ -247,13 +290,56 @@ def _prepare_source_task(analysis_id: int) -> None:
 
         source_prep_start = perf_counter()
         _prepare_source_index(analysis)
+        analysis.source_status = "ready"
+        analysis.source_failure_reason = None
+        db.commit()
         logger.info(
             "Analysis %s | source prep (%s) completed in %.2fs",
             analysis_id,
             analysis.source_kind,
             perf_counter() - source_prep_start,
         )
+    except SourceInputError as error:
+        db.rollback()
+        analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+        if analysis is None:
+            return
+
+        source_kind = analysis.source_kind
+        if source_kind == "zip":
+            reason = f"Uploaded source ZIP could not be prepared: {error}"
+        elif source_kind == "github":
+            reason = f"Source repository could not be accessed or prepared: {error}"
+        else:
+            reason = f"Source code could not be prepared: {error}"
+
+        analysis.source_status = "unavailable"
+        analysis.source_failure_reason = reason[:500]
+        db.commit()
+
+        # prepare_source() already removes partial prepared trees on failure.
+        # This second cleanup is idempotent and keeps the optional-source
+        # degradation boundary explicit here.
+        try:
+            cleanup_prepared_source(analysis_id)
+        except OSError:
+            logger.warning(
+                "Analysis %s | could not clean failed optional source preparation",
+                analysis_id,
+                exc_info=True,
+            )
+
+        logger.warning(
+            "Analysis %s | optional source unavailable (%s): %s; "
+            "continuing diagnostic analysis without source correlation",
+            analysis_id,
+            source_kind,
+            error,
+        )
+        return
     except Exception:
+        # Infrastructure/programming failures remain fatal; only controlled
+        # source-input/acquisition/resource failures degrade gracefully.
         db.rollback()
         logger.exception("Analysis %s | source preparation failed", analysis_id)
         _mark_analysis_failed(db, analysis_id)
@@ -295,7 +381,13 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 # never dispatched and so never reach "completed", but they
                 # must not block finalize either.
                 AnalysisArtifact.status.notin_(
-                    ["completed", "unsupported", "duplicate"]
+                    [
+                        "completed",
+                        "unsupported",
+                        "duplicate",
+                        "resource_limited",
+                        "processing_error",
+                    ]
                 ),
             )
             .first()
@@ -458,6 +550,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                         analysis_id,
                     )
                     analysis.ai_analysis = None
+                source_outcome = build_source_outcome_payload(analysis)
+                if source_outcome is not None:
+                    fallback_payload["source"] = source_outcome
                 # Persist-before-publish (locked requirement) - see the
                 # CORRELATED branch below for the full rationale.
                 analysis.result_snapshot = fallback_payload
@@ -483,6 +578,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis_id,
                 artifacts=zero_evidence_artifacts,
             )
+            source_outcome = build_source_outcome_payload(analysis)
+            if source_outcome is not None:
+                zero_evidence_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the
             # CORRELATED branch below for the full rationale.
             analysis.result_snapshot = zero_evidence_payload
@@ -605,6 +703,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.status,
                     AnalysisArtifact.duplicate_of_artifact_id,
                     AnalysisArtifact.fallback_context,
+                    AnalysisArtifact.failure_reason,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
@@ -697,6 +796,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     analysis_id,
                 )
                 analysis.ai_analysis = None
+            source_outcome = build_source_outcome_payload(analysis)
+            if source_outcome is not None:
+                correlation_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement): the exact same
             # bounded payload about to be published as investigation_result
             # is committed to the DB FIRST. If the live SSE event is lost
@@ -736,6 +838,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     AnalysisArtifact.status,
                     AnalysisArtifact.duplicate_of_artifact_id,
                     AnalysisArtifact.fallback_context,
+                    AnalysisArtifact.failure_reason,
                 )
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
                 .all()
@@ -791,6 +894,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     analysis_id,
                 )
                 analysis.ai_analysis = None
+            source_outcome = build_source_outcome_payload(analysis)
+            if source_outcome is not None:
+                simple_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the
             # CORRELATED branch above for the full rationale.
             analysis.result_snapshot = simple_payload
@@ -1065,7 +1171,14 @@ def _publish_ingestion_progress(
                 # permanently understating progress for the rest of the
                 # analysis (e.g. one skipped 900MB artifact alongside a real
                 # 10MB one would cap visible progress near 1%).
-                AnalysisArtifact.status.notin_(["unsupported", "duplicate"]),
+                AnalysisArtifact.status.notin_(
+                    [
+                        "unsupported",
+                        "duplicate",
+                        "resource_limited",
+                        "processing_error",
+                    ]
+                ),
             )
             .first()
         )
@@ -1172,7 +1285,11 @@ _source_index_process_cache: dict[int, object] = {}
 
 
 def _prepare_source_index(analysis: Analysis):
-    if not analysis.source_kind or not analysis.source_reference:
+    if (
+        not analysis.source_kind
+        or not analysis.source_reference
+        or getattr(analysis, "source_status", None) == "unavailable"
+    ):
         return None
 
     cached = _source_index_process_cache.get(analysis.id)
@@ -1237,6 +1354,55 @@ def _assign_batch_fingerprints(events) -> None:
             fingerprint = build_exception_fingerprint(event)
             fingerprint_cache[cache_key] = fingerprint
         event.fingerprint = fingerprint
+
+
+def _record_controlled_artifact_failure(
+    *,
+    db: Session,
+    analysis_id: int,
+    artifact_id: int,
+    status: str,
+    reason: str,
+) -> None:
+    """Persist one expected artifact-level failure without poisoning the
+    investigation.
+
+    Earlier parser batches may already have committed Evidence, so every
+    Evidence row belonging to this artifact is removed before the artifact is
+    made terminal. This is deliberately different from relationship_status
+    "partially_linked": partially linked is valid, fully ingested evidence;
+    this helper is only for an artifact whose ingestion itself did not finish.
+    """
+    artifact = (
+        db.query(AnalysisArtifact)
+        .filter(
+            AnalysisArtifact.id == artifact_id,
+            AnalysisArtifact.analysis_id == analysis_id,
+        )
+        .first()
+    )
+    if artifact is None:
+        raise RuntimeError(
+            f"Artifact {artifact_id} disappeared while recording controlled failure"
+        )
+
+    db.query(Evidence).filter(
+        Evidence.analysis_id == analysis_id,
+        Evidence.artifact_id == artifact_id,
+    ).delete(synchronize_session=False)
+
+    artifact.status = status
+    artifact.failure_reason = reason[:500]
+    artifact.processed_bytes = 0
+    artifact.last_processed_line = 0
+    artifact.fallback_context = None
+    db.commit()
+
+    payload = build_artifact_outcome_payload(
+        artifact,
+        evidence_count=0,
+    )
+    publish_artifact_outcome(analysis_id, payload)
 
 
 def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
@@ -1443,7 +1609,13 @@ def _known_terminal_artifact_outcomes(
     terminal = [
         artifact
         for artifact in artifacts
-        if artifact.status in ("unsupported", "duplicate", "completed")
+        if artifact.status in (
+            "unsupported",
+            "duplicate",
+            "completed",
+            "resource_limited",
+            "processing_error",
+        )
     ]
     if not terminal:
         return []

@@ -97,15 +97,24 @@ def _validate_cloned_source_tree(root: Path) -> None:
         for name in dirnames:
             entry = Path(dirpath) / name
             if stat.S_ISLNK(entry.lstat().st_mode):
-                raise SourceInputError(f"Symlink entries are not supported: {entry}")
+                # Report the path relative to the repository root, never the
+                # full server-side path (which would leak SOURCE_STORAGE_ROOT's
+                # internal on-disk layout into a user-facing failure reason).
+                raise SourceInputError(
+                    f"Symlink entries are not supported: {entry.relative_to(root)}"
+                )
 
         for filename in filenames:
             entry = Path(dirpath) / filename
             info = entry.lstat()
             if stat.S_ISLNK(info.st_mode):
-                raise SourceInputError(f"Symlink entries are not supported: {entry}")
+                raise SourceInputError(
+                    f"Symlink entries are not supported: {entry.relative_to(root)}"
+                )
             if not stat.S_ISREG(info.st_mode):
-                raise SourceInputError(f"Unsupported filesystem entry: {entry}")
+                raise SourceInputError(
+                    f"Unsupported filesystem entry: {entry.relative_to(root)}"
+                )
 
             file_count += 1
             if file_count > MAX_SOURCE_FILES:
