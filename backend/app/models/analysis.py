@@ -1,10 +1,7 @@
 from datetime import datetime
-
 from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, Index, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from app.db.database import Base
-
 
 class Analysis(Base):
     __tablename__ = "analyses"

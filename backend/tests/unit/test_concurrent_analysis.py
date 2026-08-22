@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -209,6 +210,30 @@ def test_process_artifact_task_skips_an_already_completed_artifact(monkeypatch):
     db = Mock()
     analysis = SimpleNamespace(id=9)
     artifact = SimpleNamespace(id=101, status="completed")
+    db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
+    monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
+    process_artifact = Mock()
+    monkeypatch.setattr(analysis_task, "_process_artifact", process_artifact)
+
+    result = analysis_task._process_artifact_task.run(9, 101)
+
+    assert result == 0
+    process_artifact.assert_not_called()
+
+
+@pytest.mark.parametrize("terminal_status", ["resource_limited", "processing_error"])
+def test_process_artifact_task_skips_an_already_controlled_failed_artifact_on_resume(
+    monkeypatch, terminal_status
+):
+    """process_analysis's dispatch filter (AnalysisArtifact.status.notin_(
+    ["unsupported", "duplicate"])) only ever excludes the two statuses
+    decided at upload time - a resumed run (e.g. after a worker crash) can
+    still re-dispatch a task for an artifact that already reached a
+    controlled, terminal failure outcome in a PRIOR run. That outcome is
+    exactly as final as "completed" and must not be re-processed."""
+    db = Mock()
+    analysis = SimpleNamespace(id=9)
+    artifact = SimpleNamespace(id=101, status=terminal_status)
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     process_artifact = Mock()

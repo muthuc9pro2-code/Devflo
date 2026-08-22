@@ -138,7 +138,7 @@ def process_analysis(analysis_id: int):
                     # resolved at upload time (create_analysis) - they are
                     # never dispatched for ingestion and never produce their
                     # own Evidence set.
-                    AnalysisArtifact.status.notin_(["unsupported", "duplicate"]),
+                    AnalysisArtifact.status.notin_(["unsupported", "duplicate", "resource_limited", "processing_error"]),
                 )
                 .order_by(AnalysisArtifact.position, AnalysisArtifact.id)
                 .all()
@@ -204,7 +204,15 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             )
             return 0
 
-        if artifact.status == "completed":
+        if artifact.status in ("completed", "resource_limited", "processing_error"):
+            # Resumability: process_analysis's dispatch filter only excludes
+            # unsupported/duplicate (statuses that can only ever be decided
+            # at upload time, before any artifact task exists), so a
+            # resumed run (e.g. after a worker crash) can still re-dispatch
+            # an artifact task for one already reaching a controlled,
+            # terminal failure outcome. That outcome is equally final as
+            # "completed" - never re-run its (deterministically identical)
+            # extraction, evidence cleanup, and status/reason persistence.
             return 0
 
         source_index = _prepare_source_index(analysis)
@@ -286,6 +294,14 @@ def _prepare_source_task(analysis_id: int) -> None:
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
         if analysis is None:
             logger.warning("Analysis %s not found for source prep", analysis_id)
+            return
+
+        if analysis.source_status == "unavailable":
+            logger.info(
+                "Analysis %s | optional source already unavailable; "
+                "skipping source preparation",
+                analysis_id,
+            )
             return
 
         source_prep_start = perf_counter()
@@ -1563,11 +1579,16 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
         .all()
     )
 
-    dispatchable = [
-        row for row in rows if row.status not in ("unsupported", "duplicate")
-    ]
-    ingestion_done = bool(dispatchable) and all(
-        row.status == "completed" for row in dispatchable
+    # A resource_limited/processing_error artifact is exactly as terminal
+    # as completed/unsupported/duplicate - it will never become
+    # status="completed" either, so it must count toward "ingestion is
+    # done" too (matches _finalize_analysis_task's own "incomplete" check).
+    # Without this, a still-processing analysis with one already-failed
+    # artifact could never report the 99% post-ingestion state, even after
+    # every other artifact genuinely finished.
+    ingestion_done = bool(rows) and all(
+        row.status in ("unsupported", "duplicate", "completed", "resource_limited", "processing_error")
+        for row in rows
     )
 
     if ingestion_done:
@@ -1579,9 +1600,16 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
         progress = 99
     else:
         # Same exclusion as the live _publish_ingestion_progress query:
-        # unsupported/duplicate artifacts are never dispatched, so their
-        # size_bytes must not sit in the denominator alongside real
-        # processed_bytes that will never catch up to it.
+        # unsupported/duplicate artifacts are never dispatched, and a
+        # resource_limited/processing_error artifact has its
+        # processed_bytes reset to 0 on failure (see
+        # _record_controlled_artifact_failure) - none of their size_bytes
+        # may sit in the denominator alongside real processed_bytes that
+        # will never catch up to it.
+        dispatchable = [
+            row for row in rows
+            if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
+        ]
         total_bytes = sum(row.size_bytes for row in dispatchable)
         processed_bytes = sum(row.processed_bytes for row in dispatchable)
         progress = _ingestion_percentage(processed_bytes, total_bytes) if total_bytes else 0

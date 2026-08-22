@@ -143,6 +143,47 @@ def test_duplicate_and_unsupported_artifacts_are_excluded_from_the_byte_ratio():
     assert state["progress"] == 50
 
 
+def test_resource_limited_and_processing_error_artifacts_do_not_block_the_99_transition():
+    """A resource_limited/processing_error artifact is just as terminal as
+    duplicate/unsupported - it will never reach status="completed" either,
+    so it must not permanently block "is ingestion actually done" from
+    ever becoming true for the rest of this analysis."""
+    db, user = _session()
+    analysis = _analysis(db, user, status="processing")
+    _artifact(
+        db, analysis, position=0, size_bytes=1000, processed_bytes=1000, status="completed"
+    )
+    _artifact(
+        db, analysis, position=1, size_bytes=0, processed_bytes=0, status="resource_limited",
+    )
+    _artifact(
+        db, analysis, position=2, size_bytes=0, processed_bytes=0, status="processing_error",
+    )
+
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+
+    assert state["progress"] == 99
+
+
+def test_resource_limited_and_processing_error_artifacts_are_excluded_from_the_byte_ratio():
+    """A controlled artifact failure resets processed_bytes to 0 (see
+    _record_controlled_artifact_failure) but its size_bytes is untouched -
+    if it stayed in the denominator, the numerator could never catch up,
+    permanently understating progress for the rest of a still-processing
+    analysis, exactly like an unsupported/duplicate artifact would."""
+    db, user = _session()
+    analysis = _analysis(db, user, status="processing")
+    _artifact(db, analysis, position=0, size_bytes=1000, processed_bytes=500, status="processing")
+    _artifact(
+        db, analysis, position=1, size_bytes=500, processed_bytes=0, status="resource_limited",
+    )
+
+    state = analysis_task.compute_current_analysis_state(db, analysis)
+
+    # 500 / 1000 = 50% - driven only by the real, still-ingesting artifact.
+    assert state["progress"] == 50
+
+
 def test_large_unsupported_artifact_does_not_suppress_progress():
     """Before Additional Requirement B, a huge skipped artifact sitting in
     the denominator could pin visible progress near 0% for the entire
