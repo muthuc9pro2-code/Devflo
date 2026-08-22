@@ -51,6 +51,8 @@ function useAnimatedProgress(target) {
 function artifactLabel(artifact) {
   if (artifact.status === 'duplicate') return 'Duplicate'
   if (artifact.status === 'unsupported') return 'Unsupported'
+  if (artifact.status === 'resource_limited') return 'Resource limit exceeded'
+  if (artifact.status === 'processing_error') return 'Could not analyze'
   if (artifact.relationship_status) return humanize(artifact.relationship_status)
   if (artifact.status === 'processed' || artifact.status === 'completed') return 'Processed'
   return humanize(artifact.status)
@@ -113,6 +115,14 @@ export default function ProcessingView({
     () => buildFileRows(filenames, artifacts),
     [artifacts, filenames],
   )
+  const failureNotes = useMemo(
+    () => rows.filter((row) => (
+      row.outcome
+      && ['resource_limited', 'processing_error'].includes(row.outcome.status)
+      && row.outcome.message
+    )),
+    [rows],
+  )
   const isPending = status === 'pending'
   const primaryMessage = isPending ? 'Queued for analysis' : (message || 'Analyzing diagnostics')
   const unknownCount = Math.max(0, (artifactCount || 0) - rows.length)
@@ -166,6 +176,11 @@ export default function ProcessingView({
                 </li>
               ))}
             </ol>
+            {failureNotes.map((row) => (
+              <p className="processing-files-note" key={`reason:${row.key}`}>
+                {row.filename}: {row.outcome.message}
+              </p>
+            ))}
             {unknownCount > 0 && (
               <p className="processing-files-note">
                 {unknownCount} additional diagnostic {unknownCount === 1 ? 'file is' : 'files are'} included in this investigation.

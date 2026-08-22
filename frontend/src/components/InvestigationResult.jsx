@@ -37,6 +37,28 @@ function ResultHeader({ result }) {
   )
 }
 
+function SourceOutcome({ source }) {
+  if (!source) return null
+  const isReady = source.status === 'ready'
+
+  return (
+    <section className="zero-evidence-card result-panel">
+      <div className="zero-evidence-mark" aria-hidden="true">{isReady ? '✓' : '○'}</div>
+      <div>
+        <h2>Source code</h2>
+        {isReady ? (
+          <p>Available for source correlation.</p>
+        ) : (
+          <>
+            <p>{source.failure_reason || 'Source code could not be prepared.'}</p>
+            <p className="muted-copy">Investigation completed without source correlation.</p>
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
+
 function SimpleResult({ result }) {
   return (
     <>
@@ -105,6 +127,7 @@ export default function InvestigationResult({ result }) {
   return (
     <article className={`result-page result-${result.investigation_path || 'unknown'} view-enter`}>
       <ResultHeader result={result} />
+      <SourceOutcome source={result.source} />
       {result.investigation_path === 'correlated' && <CorrelatedResult result={result} />}
       {result.investigation_path === 'simple' && <SimpleResult result={result} />}
       {result.investigation_path === 'zero_evidence' && <ZeroEvidenceResult result={result} />}
