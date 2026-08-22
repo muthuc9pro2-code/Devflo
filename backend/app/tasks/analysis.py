@@ -574,6 +574,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 analysis.result_snapshot = fallback_payload
                 analysis.status = "completed"
                 db.commit()
+                _cleanup_completed_diagnostic_files(db, analysis_id)
 
                 logger.info(
                     "Analysis %s | zero structured evidence, %s artifact(s) "
@@ -602,6 +603,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             analysis.result_snapshot = zero_evidence_payload
             analysis.status = "completed"
             db.commit()
+            _cleanup_completed_diagnostic_files(db, analysis_id)
 
             logger.info(
                 "Analysis %s | no meaningful diagnostic evidence found",
@@ -825,6 +827,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             analysis.result_snapshot = correlation_payload
             analysis.status = "completed"
             db.commit()
+            _cleanup_completed_diagnostic_files(db, analysis_id)
             logger.info(
                 "Analysis %s | TOTAL processing time %.2fs",
                 analysis_id,
@@ -918,6 +921,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             analysis.result_snapshot = simple_payload
             analysis.status = "completed"
             db.commit()
+            _cleanup_completed_diagnostic_files(db, analysis_id)
             logger.info(
                 "Analysis %s | TOTAL processing time %.2fs",
                 analysis_id,
@@ -1414,11 +1418,89 @@ def _record_controlled_artifact_failure(
     artifact.fallback_context = None
     db.commit()
 
+    # This artifact's outcome is now durably terminal (status + reason
+    # committed above), and _process_artifact_task's own resume-skip guard
+    # means no retry/redelivery will ever call _process_artifact for it
+    # again - its raw staged bytes are safe to reclaim immediately, unlike
+    # a "completed" artifact's, which waits for the whole analysis's final
+    # result (see _cleanup_completed_diagnostic_files).
+    _cleanup_diagnostic_artifact_file(artifact.saved_file_path)
+
     payload = build_artifact_outcome_payload(
         artifact,
         evidence_count=0,
     )
     publish_artifact_outcome(analysis_id, payload)
+
+
+# Matches crud.analysis._UPLOAD_ROOT's own independent Path("uploads")
+# constant (that module intentionally does not import this one, or vice
+# versa, to avoid an api/crud/tasks import cycle) - both resolve the same
+# physical directory and both gate every deletion on the resolved parent
+# actually being this exact directory, never an arbitrary caller-supplied
+# path.
+_UPLOAD_ROOT = Path("uploads").resolve()
+
+
+def _cleanup_diagnostic_artifact_file(saved_file_path: str) -> None:
+    """Best-effort removal of one diagnostic artifact's raw staged bytes.
+    Never the source of truth: AnalysisArtifact.status/failure_reason and
+    persisted Evidence already fully describe the outcome on their own.
+    Scoped strictly to files directly inside _UPLOAD_ROOT; anything else is
+    silently left alone rather than deleted. A failure here is logged and
+    must never propagate - see callers (_record_controlled_artifact_failure,
+    _cleanup_completed_diagnostic_files), both already past their own
+    durable commit by the time this runs."""
+    try:
+        path = Path(saved_file_path)
+        if path.resolve(strict=False).parent != _UPLOAD_ROOT:
+            return
+        path.unlink(missing_ok=True)
+    except Exception:
+        logger.warning(
+            "Could not remove diagnostic artifact file %s",
+            saved_file_path,
+            exc_info=True,
+        )
+
+
+def _cleanup_completed_diagnostic_files(db: Session, analysis_id: int) -> None:
+    """Best-effort removal of every "completed" diagnostic artifact's raw
+    staged bytes for this analysis - called only AFTER the final durable
+    investigation result (result_snapshot + status="completed") is already
+    committed. From that point on, Evidence + result_snapshot are the sole
+    source of truth: nothing in finalization, reconnect, or History ever
+    re-reads a diagnostic artifact's saved_file_path (parsing, fallback
+    capture, OCR, and source correlation all already ran, once, during this
+    artifact's own ingestion pass). unsupported/duplicate artifacts already
+    had their files removed at upload time; resource_limited/
+    processing_error artifacts already had theirs removed by
+    _record_controlled_artifact_failure - only "completed" remains here.
+
+    Failures are logged and never raised: a failure to delete temporary
+    files must never turn an already-successful, already-persisted
+    investigation into a failed one.
+    """
+    try:
+        completed_paths = [
+            row[0]
+            for row in db.query(AnalysisArtifact.saved_file_path)
+            .filter(
+                AnalysisArtifact.analysis_id == analysis_id,
+                AnalysisArtifact.status == "completed",
+            )
+            .all()
+        ]
+    except Exception:
+        logger.warning(
+            "Analysis %s | could not list completed diagnostic artifacts for cleanup",
+            analysis_id,
+            exc_info=True,
+        )
+        return
+
+    for saved_file_path in completed_paths:
+        _cleanup_diagnostic_artifact_file(saved_file_path)
 
 
 def _mark_analysis_failed(db: Session, analysis_id: int) -> None:

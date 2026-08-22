@@ -140,21 +140,99 @@ def test_github_and_source_zip_are_mutually_exclusive(tmp_path, monkeypatch):
     create_analysis.assert_not_called()
 
 
-def test_source_zip_limit_cleans_all_staged_files(tmp_path, monkeypatch):
+def test_oversized_source_zip_degrades_source_but_still_processes_diagnostics(
+    tmp_path, monkeypatch
+):
+    """Source ZIP is OPTIONAL enrichment - a controlled failure detected
+    synchronously at upload time (oversized here) must not abort otherwise-
+    valid diagnostic artifacts. The request succeeds, source_kind still
+    records what was attempted, source_status is "unavailable" with a safe
+    reason, and the invalid staged ZIP is reclaimed - but the diagnostic
+    artifact remains staged and dispatched normally."""
+    create_analysis = Mock(return_value=SimpleNamespace(id=24, artifacts=[]))
+    task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "MAX_SOURCE_ARCHIVE_BYTES", 3)
     monkeypatch.setattr(analysis_api, "UPLOAD_COPY_CHUNK_BYTES", 2)
-    monkeypatch.setattr(analysis_api, "create_analysis", Mock())
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
 
-    with pytest.raises(HTTPException) as error:
+    result = analysis_api.upload_file(
+        file=_upload("diagnostic.log", b"ERROR failed"),
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+        source_zip=_upload("source.zip", b"1234"),
+    )
+
+    assert result.id == 24
+    kwargs = create_analysis.call_args.kwargs
+    assert kwargs["source_kind"] == "zip"
+    assert kwargs["source_reference"] is None
+    assert kwargs["source_status"] == "unavailable"
+    assert kwargs["source_failure_reason"].startswith(
+        "Uploaded source ZIP could not be prepared:"
+    )
+    assert [row["original_filename"] for row in kwargs["artifacts"]] == ["diagnostic.log"]
+    task.delay.assert_called_once_with(24)
+
+    remaining = [p.name for p in tmp_path.iterdir()]
+    assert not any(name.endswith("_source.zip") for name in remaining)
+    assert any(name.endswith("diagnostic.log") for name in remaining)
+
+
+def test_invalid_github_url_degrades_source_but_still_processes_diagnostics(
+    tmp_path, monkeypatch
+):
+    """Same optional-source degradation as the ZIP case, for a malformed
+    GitHub URL rejected synchronously by validate_github_url()."""
+    create_analysis = Mock(return_value=SimpleNamespace(id=25, artifacts=[]))
+    task = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
+
+    result = analysis_api.upload_file(
+        file=_upload("diagnostic.log", b"ERROR failed"),
+        db=Mock(),
+        current_user=SimpleNamespace(id=4),
+        github_url="https://not-github.example.com/acme/project",
+    )
+
+    assert result.id == 25
+    kwargs = create_analysis.call_args.kwargs
+    assert kwargs["source_kind"] == "github"
+    assert kwargs["source_reference"] is None
+    assert kwargs["source_status"] == "unavailable"
+    assert kwargs["source_failure_reason"].startswith(
+        "Source repository could not be accessed or prepared:"
+    )
+    assert [row["original_filename"] for row in kwargs["artifacts"]] == ["diagnostic.log"]
+    task.delay.assert_called_once_with(25)
+
+
+def test_unexpected_source_exception_remains_fatal_and_is_not_degraded(
+    tmp_path, monkeypatch
+):
+    """Only controlled SourceInputError/UploadTooLarge failures degrade to
+    source_status="unavailable" - an unexpected internal exception (a
+    programming bug, an infrastructure failure) raised from source
+    validation must still abort the whole request, exactly like before."""
+    create_analysis = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(
+        analysis_api, "validate_source_zip", Mock(side_effect=RuntimeError("disk exploded"))
+    )
+
+    with pytest.raises(RuntimeError, match="disk exploded"):
         analysis_api.upload_file(
             file=_upload("diagnostic.log", b"ERROR failed"),
             db=Mock(),
             current_user=SimpleNamespace(id=4),
-            source_zip=_upload("source.zip", b"1234"),
+            source_zip=_upload("source.zip", b"zip bytes"),
         )
 
-    assert error.value.status_code == 413
+    create_analysis.assert_not_called()
     assert list(tmp_path.iterdir()) == []
 
 

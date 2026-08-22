@@ -96,22 +96,49 @@ def upload_file(
     total_bytes = 0
     image_count = 0
     source_kind = source_reference = None
+    source_status = source_failure_reason = None
 
     try:
         if github_url:
-            source_kind, source_reference = "github", validate_github_url(github_url)
+            source_kind = "github"
+            try:
+                source_reference = validate_github_url(github_url)
+            except SourceInputError as error:
+                # Optional source enrichment: a malformed repository URL
+                # detected synchronously here must degrade the exact same
+                # way a later async acquisition failure already does (see
+                # _prepare_source_task) - never abort otherwise-valid
+                # diagnostic artifacts over it. source_kind stays "github"
+                # so History/the final result can still say what kind of
+                # source was attempted.
+                source_status = "unavailable"
+                source_failure_reason = (
+                    f"Source repository could not be accessed or prepared: {error}"
+                )[:500]
         elif source_zip:
+            source_kind = "zip"
             source_path = UPLOAD_DIR / f"{upload_group}_source.zip"
             staged_paths.append(source_path)
-            copy_upload(
-                source_zip,
-                source_path,
-                MAX_SOURCE_ARCHIVE_BYTES,
-                "Source ZIP exceeds the configured archive limit",
-                UPLOAD_COPY_CHUNK_BYTES,
-            )
-            validate_source_zip(source_path)
-            source_kind, source_reference = "zip", str(source_path)
+            try:
+                copy_upload(
+                    source_zip,
+                    source_path,
+                    MAX_SOURCE_ARCHIVE_BYTES,
+                    "Source ZIP exceeds the configured archive limit",
+                    UPLOAD_COPY_CHUNK_BYTES,
+                )
+                validate_source_zip(source_path)
+                source_reference = str(source_path)
+            except (UploadTooLarge, SourceInputError) as error:
+                # Same degradation as the github_url branch above. The
+                # invalid/oversized staged ZIP is reclaimed immediately -
+                # it will never be used, and the diagnostic artifacts
+                # staged below are entirely unaffected by it.
+                source_status = "unavailable"
+                source_failure_reason = (
+                    f"Uploaded source ZIP could not be prepared: {error}"
+                )[:500]
+                source_path.unlink(missing_ok=True)
 
         for position, upload in enumerate(uploads):
             original_filename = _safe_original_filename(
@@ -242,6 +269,8 @@ def upload_file(
             artifacts=artifact_rows,
             source_kind=source_kind,
             source_reference=source_reference,
+            source_status=source_status,
+            source_failure_reason=source_failure_reason,
         )
     except UploadTooLarge as error:
         _remove_staged_uploads(staged_paths)

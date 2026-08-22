@@ -18,13 +18,23 @@ def create_analysis(
     artifacts: Sequence[Mapping[str, Any]] | None = None,
     source_kind: str | None = None,
     source_reference: str | None = None,
+    source_status: str | None = None,
+    source_failure_reason: str | None = None,
 ) -> Analysis:
+    # source_status/source_failure_reason let the caller record a source
+    # failure that was already known SYNCHRONOUSLY at upload time (e.g. a
+    # malformed GitHub URL or an invalid source ZIP) directly on creation,
+    # rather than a second post-commit UPDATE - the asynchronous
+    # _prepare_source_task path still sets these itself when source
+    # acquisition instead fails later, during processing.
     analysis = Analysis(
         user_id=user_id,
         original_filename=filename,
         saved_file_path=saved_file_path,
         source_kind=source_kind,
         source_reference=source_reference,
+        source_status=source_status,
+        source_failure_reason=source_failure_reason,
     )
 
     try:
