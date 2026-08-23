@@ -814,7 +814,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     analysis_id,
                 )
                 analysis.ai_analysis = None
-            source_outcome = build_source_outcome_payload(analysis)
+            source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 correlation_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement): the exact same
@@ -913,7 +913,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     analysis_id,
                 )
                 analysis.ai_analysis = None
-            source_outcome = build_source_outcome_payload(analysis)
+            source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the

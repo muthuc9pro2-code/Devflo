@@ -1671,13 +1671,26 @@ def build_artifact_outcome_payload(
     return payload
 
 
-def build_source_outcome_payload(analysis: Any) -> dict[str, Any] | None:
+def build_source_outcome_payload(
+    analysis: Any, evidence_rows: list[Any] | None = None
+) -> dict[str, Any] | None:
     """Small, existing-style outcome presentation for OPTIONAL source-code
     enrichment (uploaded ZIP or GitHub URL) - never included in artifacts[]
     since source code is not a diagnostic artifact. Returns None when no
     source was ever requested for this analysis (nothing to show), or when
     this analysis predates the source_status column (also nothing
-    meaningful to show)."""
+    meaningful to show).
+
+    match_count distinguishes "source prepared but nothing in it matched
+    this incident's evidence" from "source prepared and genuinely matched"
+    - never derived from the overall evidence_count (an investigation can
+    have many Evidence records and zero source matches). Counted directly
+    from each Evidence row's own real evidence.source_matches (populated by
+    correlate_event() during ingestion - see _correlate_source_events),
+    not a second/invented matching system. evidence_rows is the caller's
+    already-loaded working set (the same bounded set the rest of this
+    investigation's payload/graph is built from); omitted (or empty) when
+    the whole analysis has zero Evidence, where the count is trivially 0."""
     if not getattr(analysis, "source_kind", None):
         return None
 
@@ -1685,7 +1698,12 @@ def build_source_outcome_payload(analysis: Any) -> dict[str, Any] | None:
     if status is None:
         return None
 
+    match_count = sum(
+        1 for evidence in (evidence_rows or []) if evidence.source_matches
+    )
+
     return {
         "status": status,  # "ready" | "unavailable"
+        "match_count": match_count,
         "failure_reason": getattr(analysis, "source_failure_reason", None),
     }

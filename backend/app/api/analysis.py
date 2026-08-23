@@ -103,18 +103,22 @@ def upload_file(
             source_kind = "github"
             try:
                 source_reference = validate_github_url(github_url)
-            except SourceInputError as error:
+            except SourceInputError:
                 # Optional source enrichment: a malformed repository URL
                 # detected synchronously here must degrade the exact same
                 # way a later async acquisition failure already does (see
                 # _prepare_source_task) - never abort otherwise-valid
                 # diagnostic artifacts over it. source_kind stays "github"
                 # so History/the final result can still say what kind of
-                # source was attempted.
+                # source was attempted. Deliberately distinct wording from
+                # _prepare_source_task's "could not be accessed or
+                # prepared": this is a malformed URL Devflo can reliably
+                # detect without ever attempting to reach GitHub - a later
+                # genuine access/clone failure (private repo, network,
+                # nonexistent repo, etc.) is a different, less certain
+                # class of failure and must not be conflated with this one.
                 source_status = "unavailable"
-                source_failure_reason = (
-                    f"Source repository could not be accessed or prepared: {error}"
-                )[:500]
+                source_failure_reason = "Invalid GitHub repository URL."
         elif source_zip:
             source_kind = "zip"
             source_path = UPLOAD_DIR / f"{upload_group}_source.zip"

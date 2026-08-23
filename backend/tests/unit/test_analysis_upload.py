@@ -184,7 +184,11 @@ def test_invalid_github_url_degrades_source_but_still_processes_diagnostics(
     tmp_path, monkeypatch
 ):
     """Same optional-source degradation as the ZIP case, for a malformed
-    GitHub URL rejected synchronously by validate_github_url()."""
+    GitHub URL rejected synchronously by validate_github_url() - a
+    malformed URL Devflo can reliably detect without ever attempting to
+    reach GitHub gets its own distinct wording, deliberately different
+    from a later genuine access/clone failure (see
+    test_source_correlation_outcome.py for that async-path case)."""
     create_analysis = Mock(return_value=SimpleNamespace(id=25, artifacts=[]))
     task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -203,9 +207,7 @@ def test_invalid_github_url_degrades_source_but_still_processes_diagnostics(
     assert kwargs["source_kind"] == "github"
     assert kwargs["source_reference"] is None
     assert kwargs["source_status"] == "unavailable"
-    assert kwargs["source_failure_reason"].startswith(
-        "Source repository could not be accessed or prepared:"
-    )
+    assert kwargs["source_failure_reason"] == "Invalid GitHub repository URL."
     assert [row["original_filename"] for row in kwargs["artifacts"]] == ["diagnostic.log"]
     task.delay.assert_called_once_with(25)
 

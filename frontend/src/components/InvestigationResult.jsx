@@ -40,18 +40,27 @@ function ResultHeader({ result }) {
 function SourceOutcome({ source }) {
   if (!source) return null
   const isReady = source.status === 'ready'
+  const hasMatches = isReady && Number(source.match_count) > 0
 
   return (
     <section className="zero-evidence-card result-panel">
-      <div className="zero-evidence-mark" aria-hidden="true">{isReady ? '✓' : '○'}</div>
+      <div className="zero-evidence-mark" aria-hidden="true">{hasMatches ? '✓' : '○'}</div>
       <div>
         <h2>Source code</h2>
-        {isReady ? (
-          <p>Available for source correlation.</p>
-        ) : (
+        {!isReady && (
           <>
             <p>{source.failure_reason || 'Source code could not be prepared.'}</p>
             <p className="muted-copy">Investigation completed without source correlation.</p>
+          </>
+        )}
+        {isReady && hasMatches && <p>Matched to diagnostic evidence.</p>}
+        {isReady && !hasMatches && (
+          <>
+            <p>No source matches found.</p>
+            <p className="muted-copy">
+              The supplied source code was prepared successfully, but no matches were found for
+              the diagnostic evidence.
+            </p>
           </>
         )}
       </div>
