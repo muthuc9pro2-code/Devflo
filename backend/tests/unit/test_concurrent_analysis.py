@@ -55,7 +55,11 @@ def test_dispatch_builds_a_bounded_group_and_chord_instead_of_looping(monkeypatc
     db = Mock()
     analysis = SimpleNamespace(id=9, status="pending", source_kind=None)
     db.query.return_value.filter.return_value.first.return_value = analysis
-    artifacts = [SimpleNamespace(id=101), SimpleNamespace(id=102), SimpleNamespace(id=103)]
+    artifacts = [
+        SimpleNamespace(id=101, status="pending"),
+        SimpleNamespace(id=102, status="pending"),
+        SimpleNamespace(id=103, status="pending"),
+    ]
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = artifacts
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
 
@@ -96,7 +100,7 @@ def test_source_prep_is_chained_before_the_artifact_chord_when_source_present(mo
     analysis = SimpleNamespace(id=9, status="pending", source_kind="zip")
     db.query.return_value.filter.return_value.first.return_value = analysis
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
-        SimpleNamespace(id=101)
+        SimpleNamespace(id=101, status="pending")
     ]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     monkeypatch.setattr(analysis_task, "group", Mock(return_value=SimpleNamespace()))
@@ -126,7 +130,7 @@ def test_dispatch_skips_source_chain_when_no_source_present(monkeypatch):
     analysis = SimpleNamespace(id=9, status="pending", source_kind=None)
     db.query.return_value.filter.return_value.first.return_value = analysis
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
-        SimpleNamespace(id=101)
+        SimpleNamespace(id=101, status="pending")
     ]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     monkeypatch.setattr(analysis_task, "group", Mock(return_value=SimpleNamespace()))
@@ -182,7 +186,7 @@ def test_finalize_skips_when_analysis_already_marked_failed(monkeypatch):
 
 def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9)
+    analysis = SimpleNamespace(id=9, status="processing")
     artifact = SimpleNamespace(id=101, position=0, status="pending")
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
@@ -208,7 +212,7 @@ def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
 
 def test_process_artifact_task_skips_an_already_completed_artifact(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9)
+    analysis = SimpleNamespace(id=9, status="processing")
     artifact = SimpleNamespace(id=101, status="completed")
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
@@ -232,7 +236,7 @@ def test_process_artifact_task_skips_an_already_controlled_failed_artifact_on_re
     controlled, terminal failure outcome in a PRIOR run. That outcome is
     exactly as final as "completed" and must not be re-processed."""
     db = Mock()
-    analysis = SimpleNamespace(id=9)
+    analysis = SimpleNamespace(id=9, status="processing")
     artifact = SimpleNamespace(id=101, status=terminal_status)
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))

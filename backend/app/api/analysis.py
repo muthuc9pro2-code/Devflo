@@ -36,14 +36,18 @@ from app.services.artifact_detector import (
     detect_artifact_sample,
     is_supported_diagnostic_sample
 )
-from app.services.analysis_events import publish_artifact_outcome
+from app.services.analysis_events import publish_analysis_event, publish_artifact_outcome
 from app.services.image_text_extractor import (
     InvalidOcrImageError,
     OcrImageTooLargeError,
     validate_ocr_image,
 )
 from app.services.investigation_context import build_artifact_outcome_payload
-from app.tasks.analysis import compute_current_analysis_state, process_analysis
+from app.tasks.analysis import (
+    cancel_analysis_and_cleanup,
+    compute_current_analysis_state,
+    process_analysis,
+)
 
 HISTORY_DEFAULT_LIMIT = 20
 HISTORY_MAX_LIMIT = 100
@@ -329,6 +333,12 @@ def get_analysis_history(
     deserialization - only the small ai_analysis column (for title/
     summary) and one grouped artifact-count query, both scoped to exactly
     the page being returned, never the user's whole history.
+
+    Cancelled analyses are excluded at the query level - not a general
+    History-deletion feature, just the terminal-state equivalent of an
+    upload that never really happened: its generated data was already
+    discarded by cancel_analysis_and_cleanup(). pending/processing/
+    completed/failed are all returned exactly as before.
     """
     response.headers["Cache-Control"] = "no-store"
     limit = max(1, min(limit, HISTORY_MAX_LIMIT))
@@ -340,7 +350,10 @@ def get_analysis_history(
         Analysis.updated_at,
         Analysis.original_filename,
         Analysis.ai_analysis,
-    ).filter(Analysis.user_id == current_user.id)
+    ).filter(
+        Analysis.user_id == current_user.id,
+        Analysis.status != "cancelled",
+    )
 
     if cursor:
         cursor_created_at, cursor_id = _decode_history_cursor(cursor)
@@ -436,6 +449,59 @@ def get_analysis_detail(
         media_type="application/json",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@router.post("/{analysis_id}/cancel")
+def cancel_analysis(
+    analysis_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_verified_user)],
+) -> dict:
+    """Explicit user cancellation - the ONLY user-triggered way an analysis
+    ever becomes "cancelled" (a closed browser tab/lost connection is
+    never cancellation; see AnalysisPage's durable reconnect design).
+
+    Runs entirely synchronously in this request - never depends on
+    obtaining a free Celery worker slot, and is never itself dispatched as
+    a Celery task: cancel_analysis_and_cleanup() commits the durable
+    "cancelled" tombstone before doing any cleanup, so even if every
+    worker is currently busy, this endpoint still durably wins.
+
+    Ownership enforced the same way as get_analysis_detail (both
+    analysis_id and current_user.id in one query - a mismatched owner and
+    a nonexistent id are indistinguishable, both 404).
+    """
+    analysis = (
+        db.query(Analysis)
+        .filter(Analysis.id == analysis_id, Analysis.user_id == current_user.id)
+        .first()
+    )
+    if analysis is None:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    if analysis.status == "cancelled":
+        return {"analysis_id": analysis.id, "status": "cancelled"}  # idempotent
+
+    if analysis.status == "completed":
+        raise HTTPException(
+            status_code=409, detail="Completed analyses cannot be cancelled"
+        )
+
+    if analysis.status == "failed":
+        raise HTTPException(
+            status_code=409, detail="Failed analyses cannot be cancelled"
+        )
+
+    # analysis.status in ("pending", "processing") - cancellable.
+    cancel_analysis_and_cleanup(db, analysis_id)
+
+    # Best-effort live notification only (Part K) - DB is already
+    # authoritative regardless of whether this is ever delivered; a lost
+    # event is fully reconstructed by the next durable GET/reconnect via
+    # compute_current_analysis_state's "cancelled" branch.
+    publish_analysis_event(analysis_id, "cancelled", {"analysis_id": analysis_id})
+
+    return {"analysis_id": analysis_id, "status": "cancelled"}
 
 
 def _encode_history_cursor(created_at: datetime, analysis_id: int) -> str:

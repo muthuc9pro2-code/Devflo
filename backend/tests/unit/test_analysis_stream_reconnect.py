@@ -299,6 +299,71 @@ async def test_failed_initial_snapshot_yields_state_then_terminates(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_cancelled_initial_snapshot_yields_state_then_terminates(monkeypatch):
+    """Part K: a snapshot that is already "cancelled" (the analysis was
+    cancelled before this client ever connected/reconnected) must behave
+    exactly like completed/failed above - one state event, then done. No
+    fake progress=100, no investigation_result."""
+    monkeypatch.setattr(analysis_stream.async_redis_client, "pubsub", lambda: _FakePubSub([]))
+    monkeypatch.setattr(analysis_stream, "sessionLocal", _session_local(row=SimpleNamespace(id=7)))
+    monkeypatch.setattr(
+        analysis_stream,
+        "compute_current_analysis_state",
+        lambda db, analysis: {"analysis_id": 7, "status": "cancelled"},
+    )
+
+    generator = analysis_stream._analysis_event_stream(7)
+    state_chunk = await generator.__anext__()
+
+    assert state_chunk.startswith("event: state\n")
+    assert '"status":"cancelled"' in state_chunk
+    assert "progress" not in state_chunk
+    with pytest.raises(StopAsyncIteration):
+        await generator.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_live_cancelled_event_is_yielded_once_then_terminates(monkeypatch):
+    """Part K: a client already watching a still-processing analysis that
+    gets cancelled mid-stream must receive the live "cancelled" event
+    (published by POST /analysis/{id}/cancel) exactly once, then the
+    stream ends - the same terminal treatment as a live investigation_result."""
+    class _PubSubWithLiveCancellation(_FakePubSub):
+        def __init__(self, calls):
+            super().__init__(calls)
+            self._delivered = False
+
+        async def get_message(self, **kwargs):
+            if not self._delivered:
+                self._delivered = True
+                return {
+                    "data": json.dumps(
+                        {"event": "cancelled", "data": {"analysis_id": 7}}
+                    )
+                }
+            return None
+
+    monkeypatch.setattr(
+        analysis_stream.async_redis_client, "pubsub", lambda: _PubSubWithLiveCancellation([])
+    )
+    monkeypatch.setattr(analysis_stream, "sessionLocal", _session_local(row=SimpleNamespace(id=7)))
+    monkeypatch.setattr(
+        analysis_stream,
+        "compute_current_analysis_state",
+        lambda db, analysis: {"analysis_id": 7, "status": "processing", "progress": 40},
+    )
+
+    generator = analysis_stream._analysis_event_stream(7)
+    await generator.__anext__()  # state
+    cancelled_chunk = await generator.__anext__()
+
+    assert cancelled_chunk.startswith("event: cancelled\n")
+    assert '"analysis_id":7' in cancelled_chunk
+    with pytest.raises(StopAsyncIteration):
+        await generator.__anext__()
+
+
+@pytest.mark.asyncio
 async def test_live_investigation_result_is_yielded_once_then_terminates(monkeypatch):
     class _PubSubWithLiveResult(_FakePubSub):
         def __init__(self, calls):

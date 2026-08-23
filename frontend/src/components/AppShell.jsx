@@ -37,6 +37,15 @@ export default function AppShell({ pathname, navigate }) {
   const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 900px)').matches)
   const historyRequestRef = useRef(0)
   const liveStatusRef = useRef(new Map())
+  // Ids explicitly cancelled this session - never a History item again,
+  // even if a History fetch was already in flight when cancellation
+  // happened and its (pre-cancel) page lands afterward. The backend
+  // already excludes cancelled analyses from /analysis/history at the
+  // query level, so this only ever matters for that one race window; it
+  // is deliberately never pruned back down (a handful of ids for the
+  // life of this tab is negligible, and removing entries would just
+  // reopen the exact race this exists to close).
+  const cancelledIdsRef = useRef(new Set())
   const drawerRef = useRef(null)
   const drawerCloseRef = useRef(null)
   const menuButtonRef = useRef(null)
@@ -57,17 +66,25 @@ export default function AppShell({ pathname, navigate }) {
       setHistory((current) => {
         if (!append) {
           const currentById = new Map(current.map((item) => [Number(item.analysis_id), item]))
-          return page.items.map((item) => {
-            const analysisId = Number(item.analysis_id)
-            const reconciled = reconcileHistoryItem(item, currentById.get(analysisId))
-            const liveStatus = liveStatusRef.current.get(analysisId)
-            return liveStatus
-              ? reconcileHistoryItem(reconciled, { ...reconciled, status: liveStatus })
-              : reconciled
-          })
+          return page.items
+            .filter((item) => !cancelledIdsRef.current.has(Number(item.analysis_id)))
+            .map((item) => {
+              const analysisId = Number(item.analysis_id)
+              const reconciled = reconcileHistoryItem(item, currentById.get(analysisId))
+              const liveStatus = liveStatusRef.current.get(analysisId)
+              return liveStatus
+                ? reconcileHistoryItem(reconciled, { ...reconciled, status: liveStatus })
+                : reconciled
+            })
         }
         const known = new Set(current.map((item) => item.analysis_id))
-        return [...current, ...page.items.filter((item) => !known.has(item.analysis_id))]
+        return [
+          ...current,
+          ...page.items.filter((item) => (
+            !known.has(item.analysis_id)
+            && !cancelledIdsRef.current.has(Number(item.analysis_id))
+          )),
+        ]
       })
       setNextCursor(page.next_cursor)
     } catch (error) {
@@ -188,6 +205,19 @@ export default function AppShell({ pathname, navigate }) {
     }))
   }, [])
 
+  // Deliberately distinct from handleStatusChange above: a cancelled
+  // analysis must disappear from History outright, not just get relabeled
+  // in place. cancelledIdsRef.current is checked by loadHistory's own
+  // merge (see above) so this is race-proof even against a History fetch
+  // that was already in flight before cancellation committed and lands
+  // afterward with a stale (pre-cancel) copy of this item.
+  const handleCancelled = useCallback((cancelledAnalysisId) => {
+    const id = Number(cancelledAnalysisId)
+    cancelledIdsRef.current.add(id)
+    liveStatusRef.current.delete(id)
+    setHistory((current) => current.filter((item) => Number(item.analysis_id) !== id))
+  }, [])
+
   const handleLogout = useCallback(async () => {
     try {
       await logout()
@@ -264,6 +294,7 @@ export default function AppShell({ pathname, navigate }) {
               historyItem={historyItem}
               onSettled={handleSettled}
               onStatusChange={handleStatusChange}
+              onCancelled={handleCancelled}
             />
           )}
         </main>

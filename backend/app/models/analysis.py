@@ -28,10 +28,27 @@ class Analysis(Base):
     source_failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     status: Mapped[str] = mapped_column(
-        Enum("pending", "processing", "completed", "failed", name="analysis_status"),
+        Enum(
+            "pending", "processing", "completed", "failed", "cancelled",
+            name="analysis_status",
+        ),
         default="pending",
         nullable=False,
     )
+
+    # Throttled liveness signal (see app/tasks/analysis.py's heartbeat
+    # helper) - the ONLY thing that lets stale/orphan recovery tell a
+    # genuinely-interrupted pending/processing analysis apart from a
+    # healthy one, since ordinary per-batch artifact commits deliberately
+    # do NOT dirty this row (see AnalysisArtifact.processed_bytes/
+    # last_processed_line instead). Also reused, unmodified, as the
+    # recovery scan's atomic claim fence - a conditional UPDATE against
+    # this same column - so no separate lease/lock field exists. Never
+    # meaningful once the analysis reaches a terminal status.
+    processing_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

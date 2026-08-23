@@ -997,6 +997,12 @@ pre { margin: 0; }
   color: var(--danger);
 }
 
+.state-icon-warning {
+  border: 1px solid rgba(223, 188, 105, 0.3);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
 .state-actions {
   display: flex;
   gap: 0.6rem;
@@ -1097,6 +1103,25 @@ pre { margin: 0; }
   margin: 0.6rem 0 0;
   color: var(--warning);
   font-size: 0.7rem;
+}
+
+.processing-cancel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-top: clamp(0.9rem, 2.4vh, 1.4rem);
+}
+
+.processing-cancel .btn-ghost {
+  min-height: 34px;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.78rem;
+}
+
+.processing-cancel-error {
+  margin: 0.5rem 0 0;
+  color: var(--danger);
+  font-size: 0.72rem;
 }
 
 .processing-files {

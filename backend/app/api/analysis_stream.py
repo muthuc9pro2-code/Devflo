@@ -130,14 +130,15 @@ async def _analysis_event_stream(analysis_id: int):
 
         yield _sse_event("state", initial_state)
 
-        # For a snapshot that is already terminal (completed/failed), there
-        # is nothing further this stream can ever meaningfully deliver:
-        # investigation_result (for "completed") is already inside the
-        # snapshot just yielded, and a "failed" analysis will never
-        # publish one. Ending here also means a stray buffered live
-        # investigation_result for this same analysis is never relayed a
-        # second time - DB state is the source of truth.
-        if initial_state.get("status") in ("completed", "failed"):
+        # For a snapshot that is already terminal (completed/failed/
+        # cancelled), there is nothing further this stream can ever
+        # meaningfully deliver: investigation_result (for "completed") is
+        # already inside the snapshot just yielded, and "failed"/
+        # "cancelled" will never publish one. Ending here also means a
+        # stray buffered live investigation_result/cancelled for this same
+        # analysis is never relayed a second time - DB state is the source
+        # of truth.
+        if initial_state.get("status") in ("completed", "failed", "cancelled"):
             return
 
         # Guard against a stale queued progress tick from the
@@ -205,10 +206,13 @@ async def _analysis_event_stream(analysis_id: int):
                         continue
                     min_progress = progress
 
-            if event_name == "investigation_result":
-                # The single authoritative final payload - delivered
-                # exactly once, then this stream is finished. No
-                # heartbeat/progress follows it.
+            if event_name in ("investigation_result", "cancelled"):
+                # The single authoritative final event for this stream -
+                # delivered exactly once, then finished. No heartbeat/
+                # progress follows it. Even if this live event is lost
+                # entirely, DB reconnect reconstructs "cancelled" the same
+                # way (compute_current_analysis_state) - this is a UX
+                # nicety, never the source of truth.
                 yield _sse_event(event_name, event_data)
                 return
 

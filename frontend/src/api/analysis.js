@@ -29,6 +29,12 @@ export function getAnalysisDetail(analysisId) {
   return request(`/analysis/${encodeURIComponent(analysisId)}`)
 }
 
+export function cancelAnalysis(analysisId) {
+  return request(`/analysis/${encodeURIComponent(analysisId)}/cancel`, {
+    method: 'POST',
+  })
+}
+
 function parseEventData(event) {
   try {
     return JSON.parse(event.data)
@@ -39,7 +45,7 @@ function parseEventData(event) {
 
 export function subscribeToAnalysisEvents(
   analysisId,
-  { onState, onProgress, onArtifactOutcome, onResult, onOpen, onError },
+  { onState, onProgress, onArtifactOutcome, onResult, onCancelled, onOpen, onError },
 ) {
   const source = new EventSource(
     `/analyses/${encodeURIComponent(analysisId)}/events`,
@@ -57,6 +63,7 @@ export function subscribeToAnalysisEvents(
   listen('progress', onProgress)
   listen('artifact_outcome', onArtifactOutcome)
   listen('investigation_result', onResult)
+  listen('cancelled', onCancelled)
   source.onopen = () => onOpen?.()
   source.onerror = (event) => onError?.(event)
 

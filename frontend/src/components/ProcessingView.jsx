@@ -109,6 +109,9 @@ export default function ProcessingView({
   filenames,
   artifacts,
   artifactCount,
+  onCancel,
+  cancelling,
+  cancelError,
 }) {
   const displayedProgress = useAnimatedProgress(progress)
   const { rows, ambiguousOutcomes } = useMemo(
@@ -156,6 +159,22 @@ export default function ProcessingView({
             </p>
           )}
         </div>
+
+        {(status === 'pending' || status === 'processing') && (
+          <div className="processing-cancel">
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={onCancel}
+              disabled={cancelling}
+            >
+              {cancelling ? 'Cancelling…' : 'Cancel analysis'}
+            </button>
+            {cancelError && (
+              <p className="processing-cancel-error" role="alert">{cancelError}</p>
+            )}
+          </div>
+        )}
       </div>
 
       {(rows.length > 0 || unknownCount > 0) && (

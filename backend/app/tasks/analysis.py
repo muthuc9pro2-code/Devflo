@@ -1,10 +1,11 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from os.path import getsize
 from pathlib import Path
 from time import perf_counter
 from time import time as wall_time
 from celery import chain, chord, group
-from sqlalchemy import func
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session
 from app.core.celery_app import celery_app
 from app.core.processing_config import (
@@ -84,6 +85,97 @@ logger = logging.getLogger(__name__)
 # count before the next artifact's band begins.
 _GLOBAL_LINE_NUMBER_STRIDE = 10**9
 
+# --- Cancellation -----------------------------------------------------
+#
+# DB is authoritative for cancellation, exactly like everything else in
+# this pipeline. No Redis flag, no process-global set, no frontend-only
+# state: every checkpoint below is a real read of Analysis.status (either
+# the already-loaded ORM object at a function's entry, or one small fresh
+# query at a later point where meaningful time may have passed).
+#
+# Checkpoints exist only at meaningful stage boundaries - dispatch entry,
+# per-artifact-task entry, before/after the external Gemini call, and
+# immediately before the final result/status commit - never per log line,
+# per parsed record, or per byte. See _is_analysis_cancelled/_bail_if_cancelled
+# below and their call sites.
+
+
+def _is_analysis_cancelled(db: Session, analysis_id: int) -> bool:
+    return (
+        db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
+        == "cancelled"
+    )
+
+
+def _bail_if_cancelled(db: Session, analysis_id: int, stage: str) -> bool:
+    """Fresh, cheap (single indexed column) re-check at a finalize-stage
+    boundary where real time may have passed since analysis.status was
+    last read (Gemini calls in particular). Returns True (and logs) when
+    finalize must stop here WITHOUT touching Analysis/Evidence at all -
+    the cancel endpoint has already durably reset/cleared everything for
+    this analysis; stale finalization must never re-create result data or
+    resurrect cancelled -> completed."""
+    if _is_analysis_cancelled(db, analysis_id):
+        logger.info(
+            "Analysis %s | cancelled; stopping finalize at %s", analysis_id, stage
+        )
+        return True
+    return False
+
+
+# --- Recovery / orphan detection --------------------------------------
+#
+# Analysis.processing_heartbeat_at is a throttled liveness signal, never a
+# second progress-tracking system: ordinary per-batch artifact commits
+# deliberately do not dirty the shared Analysis row (Section 5), so this
+# is the one place that does, and only rarely.
+_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
+
+# Process-local (Celery workers are separate OS processes, same caveat as
+# _source_index_process_cache below) throttle state - bounded with the
+# same simple FIFO eviction so a long-lived worker touching many analyses
+# cannot grow this unboundedly. Never the source of truth: a missed/lost
+# throttle entry only means one extra (still cheap, still correct) write.
+_last_heartbeat_write: dict[int, float] = {}
+_HEARTBEAT_THROTTLE_CACHE_MAX_ENTRIES = 64
+
+
+def _bump_processing_heartbeat(db: Session, analysis_id: int) -> None:
+    """Best-effort, throttled liveness signal for orphan recovery only -
+    NOT correctness-critical (persisted Evidence/AnalysisArtifact
+    checkpoints remain the real resume state regardless of whether this
+    write ever lands), so a failure here is logged and swallowed, never
+    retried, never allowed to affect the caller.
+
+    Throttled to at most once per _HEARTBEAT_MIN_INTERVAL_SECONDS per
+    analysis_id, independent of how often the caller invokes this - this
+    is what keeps it from recreating the shared-Analysis-row contention
+    Section 5 removed: even a burst of many batches within the throttle
+    window writes the heartbeat at most once, not once per batch.
+    """
+    now = perf_counter()
+    last = _last_heartbeat_write.get(analysis_id, 0.0)
+    if now - last < _HEARTBEAT_MIN_INTERVAL_SECONDS:
+        return
+
+    if len(_last_heartbeat_write) >= _HEARTBEAT_THROTTLE_CACHE_MAX_ENTRIES:
+        oldest_analysis_id = next(iter(_last_heartbeat_write))
+        del _last_heartbeat_write[oldest_analysis_id]
+    _last_heartbeat_write[analysis_id] = now
+
+    try:
+        db.query(Analysis).filter(Analysis.id == analysis_id).update(
+            {"processing_heartbeat_at": datetime.now(timezone.utc)},
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.debug(
+            "Analysis %s | heartbeat write failed", analysis_id, exc_info=True
+        )
+
+
 @celery_app.task
 def process_analysis(analysis_id: int):
     """Dispatch bounded, per-artifact concurrent processing for one analysis.
@@ -106,6 +198,7 @@ def process_analysis(analysis_id: int):
     cannot itself consume a worker slot the children need.
     """
     db = sessionLocal(expire_on_commit=False)
+    finalize_only = False
 
     try:
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -114,11 +207,22 @@ def process_analysis(analysis_id: int):
             logger.warning("Analysis %s not found", analysis_id)
             return
 
-        if analysis.status == "completed":
-            logger.info("Analysis %s is already completed", analysis_id)
+        # Terminal-state guard (Part W): cancelled/completed/failed never
+        # transition back into "processing" - a duplicate/redelivered
+        # dispatch message for any of these is always a no-op. Only
+        # pending/processing may proceed (processing is legitimate here
+        # too: this task itself can be redelivered after a crash between
+        # committing "processing" and dispatching its children below).
+        if analysis.status in ("cancelled", "completed", "failed"):
+            logger.info(
+                "Analysis %s | already %s; not (re)dispatching",
+                analysis_id,
+                analysis.status,
+            )
             return
 
         analysis.status = "processing"
+        analysis.processing_heartbeat_at = datetime.now(timezone.utc)
         db.commit()
 
         publish_progress(
@@ -128,29 +232,60 @@ def process_analysis(analysis_id: int):
             progress=0,
         )
 
-        artifact_ids = [
-            row.id
-            for row in (
-                db.query(AnalysisArtifact)
-                .filter(
-                    AnalysisArtifact.analysis_id == analysis_id,
-                    # Unsupported/duplicate artifacts are already fully
-                    # resolved at upload time (create_analysis) - they are
-                    # never dispatched for ingestion and never produce their
-                    # own Evidence set.
-                    AnalysisArtifact.status.notin_(["unsupported", "duplicate", "resource_limited", "processing_error"]),
-                )
-                .order_by(AnalysisArtifact.position, AnalysisArtifact.id)
-                .all()
-            )
-        ]
-
-        if not artifact_ids:
+        all_artifacts = (
+            db.query(AnalysisArtifact.id, AnalysisArtifact.status)
+            .filter(AnalysisArtifact.analysis_id == analysis_id)
+            .order_by(AnalysisArtifact.position, AnalysisArtifact.id)
+            .all()
+        )
+        if not all_artifacts:
             raise RuntimeError(
                 f"Analysis {analysis_id} has no persisted diagnostic artifacts"
             )
 
-        needs_source_prep = bool(analysis.source_kind)
+        artifact_ids = [
+            row.id
+            for row in all_artifacts
+            # Unsupported/duplicate/resource_limited/processing_error
+            # artifacts are already terminal (the first two resolved at
+            # upload time; the latter two only ever reached DURING a prior
+            # processing attempt) - never (re)dispatched for ingestion,
+            # never produce a new Evidence set.
+            if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
+        ]
+
+        # Part Z zombie case: every artifact already reached SOME terminal
+        # outcome - completed included, not just the 4 statuses excluded
+        # from dispatch above (a "completed" artifact is still present in
+        # artifact_ids, since redispatching it is harmless: _process_
+        # artifact_task's own resumability guard no-ops immediately for it
+        # without reparsing - but it means artifact_ids alone can't tell
+        # "everything is done" apart from "some of this genuinely needs
+        # (re)processing"). This can only happen on a recovered/redelivered
+        # dispatch, never on a fresh upload - upload_file() already rejects
+        # an all-unsupported batch before create_analysis() runs, and
+        # resource_limited/processing_error/completed cannot exist before
+        # any artifact task has ever run. Nothing left to ingest; only
+        # finalization is missing. Invoke the existing finalizer directly
+        # instead of building a chord (empty, or one made only of no-op
+        # redispatches) - it is itself idempotent and re-derives everything
+        # from already-persisted Evidence/checkpoints, never reparsing a
+        # completed artifact.
+        finalize_only = all(
+            row.status in ("completed", "unsupported", "duplicate", "resource_limited", "processing_error")
+            for row in all_artifacts
+        )
+        needs_source_prep = bool(analysis.source_kind) and not finalize_only
+
+        # Re-check immediately before dispatch (Part E): cheap, and closes
+        # the (small) window since the entry check above in case a cancel
+        # request raced in during this synchronous setup.
+        if _is_analysis_cancelled(db, analysis_id):
+            logger.info(
+                "Analysis %s | cancelled before dispatch; not dispatching",
+                analysis_id,
+            )
+            return
     except Exception:
         db.rollback()
         logger.exception("Analysis %s processing failed", analysis_id)
@@ -160,6 +295,15 @@ def process_analysis(analysis_id: int):
         db.close()
 
     dispatch_start = wall_time()
+
+    if finalize_only:
+        logger.info(
+            "Analysis %s | every artifact already terminal; finalizing directly",
+            analysis_id,
+        )
+        _finalize_analysis_task.delay([], analysis_id, dispatch_start)
+        return
+
     artifact_group = group(
         _process_artifact_task.si(analysis_id, artifact_id)
         for artifact_id in artifact_ids
@@ -204,16 +348,35 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             )
             return 0
 
+        # Cancellation checkpoint (Part E/Q Case 2): a stale/redelivered
+        # task for an analysis the user has since cancelled must return
+        # cleanly - no source-index prep, no parsing, no Evidence, no
+        # status resurrection. Checked once here, before any expensive
+        # work for this artifact begins (see the per-batch fence in
+        # _persist_artifact_batch for the part of this check that closes
+        # the cancel-vs-Evidence-commit race for work already in flight).
+        if analysis.status == "cancelled":
+            logger.info(
+                "Analysis %s | cancelled; skipping artifact %s",
+                analysis_id,
+                artifact_id,
+            )
+            return 0
+
         if artifact.status in ("completed", "resource_limited", "processing_error"):
-            # Resumability: process_analysis's dispatch filter only excludes
-            # unsupported/duplicate (statuses that can only ever be decided
-            # at upload time, before any artifact task exists), so a
-            # resumed run (e.g. after a worker crash) can still re-dispatch
-            # an artifact task for one already reaching a controlled,
-            # terminal failure outcome. That outcome is equally final as
+            # Resumability: process_analysis's dispatch filter excludes
+            # unsupported/duplicate/resource_limited/processing_error -
+            # the first two are decided at upload time, before any artifact
+            # task exists; the latter two only ever become true DURING a
+            # prior processing attempt. Either way, a resumed run (e.g.
+            # after a worker crash or a recovery redispatch) can still
+            # re-dispatch a task for an artifact already reaching one of
+            # these terminal outcomes. That outcome is equally final as
             # "completed" - never re-run its (deterministically identical)
             # extraction, evidence cleanup, and status/reason persistence.
             return 0
+
+        _bump_processing_heartbeat(db, analysis_id)
 
         source_index = _prepare_source_index(analysis)
 
@@ -296,6 +459,16 @@ def _prepare_source_task(analysis_id: int) -> None:
             logger.warning("Analysis %s not found for source prep", analysis_id)
             return
 
+        # Cancellation checkpoint (Part E/I): a cancelled analysis must
+        # never start source preparation, and its source_status must never
+        # be written by this task at all - not "ready", not "unavailable".
+        if analysis.status == "cancelled":
+            logger.info(
+                "Analysis %s | cancelled; skipping source preparation",
+                analysis_id,
+            )
+            return
+
         if analysis.source_status == "unavailable":
             logger.info(
                 "Analysis %s | optional source already unavailable; "
@@ -304,8 +477,33 @@ def _prepare_source_task(analysis_id: int) -> None:
             )
             return
 
+        _bump_processing_heartbeat(db, analysis_id)
+
         source_prep_start = perf_counter()
         _prepare_source_index(analysis)
+
+        # Re-check after preparation, before persisting the "ready" state
+        # (Part E: "after preparation before persisting ready state where
+        # practical") - source prep (a real git clone/ZIP extraction) can
+        # take real wall-clock time, during which the analysis may have
+        # been cancelled. A cancelled analysis must never be marked source-
+        # ready; the prepared tree is discarded instead.
+        if _is_analysis_cancelled(db, analysis_id):
+            logger.info(
+                "Analysis %s | cancelled during source preparation; discarding",
+                analysis_id,
+            )
+            try:
+                cleanup_prepared_source(analysis_id)
+            except OSError:
+                logger.warning(
+                    "Analysis %s | could not clean up source prepared for a "
+                    "since-cancelled analysis",
+                    analysis_id,
+                    exc_info=True,
+                )
+            return
+
         analysis.source_status = "ready"
         analysis.source_failure_reason = None
         db.commit()
@@ -319,6 +517,14 @@ def _prepare_source_task(analysis_id: int) -> None:
         db.rollback()
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
         if analysis is None:
+            return
+        if analysis.status == "cancelled":
+            # Never converted to source_status="unavailable" for a
+            # cancelled analysis - the acquisition failure is moot.
+            logger.info(
+                "Analysis %s | cancelled; ignoring source preparation failure",
+                analysis_id,
+            )
             return
 
         source_kind = analysis.source_kind
@@ -381,10 +587,16 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             logger.warning("Analysis %s not found at finalize time", analysis_id)
             return
 
-        if analysis.status == "failed":
+        # Cancellation checkpoint, immediately on entry (Part J): a stale/
+        # redelivered/recovery-triggered finalize for an analysis the user
+        # has since cancelled must do nothing - the cancel endpoint already
+        # durably reset/cleared everything for it. "failed" is likewise
+        # already terminal and must not be reprocessed.
+        if analysis.status in ("cancelled", "failed"):
             logger.info(
-                "Analysis %s | already marked failed; skipping finalize",
+                "Analysis %s | already %s; skipping finalize",
                 analysis_id,
+                analysis.status,
             )
             return
 
@@ -416,6 +628,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 incomplete.status,
             )
             return
+
+        _bump_processing_heartbeat(db, analysis_id)
 
         # Section 9: every artifact task that could ever use the physical
         # prepared source tree (to correlate stack frames and persist
@@ -516,6 +730,12 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             or 0
         )
 
+        # Cancellation checkpoint: before any deterministic identity/
+        # timeline/correlation work, and before the zero-evidence/fallback
+        # path below (both are "the remaining finalize work" this guards).
+        if _bail_if_cancelled(db, analysis_id, "before correlation"):
+            return
+
         if evidence_count == 0:
             # Every artifact reaching finalize is "completed", and since the
             # WHOLE analysis retained zero evidence, every one of them is
@@ -546,8 +766,15 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     fallback_artifacts,
                     artifacts=zero_evidence_artifacts,
                 )
+                if _bail_if_cancelled(db, analysis_id, "before Gemini (fallback)"):
+                    return
                 try:
                     gemini_result = generate_investigation_explanation(fallback_llm_context)
+                    # Part F/J: the external call may have taken real time -
+                    # a cancellation that landed while it was in flight must
+                    # discard this result rather than persist it.
+                    if _bail_if_cancelled(db, analysis_id, "after Gemini (fallback)"):
+                        return
                     fallback_payload["ai_analysis"] = gemini_result.model_dump()
                     # Persisted only after a valid Gemini schema result (see
                     # the CORRELATED/SIMPLE branches below) so reconnect can
@@ -570,7 +797,11 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 if source_outcome is not None:
                     fallback_payload["source"] = source_outcome
                 # Persist-before-publish (locked requirement) - see the
-                # CORRELATED branch below for the full rationale.
+                # CORRELATED branch below for the full rationale. Final
+                # cancellation fence immediately before persistence (Part
+                # J): stale finalization must never do cancelled -> completed.
+                if _bail_if_cancelled(db, analysis_id, "before persistence (fallback)"):
+                    return
                 analysis.result_snapshot = fallback_payload
                 analysis.status = "completed"
                 db.commit()
@@ -600,6 +831,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 zero_evidence_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the
             # CORRELATED branch below for the full rationale.
+            if _bail_if_cancelled(db, analysis_id, "before persistence (zero-evidence)"):
+                return
             analysis.result_snapshot = zero_evidence_payload
             analysis.status = "completed"
             db.commit()
@@ -789,8 +1022,15 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 supplemental_artifacts=supplemental_artifacts,
             )
 
+            if _bail_if_cancelled(db, analysis_id, "before Gemini (correlated)"):
+                return
             try:
                 gemini_result = generate_investigation_explanation(llm_context)
+                # Part F/J: the external call may have taken real time -
+                # discard this result rather than persist it if cancelled
+                # while it was in flight.
+                if _bail_if_cancelled(db, analysis_id, "after Gemini (correlated)"):
+                    return
                 correlation_payload["ai_analysis"] = gemini_result.model_dump()
                 # Persisted only now that Gemini has returned a valid schema
                 # result - lets a client reconnecting after completion see
@@ -823,7 +1063,11 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             # immediately afterward (client disconnected, process crashed),
             # History/reconnect must already have the authoritative result
             # rather than racing a result that only ever went out over the
-            # wire.
+            # wire. Final cancellation fence immediately before persistence
+            # (Part J): stale finalization must never do
+            # cancelled -> completed.
+            if _bail_if_cancelled(db, analysis_id, "before persistence (correlated)"):
+                return
             analysis.result_snapshot = correlation_payload
             analysis.status = "completed"
             db.commit()
@@ -896,8 +1140,15 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 supplemental_artifacts=simple_supplemental_artifacts,
             )
 
+            if _bail_if_cancelled(db, analysis_id, "before Gemini (simple)"):
+                return
             try:
                 gemini_result = generate_investigation_explanation(simple_llm_context)
+                # Part F/J: the external call may have taken real time -
+                # discard this result rather than persist it if cancelled
+                # while it was in flight.
+                if _bail_if_cancelled(db, analysis_id, "after Gemini (simple)"):
+                    return
                 simple_payload["ai_analysis"] = gemini_result.model_dump()
                 # See the CORRELATED branch above: persisted only after a
                 # valid Gemini schema result, so reconnect can reattach it
@@ -917,7 +1168,10 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the
-            # CORRELATED branch above for the full rationale.
+            # CORRELATED branch above for the full rationale. Final
+            # cancellation fence immediately before persistence (Part J).
+            if _bail_if_cancelled(db, analysis_id, "before persistence (simple)"):
+                return
             analysis.result_snapshot = simple_payload
             analysis.status = "completed"
             db.commit()
@@ -1053,13 +1307,28 @@ def _process_artifact(
         )
 
     for batch in create_batches(records):
-        parsed_count += _persist_artifact_batch(
+        batch_result = _persist_artifact_batch(
             db=db,
             analysis=analysis,
             artifact=artifact,
             batch=batch,
             source_index=source_index,
         )
+        if batch_result is None:
+            # Cancellation fence tripped (Part D/F): this batch was
+            # deliberately not persisted, and this analysis is cancelled -
+            # stop consuming the generator and return immediately. Do NOT
+            # fall through to the terminal size-check/status="completed"
+            # write below; this artifact is being abandoned mid-stream, not
+            # finishing normally. The cancel endpoint's own cleanup already
+            # owns resetting this artifact's checkpoint/generated state.
+            logger.info(
+                "Analysis %s | artifact %s | cancelled mid-batch; stopping",
+                analysis.id,
+                artifact.id,
+            )
+            return parsed_count
+        parsed_count += batch_result
         if (
             artifact.processed_bytes - last_progress_query_offset >= progress_query_step
             or artifact.processed_bytes >= artifact.size_bytes
@@ -1235,7 +1504,13 @@ def _persist_artifact_batch(
     artifact: AnalysisArtifact,
     batch,
     source_index=None,
-) -> int:
+) -> int | None:
+    """Returns the number of raw records processed, or None specifically to
+    signal "this analysis was cancelled - stop, nothing was persisted" to
+    the caller's batch loop (see _process_artifact). A real batch is never
+    empty (create_batches never yields one), so len(batch) is always >= 1
+    - None is otherwise unambiguous as the cancellation sentinel.
+    """
 
     important_events = []
     important_append = important_events.append
@@ -1250,9 +1525,42 @@ def _persist_artifact_batch(
 
         if is_evidence_worthy(event):
             important_append(event)
-        
+
     _correlate_source_events(important_events, source_index)
     _assign_batch_fingerprints(important_events)
+
+    # Cancel-vs-Evidence-commit race fence (Part D). A plain unlocked
+    # SELECT here would still leave a check-then-commit gap a concurrent
+    # cancel could land in. with_for_update(read=True) instead takes a
+    # SHARED row lock on this one Analysis row (MySQL: LOCK IN SHARE MODE),
+    # held only until this same transaction's commit/rollback below:
+    #   - multiple concurrent artifact-batch transactions taking a SHARED
+    #     lock never block each other - this is NOT the shared-Analysis-
+    #     row UPDATE contention Section 5 removed, and that stays removed;
+    #     under normal operation (no cancellation in flight) this never
+    #     blocks anything and costs one extra indexed single-row read.
+    #   - it DOES block against the cancel endpoint's own brief, rare
+    #     UPDATE (an EXCLUSIVE lock), and only for the handful of
+    #     milliseconds that commit takes - once unblocked, it is
+    #     guaranteed to observe the true, latest COMMITTED status.
+    # Net effect: if cancellation has already committed by the time this
+    # runs, this batch's Evidence/checkpoint writes are rolled back
+    # instead of committed - a cancelled analysis can never end up with
+    # nonzero Evidence from a batch that "raced" it. Any batch that
+    # commits BEFORE the cancellation tombstone wins is still caught by
+    # the cancel endpoint's own Evidence cleanup, which runs AFTER its
+    # tombstone commits (Part C/G) and deletes everything present at that
+    # moment, including this kind of just-committed batch.
+    current_status = (
+        db.query(Analysis.status)
+        .filter(Analysis.id == analysis.id)
+        .with_for_update(read=True)
+        .scalar()
+    )
+    if current_status == "cancelled":
+        db.rollback()
+        return None
+
     persist_evidence_batch(
         db=db,
         analysis_id=analysis.id,
@@ -1503,12 +1811,132 @@ def _cleanup_completed_diagnostic_files(db: Session, analysis_id: int) -> None:
         _cleanup_diagnostic_artifact_file(saved_file_path)
 
 
+def cancel_analysis_and_cleanup(db: Session, analysis_id: int) -> str | None:
+    """Durably cancel one analysis and best-effort reclaim everything
+    generated for it. Called synchronously from the HTTP cancel endpoint
+    (FastAPI, not Celery) - never depends on a free Celery worker slot
+    (Part F): the tombstone commit below is the entire "cancellation
+    happened" guarantee, independent of whether/when any in-flight worker
+    ever observes it.
+
+    Ordering (Part C) is the whole safety story here:
+      1/2. the durable tombstone (status="cancelled") is established and
+           committed FIRST, before any destructive cleanup;
+      3.   analysis-scoped generated-data cleanup (Evidence, ai_analysis,
+           result_snapshot, abandoned artifact checkpoint state) runs only
+           after that commit;
+      4.   staged-file/source cleanup runs last, reusing the existing safe
+           primitives (_cleanup_diagnostic_artifact_file,
+           cleanup_prepared_source) - never a parallel cleanup system.
+    Step 4's filesystem operations are best-effort: a failure there is
+    logged and swallowed, never propagated. Step 3 is plain in-transaction
+    DB work with no external/filesystem dependency, so it is not swallowed
+    the same way - a failure there propagates to the caller as an error
+    response rather than silently leaving stale Evidence behind. Either
+    way, nothing in this function (or its caller) ever transitions
+    "cancelled" to "failed": the tombstone from step 2 already durably
+    won, and no downstream code path here can revert it.
+
+    Returns the analysis's ORIGINAL status ("pending"/"processing") on a
+    real transition, or None if the analysis does not exist or was not in
+    a cancellable state (the caller - the API endpoint - is expected to
+    have already produced the right HTTP response for "already cancelled"/
+    "completed"/"failed"/not-found; this only guards the rare race where
+    status changed between that read and this call).
+    """
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    if analysis is None or analysis.status not in ("pending", "processing"):
+        return None
+
+    previous_status = analysis.status
+
+    # 1/2: the durable tombstone, committed before any destructive cleanup.
+    analysis.status = "cancelled"
+    db.commit()
+
+    # 3: analysis-scoped generated-data cleanup. Evidence deletion here is
+    # what closes the cancel-vs-Evidence-commit race together with the
+    # per-batch fence in _persist_artifact_batch (Part D): any batch that
+    # already committed Evidence before this tombstone won is captured by
+    # this DELETE (it deletes everything present at this moment); any
+    # batch whose own fence observes the now-committed tombstone rolls
+    # itself back instead of committing more. Either way, Evidence count
+    # for this analysis converges to (and stays at) zero.
+    db.query(Evidence).filter(Evidence.analysis_id == analysis_id).delete(
+        synchronize_session=False
+    )
+    analysis.ai_analysis = None
+    analysis.result_snapshot = None
+    # Only abandoned, still-in-flight artifact state is reset - a terminal
+    # outcome an artifact already reached (completed/resource_limited/
+    # processing_error/unsupported/duplicate) is a truthful historical
+    # record of what happened to THAT artifact and is left exactly as-is.
+    db.query(AnalysisArtifact).filter(
+        AnalysisArtifact.analysis_id == analysis_id,
+        AnalysisArtifact.status.in_(["pending", "processing"]),
+    ).update(
+        {
+            "processed_bytes": 0,
+            "last_processed_line": 0,
+            "fallback_context": None,
+            "failure_reason": None,
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+
+    # 4: staged-file/source cleanup - best-effort, reusing the existing
+    # safe primitives, never re-raised.
+    _source_index_process_cache.pop(analysis_id, None)
+    try:
+        saved_paths = [
+            row[0]
+            for row in db.query(AnalysisArtifact.saved_file_path)
+            .filter(AnalysisArtifact.analysis_id == analysis_id)
+            .all()
+        ]
+        for saved_file_path in saved_paths:
+            _cleanup_diagnostic_artifact_file(saved_file_path)
+    except Exception:
+        logger.warning(
+            "Analysis %s | could not clean up diagnostic files after cancellation",
+            analysis_id,
+            exc_info=True,
+        )
+
+    if analysis.source_kind:
+        try:
+            cleanup_prepared_source(analysis_id)
+        except OSError:
+            logger.warning(
+                "Analysis %s | could not clean up prepared source after cancellation",
+                analysis_id,
+                exc_info=True,
+            )
+
+    logger.info(
+        "Analysis %s | cancelled by user request (was %s)",
+        analysis_id,
+        previous_status,
+    )
+    return previous_status
+
+
 def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
     try:
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-        if analysis is not None:
-            analysis.status = "failed"
-            db.commit()
+        if analysis is None:
+            return
+        # Part J: cancelled is terminal and user-authoritative - an
+        # unexpected exception elsewhere in a stale/redelivered task for an
+        # already-cancelled analysis must never resurrect/reinterpret it as
+        # "failed". completed is left the same way for symmetry, though in
+        # practice every caller of this helper already guards against a
+        # completed analysis reaching it.
+        if analysis.status in ("cancelled", "completed"):
+            return
+        analysis.status = "failed"
+        db.commit()
     except Exception:
         db.rollback()
         logger.exception("Could not mark analysis %s as failed", analysis_id)
@@ -1638,6 +2066,14 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
     if analysis.status == "failed":
         return {"analysis_id": analysis.id, "status": "failed"}
 
+    if analysis.status == "cancelled":
+        # Small, terminal, durable - never fake progress=100, never an
+        # investigation_result (there is none: the cancel endpoint already
+        # discarded any generated data). Reconstructing this from
+        # Analysis.status alone means it is correct on reconnect/History
+        # detail lookup even if the live cancellation SSE event was lost.
+        return {"analysis_id": analysis.id, "status": "cancelled"}
+
     if analysis.status == "completed":
         return {
             "analysis_id": analysis.id,
@@ -1749,4 +2185,107 @@ def _known_terminal_artifact_outcomes(
         )
         for artifact in terminal
     ]
+
+
+# --- Stale/orphan recovery (Part R-V) -----------------------------------
+#
+# Conservative on purpose: this must never fire during a normal single-
+# stage pause (large parsing, OCR across up to MAX_OCR_IMAGES_PER_
+# INVESTIGATION images, a GitHub clone up to GITHUB_CLONE_TIMEOUT_SECONDS,
+# Gemini's own bounded retries/network waits) and must never duplicate a
+# perfectly healthy in-flight workflow. 10 minutes is comfortably above
+# every one of those individual stage durations while still being short
+# enough that a genuinely-orphaned analysis (worker killed, Redis/broker
+# work lost, machine interrupted) does not sit unrecoverable indefinitely.
+_STALE_ANALYSIS_THRESHOLD_SECONDS = 600
+
+# Bounded per scan tick - recovery redispatches at most this many stale
+# analyses per Beat firing, so even a large backlog after an extended
+# outage cannot flood the worker pool or the DB in one tick; the next
+# scheduled tick picks up whatever remains.
+_RECOVERY_SCAN_BATCH_LIMIT = 25
+
+
+@celery_app.task
+def recover_stale_analyses() -> int:
+    """Celery Beat periodic task (see celery_app.py's beat_schedule) - the
+    ONLY place Devflo ever redispatches a pending/processing analysis after
+    an unexpected interruption. Deliberately NOT run on FastAPI startup
+    and NOT triggered by frontend page load (Part R/U): either would risk
+    duplicating a perfectly healthy in-flight Celery workflow on a plain
+    API-process restart, which has nothing to do with whether the actual
+    worker/broker work is still alive.
+
+    "Stale" means status is "pending" or "processing" AND
+    processing_heartbeat_at is NULL or older than
+    _STALE_ANALYSIS_THRESHOLD_SECONDS - see that constant for why the
+    threshold is safe against normal long-running stages. cancelled/
+    completed/failed analyses are never candidates (excluded by the status
+    filter itself).
+
+    Claim is atomic and race-safe (Part V) against a second concurrent
+    scan, or this same task overlapping its own next Beat tick if a prior
+    run is unexpectedly slow: each candidate is claimed with one
+    conditional UPDATE ... WHERE status IN (...) AND heartbeat is still
+    stale, re-using processing_heartbeat_at itself as the claim fence (no
+    separate lease field). Only a candidate whose UPDATE actually affected
+    a row is redispatched; a second scanner racing the same row finds the
+    heartbeat already refreshed by the first and claims nothing, so at
+    most one logical process_analysis() redispatch happens per orphaned
+    analysis per genuinely-stale window.
+    """
+    db = sessionLocal()
+    claimed_ids: list[int] = []
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=_STALE_ANALYSIS_THRESHOLD_SECONDS
+        )
+        stale_filter = (
+            Analysis.status.in_(["pending", "processing"]),
+            or_(
+                Analysis.processing_heartbeat_at.is_(None),
+                Analysis.processing_heartbeat_at < cutoff,
+            ),
+        )
+        candidate_ids = [
+            row[0]
+            for row in db.query(Analysis.id)
+            .filter(*stale_filter)
+            .order_by(Analysis.id)
+            .limit(_RECOVERY_SCAN_BATCH_LIMIT)
+            .all()
+        ]
+
+        now = datetime.now(timezone.utc)
+        for analysis_id in candidate_ids:
+            result = db.execute(
+                update(Analysis)
+                .where(Analysis.id == analysis_id, *stale_filter)
+                .values(processing_heartbeat_at=now)
+                # Only result.rowcount below is ever consulted - this claim
+                # never depends on the ORM's in-memory identity map being
+                # kept in sync, so skip it (same as cancel_analysis_and_
+                # cleanup's bulk Evidence/artifact updates above).
+                .execution_options(synchronize_session=False)
+            )
+            db.commit()
+            if result.rowcount == 1:
+                claimed_ids.append(analysis_id)
+    except Exception:
+        db.rollback()
+        logger.exception("Stale analysis recovery scan failed")
+        raise
+    finally:
+        db.close()
+
+    for analysis_id in claimed_ids:
+        logger.warning(
+            "Analysis %s | reclaimed as stale/orphaned after no activity for "
+            "over %ss; redispatching",
+            analysis_id,
+            _STALE_ANALYSIS_THRESHOLD_SECONDS,
+        )
+        process_analysis.delay(analysis_id)
+
+    return len(claimed_ids)
 

@@ -236,7 +236,7 @@ def test_dispatch_publishes_progress_zero_first(monkeypatch):
     analysis = SimpleNamespace(id=9, status="pending", source_kind=None)
     db.query.return_value.filter.return_value.first.return_value = analysis
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
-        SimpleNamespace(id=101)
+        SimpleNamespace(id=101, status="pending")
     ]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     monkeypatch.setattr(analysis_task, "group", Mock(return_value=SimpleNamespace()))

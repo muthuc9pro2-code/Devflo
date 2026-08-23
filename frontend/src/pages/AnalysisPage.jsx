@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  cancelAnalysis,
   getAnalysisDetail,
   subscribeToAnalysisEvents,
 } from '../api/analysis'
@@ -10,6 +11,12 @@ import { useRouter } from '../router/useRouter'
 
 const DURABLE_CHECK_INTERVAL_MS = 15_000
 const RECONNECT_DELAY_MS = 1_200
+// How long the brief "Analysis cancelled" notice stays up (direct
+// navigation / reconnect / live-SSE-observed cancellation) before this
+// page moves on by itself - a button-click cancel (Part N) skips this
+// entirely and navigates away immediately, since the user already knows
+// what they just did.
+const CANCELLED_NOTICE_MS = 1_800
 
 function readUploadManifest(analysisId) {
   try {
@@ -45,12 +52,21 @@ const INITIAL_STATE = {
   error: '',
 }
 
-export default function AnalysisPage({ analysisId, historyItem, onSettled, onStatusChange }) {
+export default function AnalysisPage({ analysisId, historyItem, onSettled, onStatusChange, onCancelled }) {
   const { navigate } = useRouter()
   const [view, setView] = useState(INITIAL_STATE)
   const [retryKey, setRetryKey] = useState(0)
+  const [cancelling, setCancelling] = useState(false)
+  const [cancelError, setCancelError] = useState('')
   const settledCallbackRef = useRef(onSettled)
   const statusCallbackRef = useRef(onStatusChange)
+  const cancelledCallbackRef = useRef(onCancelled)
+  // Bridges the cancel button (rendered outside this effect) to the
+  // request-cancellation closure defined inside it, which is the only
+  // place with access to this mount's terminal/timer/stream state -
+  // mirrors the opposite-direction settledCallbackRef/statusCallbackRef
+  // bridges above.
+  const requestCancelRef = useRef(() => {})
 
   useEffect(() => {
     settledCallbackRef.current = onSettled
@@ -59,6 +75,10 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
   useEffect(() => {
     statusCallbackRef.current = onStatusChange
   }, [onStatusChange])
+
+  useEffect(() => {
+    cancelledCallbackRef.current = onCancelled
+  }, [onCancelled])
 
   const manifestFiles = useMemo(() => readUploadManifest(analysisId), [analysisId])
   const filenames = manifestFiles.length > 0
@@ -71,6 +91,7 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
     let closeEventSource = null
     let reconnectTimer = null
     let durableTimer = null
+    let cancelledNoticeTimer = null
     let requestInFlight = false
     let highWaterProgress = 0
     let hasReportedSettled = false
@@ -79,8 +100,10 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
     const clearTimers = () => {
       if (reconnectTimer) window.clearTimeout(reconnectTimer)
       if (durableTimer) window.clearTimeout(durableTimer)
+      if (cancelledNoticeTimer) window.clearTimeout(cancelledNoticeTimer)
       reconnectTimer = null
       durableTimer = null
+      cancelledNoticeTimer = null
     }
 
     const closeStream = () => {
@@ -137,6 +160,41 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
       reportSettled()
     }
 
+    // Shared by both cancellation-observation paths (durable state /
+    // live SSE "cancelled" event, and the button-click success path
+    // below): stop everything durably, tell AppShell so the item is
+    // removed from local History immediately (never just relabeled -
+    // see cancelledCallbackRef/onCancelled), and resync History for
+    // good measure. Deliberately does NOT go through reportStatus -
+    // AppShell's onStatusChange path only relabels an item in place,
+    // which would leave a cancelled analysis visible in History.
+    const markCancelledLocally = () => {
+      terminal = true
+      clearTimers()
+      closeStream()
+      cancelledCallbackRef.current?.(analysisId)
+      reportSettled()
+    }
+
+    // Used when cancellation is *observed* rather than just performed by
+    // this tab (direct navigation to an already-cancelled id, a durable
+    // reconnect poll, or a live SSE "cancelled" event arriving while this
+    // page is open) - briefly explains what happened, then moves on.
+    const finishWithCancelled = () => {
+      if (disposed || terminal) return
+      markCancelledLocally()
+      setView((current) => ({
+        ...current,
+        mode: 'cancelled',
+        status: 'cancelled',
+        connectionState: 'closed',
+        error: '',
+      }))
+      cancelledNoticeTimer = window.setTimeout(() => {
+        if (!disposed) navigate('/new')
+      }, CANCELLED_NOTICE_MS)
+    }
+
     const applyDurableState = (state) => {
       if (disposed || terminal || !state) return true
       if (state.status === 'completed' && state.investigation_result) {
@@ -145,6 +203,10 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
       }
       if (state.status === 'failed') {
         finishWithFailure()
+        return true
+      }
+      if (state.status === 'cancelled') {
+        finishWithCancelled()
         return true
       }
       if (state.status !== 'pending' && state.status !== 'processing') return false
@@ -225,6 +287,7 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
           }))
         },
         onResult: finishWithResult,
+        onCancelled: finishWithCancelled,
         onError: () => {
           if (disposed || terminal) return
           closeStream()
@@ -282,6 +345,37 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
       }
     }
 
+    // Plain closure-local flag, not the `cancelling` React state - this
+    // callback is created once per effect run (mirrors terminal/disposed
+    // above) and reading component state here would only ever see the
+    // value from mount time. The disabled button is the real double-click
+    // guard; this just avoids two in-flight POSTs from this closure.
+    let cancelRequestInFlight = false
+
+    const requestCancel = async () => {
+      if (disposed || terminal || cancelRequestInFlight) return
+      cancelRequestInFlight = true
+      setCancelling(true)
+      setCancelError('')
+      try {
+        await cancelAnalysis(analysisId)
+        if (disposed || terminal) return
+        // Success is intentional and already understood by the user (they
+        // just clicked the button) - no intermediate notice, straight to
+        // /new, unlike the "observed elsewhere" finishWithCancelled path.
+        markCancelledLocally()
+        navigate('/new')
+      } catch (error) {
+        cancelRequestInFlight = false
+        if (disposed) return
+        setCancelling(false)
+        setCancelError(
+          error instanceof ApiError ? error.message : 'Could not cancel this investigation.',
+        )
+      }
+    }
+    requestCancelRef.current = requestCancel
+
     loadInitialState()
 
     return () => {
@@ -289,7 +383,7 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
       clearTimers()
       closeStream()
     }
-  }, [analysisId, retryKey])
+  }, [analysisId, retryKey, navigate])
 
   if (view.mode === 'loading') {
     return (
@@ -341,6 +435,19 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
     )
   }
 
+  if (view.mode === 'cancelled') {
+    return (
+      <div className="analysis-state-page view-enter">
+        <div className="state-icon state-icon-warning" aria-hidden="true">–</div>
+        <p className="eyebrow">Analysis cancelled</p>
+        <h1>The investigation was cancelled and its generated analysis data was discarded.</h1>
+        <button type="button" className="btn-primary" onClick={() => navigate('/new')}>
+          New investigation
+        </button>
+      </div>
+    )
+  }
+
   if (view.mode === 'completed') {
     return <InvestigationResult result={view.result} />
   }
@@ -356,6 +463,9 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
         filenames={filenames}
         artifacts={view.artifacts}
         artifactCount={historyItem?.artifact_count || manifestFiles.length || view.artifacts.length}
+        onCancel={() => requestCancelRef.current?.()}
+        cancelling={cancelling}
+        cancelError={cancelError}
       />
     </div>
   )
