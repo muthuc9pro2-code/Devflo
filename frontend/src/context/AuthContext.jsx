@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { getMe, login as apiLogin, logout as apiLogout, register as apiRegister } from '../api/auth'
+import { ApiError } from '../api/client'
 import { AuthContext } from './auth-context'
 
 // A verified access-token cookie is the only way `authenticated` happens:
@@ -8,6 +9,14 @@ import { AuthContext } from './auth-context'
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [status, setStatus] = useState('loading') // loading | authenticated | unauthenticated
+  // A controlled backend 503 (core DB/service unavailable) is NOT a logout:
+  // /auth/me failing that way must not be reinterpreted as "session
+  // invalid" (see the catch blocks below and reportServiceUnavailable in
+  // api/client.js). `status` is deliberately left untouched whenever this
+  // is set - App.jsx renders the global unavailable screen ahead of any
+  // status-based routing, and once service returns, status resolves the
+  // normal way (authenticated or genuinely unauthenticated).
+  const [unavailable, setUnavailable] = useState(false)
   const sessionRequestRef = useRef(0)
 
   const refreshSession = useCallback(async ({ throwOnFailure = false } = {}) => {
@@ -20,14 +29,21 @@ export function AuthProvider({ children }) {
       }
       setUser(me)
       setStatus('authenticated')
+      setUnavailable(false)
       return me
     } catch (error) {
       if (requestId !== sessionRequestRef.current) {
         if (throwOnFailure) throw error
         return null
       }
+      if (error instanceof ApiError && error.status === 503) {
+        setUnavailable(true)
+        if (throwOnFailure) throw error
+        return null
+      }
       setUser(null)
       setStatus('unauthenticated')
+      setUnavailable(false)
       if (throwOnFailure) throw error
       return null
     }
@@ -42,9 +58,14 @@ export function AuthProvider({ children }) {
         if (cancelled || requestId !== sessionRequestRef.current) return
         setUser(me)
         setStatus('authenticated')
+        setUnavailable(false)
       })
-      .catch(() => {
+      .catch((error) => {
         if (cancelled || requestId !== sessionRequestRef.current) return
+        if (error instanceof ApiError && error.status === 503) {
+          setUnavailable(true)
+          return
+        }
         setUser(null)
         setStatus('unauthenticated')
       })
@@ -63,6 +84,15 @@ export function AuthProvider({ children }) {
     }
     window.addEventListener('devflo:session-expired', onSessionExpired)
     return () => window.removeEventListener('devflo:session-expired', onSessionExpired)
+  }, [])
+
+  // Centralized 503 signal (api/client.js) from ANY request, not just
+  // /auth/me - a DB outage discovered while e.g. loading History or
+  // polling an analysis must reach this same global state.
+  useEffect(() => {
+    const onServiceUnavailable = () => setUnavailable(true)
+    window.addEventListener('devflo:service-unavailable', onServiceUnavailable)
+    return () => window.removeEventListener('devflo:service-unavailable', onServiceUnavailable)
   }, [])
 
   const login = useCallback(
@@ -87,7 +117,7 @@ export function AuthProvider({ children }) {
   }, [])
 
   return (
-    <AuthContext.Provider value={{ user, status, login, register, logout, refreshSession }}>
+    <AuthContext.Provider value={{ user, status, unavailable, login, register, logout, refreshSession }}>
       {children}
     </AuthContext.Provider>
   )

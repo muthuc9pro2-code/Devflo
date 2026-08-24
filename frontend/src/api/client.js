@@ -51,6 +51,20 @@ function reportExpiredSession() {
   window.dispatchEvent(new Event('devflo:session-expired'))
 }
 
+// One centralized signal for a controlled backend 503 (core DB/service
+// unavailable - see main.py's OperationalError handler), so individual
+// pages/components never need their own DB-specific error handling. The
+// top-level Auth/App layer listens for this and renders one global
+// "temporarily unavailable" screen instead.
+function reportServiceUnavailable() {
+  window.dispatchEvent(new Event('devflo:service-unavailable'))
+}
+
+async function throwApiError(response) {
+  if (response.status === 503) reportServiceUnavailable()
+  throw new ApiError(await parseErrorMessage(response), response.status)
+}
+
 function refreshAccessCookie() {
   if (logoutPending) return null
   if (refreshPromise) return refreshPromise
@@ -104,18 +118,18 @@ export async function request(path, options = {}) {
         if (retryResponse.status === 401 && requestEpoch === sessionEpoch && !logoutPending) {
           reportExpiredSession()
         }
-        throw new ApiError(await parseErrorMessage(retryResponse), retryResponse.status)
+        await throwApiError(retryResponse)
       }
       return retryResponse.status === 204 ? null : retryResponse.json()
     }
     if (refreshResponse.status === 401 || refreshResponse.status === 403) {
       reportExpiredSession()
     }
-    throw new ApiError(await parseErrorMessage(refreshResponse), refreshResponse.status)
+    await throwApiError(refreshResponse)
   }
 
   if (!response.ok) {
-    throw new ApiError(await parseErrorMessage(response), response.status)
+    await throwApiError(response)
   }
 
   return response.status === 204 ? null : response.json()

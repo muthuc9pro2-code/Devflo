@@ -492,8 +492,32 @@ def cancel_analysis(
             status_code=409, detail="Failed analyses cannot be cancelled"
         )
 
-    # analysis.status in ("pending", "processing") - cancellable.
-    cancel_analysis_and_cleanup(db, analysis_id)
+    # analysis.status in ("pending", "processing") at the read above -
+    # cancellable as far as this request knows. cancel_analysis_and_cleanup
+    # re-checks under its own transaction and may still lose the race (a
+    # finalizer's completed/failed commit can land between the read above
+    # and here) - it returns None in that case rather than cancelling
+    # anything, so the response below must reflect what it actually
+    # observed, not the stale read above.
+    previous_status = cancel_analysis_and_cleanup(db, analysis_id)
+
+    if previous_status is None:
+        current_status = (
+            db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
+        )
+        if current_status == "cancelled":
+            return {"analysis_id": analysis_id, "status": "cancelled"}  # idempotent
+        if current_status == "completed":
+            raise HTTPException(
+                status_code=409, detail="Completed analyses cannot be cancelled"
+            )
+        if current_status == "failed":
+            raise HTTPException(
+                status_code=409, detail="Failed analyses cannot be cancelled"
+            )
+        # Analysis vanished or is in an unexpected state - ownership was
+        # already confirmed above, so this only means the row is gone.
+        raise HTTPException(status_code=404, detail="Analysis not found")
 
     # Best-effort live notification only (Part K) - DB is already
     # authoritative regardless of whether this is ever delivered; a lost

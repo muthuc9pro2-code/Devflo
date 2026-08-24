@@ -4,11 +4,19 @@ import { useRouter } from './router/useRouter'
 import LoginPage from './pages/LoginPage'
 import SignupPage from './pages/SignupPage'
 import VerifyEmailPage from './pages/VerifyEmailPage'
+import ServiceUnavailablePage from './pages/ServiceUnavailablePage'
 import AppShell from './components/AppShell'
 
 function Routes() {
   const { pathname, navigate } = useRouter()
-  const { status } = useAuth()
+  const { status, unavailable, refreshSession } = useAuth()
+
+  // A confirmed backend 503 (core DB/service unavailable) overrides every
+  // other route - History, current Analysis state, and auth verification
+  // are all unusable without the DB, so nothing else here can be trusted.
+  if (unavailable) {
+    return <ServiceUnavailablePage onRetry={refreshSession} />
+  }
 
   if (pathname === '/verify-email') {
     return <VerifyEmailPage />

@@ -122,6 +122,9 @@ Rules:
   groups unless the supplied evidence supports doing so.
 - Use artifact filenames and formats when they help explain which evidence
   supports a finding.
+- In all user-facing response text, including uncertainty, refer to diagnostic
+  artifacts by source_file when available. Do not expose internal numeric
+  artifact_id values as artifact names.
 - If source_matches are provided, explain the relevant file, function, and line
   without claiming that the matched line is definitely defective.
 - If no source match exists, do not invent one.
@@ -150,7 +153,9 @@ Rules:
 - Never state that a recommendation is guaranteed to fix the incident.
 - Uncertainty must describe specific limitations in the supplied evidence, such
   as missing telemetry, weak correlation, conflicting evidence, isolated events,
-  incomplete source matches, or unreliable OCR. Do not add generic AI disclaimers.
+  unavailable source code, or unreliable OCR. When no source code was supplied
+  for the investigation, describe this as "no source code was provided" rather
+  than "no source matches were provided". Do not add generic AI disclaimers.
 - Keep the response concise. Do not repeat the same evidence across sections
   unless necessary for understanding.
 

@@ -123,6 +123,57 @@ def _bail_if_cancelled(db: Session, analysis_id: int, stage: str) -> bool:
     return False
 
 
+def _finalize_commit_if_processing(
+    db: Session,
+    analysis: Analysis,
+    *,
+    result_snapshot: dict,
+    stage: str,
+) -> bool:
+    """The final transactional fence for every completed-persistence branch
+    in _finalize_analysis_task() (fallback/zero-evidence/correlated/simple).
+
+    The ordinary _bail_if_cancelled() checkpoints above are plain unlocked
+    SELECTs - useful early exits, but each still leaves a check-then-commit
+    gap a concurrent cancel_analysis_and_cleanup() commit can land in
+    between the check and this function's own commit. This closes that gap
+    the same way _persist_artifact_batch's cancel-vs-Evidence fence already
+    does it (see its "Cancel-vs-Evidence-commit race fence" comment): a
+    locking read (SELECT ... FOR UPDATE) on this one Analysis row, which
+    either already observes a committed non-"processing" status, or blocks
+    until the cancel endpoint's own UPDATE commits/rolls back and then
+    observes its result - never a stale snapshot read.
+
+    Returns False (after rolling back any pending ORM changes made earlier
+    in the branch, e.g. analysis.ai_analysis set after a Gemini call) if
+    cancellation (or, defensively, any other terminal transition) already
+    won by the time this runs - the caller must then return immediately
+    without persisting or publishing a completed result. Returns True only
+    after result_snapshot/status="completed" have been committed.
+    """
+    current_status = (
+        db.query(Analysis.status)
+        .filter(Analysis.id == analysis.id)
+        .with_for_update()
+        .scalar()
+    )
+    if current_status != "processing":
+        db.rollback()
+        logger.info(
+            "Analysis %s | status=%s at final persistence (%s); discarding "
+            "completed result",
+            analysis.id,
+            current_status,
+            stage,
+        )
+        return False
+
+    analysis.result_snapshot = result_snapshot
+    analysis.status = "completed"
+    db.commit()
+    return True
+
+
 # --- Recovery / orphan detection --------------------------------------
 #
 # Analysis.processing_heartbeat_at is a throttled liveness signal, never a
@@ -798,13 +849,12 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     fallback_payload["source"] = source_outcome
                 # Persist-before-publish (locked requirement) - see the
                 # CORRELATED branch below for the full rationale. Final
-                # cancellation fence immediately before persistence (Part
+                # transactional fence immediately before persistence (Part
                 # J): stale finalization must never do cancelled -> completed.
-                if _bail_if_cancelled(db, analysis_id, "before persistence (fallback)"):
+                if not _finalize_commit_if_processing(
+                    db, analysis, result_snapshot=fallback_payload, stage="fallback"
+                ):
                     return
-                analysis.result_snapshot = fallback_payload
-                analysis.status = "completed"
-                db.commit()
                 _cleanup_completed_diagnostic_files(db, analysis_id)
 
                 logger.info(
@@ -830,12 +880,12 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             if source_outcome is not None:
                 zero_evidence_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the
-            # CORRELATED branch below for the full rationale.
-            if _bail_if_cancelled(db, analysis_id, "before persistence (zero-evidence)"):
+            # CORRELATED branch below for the full rationale. Final
+            # transactional fence immediately before persistence (Part J).
+            if not _finalize_commit_if_processing(
+                db, analysis, result_snapshot=zero_evidence_payload, stage="zero-evidence"
+            ):
                 return
-            analysis.result_snapshot = zero_evidence_payload
-            analysis.status = "completed"
-            db.commit()
             _cleanup_completed_diagnostic_files(db, analysis_id)
 
             logger.info(
@@ -1063,14 +1113,13 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             # immediately afterward (client disconnected, process crashed),
             # History/reconnect must already have the authoritative result
             # rather than racing a result that only ever went out over the
-            # wire. Final cancellation fence immediately before persistence
+            # wire. Final transactional fence immediately before persistence
             # (Part J): stale finalization must never do
             # cancelled -> completed.
-            if _bail_if_cancelled(db, analysis_id, "before persistence (correlated)"):
+            if not _finalize_commit_if_processing(
+                db, analysis, result_snapshot=correlation_payload, stage="correlated"
+            ):
                 return
-            analysis.result_snapshot = correlation_payload
-            analysis.status = "completed"
-            db.commit()
             _cleanup_completed_diagnostic_files(db, analysis_id)
             logger.info(
                 "Analysis %s | TOTAL processing time %.2fs",
@@ -1169,12 +1218,11 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 simple_payload["source"] = source_outcome
             # Persist-before-publish (locked requirement) - see the
             # CORRELATED branch above for the full rationale. Final
-            # cancellation fence immediately before persistence (Part J).
-            if _bail_if_cancelled(db, analysis_id, "before persistence (simple)"):
+            # transactional fence immediately before persistence (Part J).
+            if not _finalize_commit_if_processing(
+                db, analysis, result_snapshot=simple_payload, stage="simple"
+            ):
                 return
-            analysis.result_snapshot = simple_payload
-            analysis.status = "completed"
-            db.commit()
             _cleanup_completed_diagnostic_files(db, analysis_id)
             logger.info(
                 "Analysis %s | TOTAL processing time %.2fs",
@@ -1329,6 +1377,15 @@ def _process_artifact(
             )
             return parsed_count
         parsed_count += batch_result
+        # Best-effort liveness refresh at a coarse persisted-progress
+        # boundary (Section: heartbeat during long artifact processing) -
+        # safe to call once per batch only because _bump_processing_
+        # heartbeat itself throttles to at most one real DB write per
+        # _HEARTBEAT_MIN_INTERVAL_SECONDS per analysis; a single genuinely
+        # long artifact (many batches, well past that interval) would
+        # otherwise never refresh Analysis.processing_heartbeat_at between
+        # this task's own start/entry heartbeat and its terminal commit.
+        _bump_processing_heartbeat(db, analysis.id)
         if (
             artifact.processed_bytes - last_progress_query_offset >= progress_query_step
             or artifact.processed_bytes >= artifact.size_bytes

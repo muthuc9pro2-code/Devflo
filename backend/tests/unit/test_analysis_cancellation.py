@@ -199,6 +199,103 @@ def test_cancel_response_leaks_no_internal_fields(monkeypatch):
     assert set(result.keys()) == {"analysis_id", "status"}
 
 
+# --- Cancel endpoint false-success race: the response must reflect what
+# cancel_analysis_and_cleanup() actually observed, not the endpoint's stale
+# initial read -------------------------------------------------------------
+
+
+def test_cancel_endpoint_does_not_report_cancelled_when_completion_wins_the_race(monkeypatch):
+    """The endpoint's initial read sees "processing", but a competing
+    lifecycle transition (the finalizer) commits "completed" before
+    cancel_analysis_and_cleanup gets to run its own re-check - the helper
+    correctly returns None in that case (see
+    test_cancel_and_cleanup_returns_none_for_a_non_cancellable_analysis).
+    The endpoint used to ignore that return value and report "cancelled"
+    anyway; it must now report the state that actually won instead.
+    Simulated by having the patched helper perform the competing
+    transition itself, then delegate to the real function so its actual
+    None-returning behavior is still exercised end to end."""
+    published = []
+    monkeypatch.setattr(
+        analysis_api, "publish_analysis_event", lambda *a, **k: published.append(a)
+    )
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    analysis_id = analysis.id
+
+    real_cancel_and_cleanup = cancel_analysis_and_cleanup
+
+    def racing_cancel_and_cleanup(db_arg, aid):
+        # Simulates the finalizer's own transaction winning between the
+        # endpoint's initial read (already done, above) and this call.
+        db_arg.query(Analysis).filter(Analysis.id == aid).update({"status": "completed"})
+        db_arg.commit()
+        return real_cancel_and_cleanup(db_arg, aid)
+
+    monkeypatch.setattr(analysis_api, "cancel_analysis_and_cleanup", racing_cancel_and_cleanup)
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.cancel_analysis(analysis_id, db=db, current_user=alice)
+
+    assert error.value.status_code == 409
+    assert "Completed" in error.value.detail
+    assert published == []  # no cancelled SSE event for a completed analysis
+    assert db.query(Analysis).filter(Analysis.id == analysis_id).first().status == "completed"
+
+
+def test_cancel_endpoint_does_not_report_cancelled_when_failure_wins_the_race(monkeypatch):
+    monkeypatch.setattr(analysis_api, "publish_analysis_event", lambda *a, **k: None)
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    analysis_id = analysis.id
+
+    real_cancel_and_cleanup = cancel_analysis_and_cleanup
+
+    def racing_cancel_and_cleanup(db_arg, aid):
+        db_arg.query(Analysis).filter(Analysis.id == aid).update({"status": "failed"})
+        db_arg.commit()
+        return real_cancel_and_cleanup(db_arg, aid)
+
+    monkeypatch.setattr(analysis_api, "cancel_analysis_and_cleanup", racing_cancel_and_cleanup)
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.cancel_analysis(analysis_id, db=db, current_user=alice)
+
+    assert error.value.status_code == 409
+    assert "Failed" in error.value.detail
+    assert db.query(Analysis).filter(Analysis.id == analysis_id).first().status == "failed"
+
+
+def test_cancel_endpoint_is_idempotent_when_another_request_wins_the_cancel_race(monkeypatch):
+    """A losing racer (another concurrent cancel request already won) must
+    still report the same idempotent "cancelled" success, not an error -
+    and must not publish a second/duplicate cancelled event."""
+    published = []
+    monkeypatch.setattr(
+        analysis_api, "publish_analysis_event", lambda *a, **k: published.append(a)
+    )
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    analysis_id = analysis.id
+
+    real_cancel_and_cleanup = cancel_analysis_and_cleanup
+
+    def racing_cancel_and_cleanup(db_arg, aid):
+        real_cancel_and_cleanup(db_arg, aid)  # another request cancels first
+        return None  # this call's own attempt loses the race
+
+    monkeypatch.setattr(analysis_api, "cancel_analysis_and_cleanup", racing_cancel_and_cleanup)
+
+    result = analysis_api.cancel_analysis(analysis_id, db=db, current_user=alice)
+
+    assert result == {"analysis_id": analysis_id, "status": "cancelled"}
+    assert published == []
+    assert db.query(Analysis).filter(Analysis.id == analysis_id).first().status == "cancelled"
+
+
 # --- Part C/D/G: cleanup ordering, cross-analysis isolation, race safety ---
 
 
@@ -565,6 +662,168 @@ def test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_gemini_w
     analysis_task._finalize_analysis_task.run([], analysis_id, None)
 
     assert published == []  # the (post-cancel) result was never published
+    db2 = session_factory()
+    reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "cancelled"
+    assert reloaded.result_snapshot is None
+    assert reloaded.ai_analysis is None
+    db2.close()
+
+
+# --- Finalizer-vs-cancel transactional race (Part J hardening) -------------
+#
+# test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_
+# gemini_was_running above already covers cancellation landing DURING the
+# Gemini call, caught by the existing "after Gemini" _bail_if_cancelled()
+# checkpoint. The tests below cover the separate, narrower gap AFTER that
+# last ordinary checkpoint has already passed (seeing status ==
+# "processing") and BEFORE the completed commit - the window
+# _finalize_commit_if_processing()'s row lock exists to close.
+
+
+def test_finalize_commit_if_processing_discards_when_cancellation_wins_in_the_gap(monkeypatch):
+    """Direct test of the centralized helper every completed-persistence
+    branch in _finalize_analysis_task() now goes through. Cancellation is
+    committed from a second session bound to the SAME engine between
+    loading the `analysis` ORM object and calling the helper - exactly
+    representing a cancel endpoint request that lands in that window, not
+    one already visible at the top of the finalize run."""
+    from app.tasks.analysis import _finalize_commit_if_processing
+
+    session_factory = _db_with_schema(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    analysis_id = analysis.id
+    artifact = _artifact(db, analysis, status="completed")
+    _evidence(db, analysis, artifact)
+
+    # The finalizer's own in-memory pending change (set right after its own
+    # Gemini call, before this final fence) - must never be flushed if
+    # cancellation already won.
+    analysis.ai_analysis = {"title": "stale, must never be persisted"}
+
+    # The race: a second session commits the durable cancel tombstone (and
+    # its Evidence cleanup) in the gap before the helper runs.
+    cancel_db = session_factory()
+    cancel_analysis_and_cleanup(cancel_db, analysis_id)
+    cancel_db.close()
+
+    won = _finalize_commit_if_processing(
+        db, analysis, result_snapshot={"investigation_path": "simple"}, stage="test",
+    )
+
+    assert won is False
+    db2 = session_factory()
+    reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "cancelled"  # never resurrected to completed
+    assert reloaded.result_snapshot is None
+    assert reloaded.ai_analysis is None
+    assert db2.query(Evidence).filter(Evidence.analysis_id == analysis_id).count() == 0
+    db2.close()
+
+
+def test_finalize_commit_if_processing_commits_normally_when_not_cancelled(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    analysis_id = analysis.id
+
+    from app.tasks.analysis import _finalize_commit_if_processing
+
+    won = _finalize_commit_if_processing(
+        db, analysis, result_snapshot={"investigation_path": "zero_evidence"}, stage="test",
+    )
+
+    assert won is True
+    db2 = session_factory()
+    reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "completed"
+    assert reloaded.result_snapshot == {"investigation_path": "zero_evidence"}
+    db2.close()
+
+
+def test_finalize_zero_evidence_branch_completed_persistence_is_fenced(monkeypatch):
+    """Representative branch coverage: the zero-evidence completed-
+    persistence branch, with cancellation landing in the gap AFTER the
+    "before correlation" checkpoint (the only one that runs on this
+    branch) and BEFORE the final commit - injected via
+    build_source_outcome_payload, the real call sandwiched between that
+    checkpoint and _finalize_commit_if_processing on every branch."""
+    session_factory = _db_with_schema(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    analysis_id = analysis.id
+    db.close()
+
+    def fake_source_outcome(*args, **kwargs):
+        cancel_db = session_factory()
+        cancel_analysis_and_cleanup(cancel_db, analysis_id)
+        cancel_db.close()
+        return None
+
+    monkeypatch.setattr(analysis_task, "build_source_outcome_payload", fake_source_outcome)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+    published = []
+    monkeypatch.setattr(
+        analysis_task, "publish_investigation_result", lambda aid, p: published.append(p)
+    )
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert published == []
+    db2 = session_factory()
+    reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "cancelled"
+    assert reloaded.result_snapshot is None
+    db2.close()
+
+
+def test_finalize_fallback_branch_completed_persistence_is_fenced(monkeypatch):
+    """Representative branch coverage: the FALLBACK completed-persistence
+    branch, with cancellation landing AFTER the "after Gemini (fallback)"
+    checkpoint (Gemini itself returns successfully here, unlike the
+    existing in-flight-cancellation test above) and BEFORE the final
+    commit."""
+    from app.schemas.gemini import GeminiInvestigationResponse
+
+    session_factory = _db_with_schema(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    _artifact(
+        db, analysis, status="completed",
+        fallback_context={"kind": "text", "text": "payment worker stops after restart"},
+    )
+    analysis_id = analysis.id
+    db.close()
+
+    fake_result = GeminiInvestigationResponse(
+        title="t", summary="s", probable_root_causes=[], what_happened=[],
+        source_code_findings=[], recommended_actions=[], uncertainties=[],
+    )
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: fake_result
+    )
+
+    def fake_source_outcome(*args, **kwargs):
+        cancel_db = session_factory()
+        cancel_analysis_and_cleanup(cancel_db, analysis_id)
+        cancel_db.close()
+        return None
+
+    monkeypatch.setattr(analysis_task, "build_source_outcome_payload", fake_source_outcome)
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+    published = []
+    monkeypatch.setattr(
+        analysis_task, "publish_investigation_result", lambda aid, p: published.append(p)
+    )
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    assert published == []
     db2 = session_factory()
     reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert reloaded.status == "cancelled"

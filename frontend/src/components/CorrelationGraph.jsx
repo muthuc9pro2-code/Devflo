@@ -18,26 +18,13 @@ import '@xyflow/react/dist/style.css'
 import { formatRelativeMs, formatTimestamp, humanize, isPresent } from '../utils/format'
 
 const ROLE_ORDER = { root: 0, propagation: 1, victim: 2, uncorrelated: 3 }
-const MAX_ROWS_PER_COLUMN = 6
-const NODE_COLUMN_STEP = 300
-const LANE_GAP = 300
-// Vertical distance between adjacent node rows (was 142 - ~26% more
-// breathing room between cards without opening up huge empty gaps).
-const ROW_STEP = 195
-// Directed edges route with getSmoothStepPath; without an explicit
-// stepPosition every parallel edge between the same two columns bends at
-// the exact same X (the default 0.5 midpoint), which is what stacked
-// many edges into one solid-looking rectangular block once their
-// permanent timing labels (which used to visually justify that space)
-// were removed. A small, deterministic set of lanes - keyed off the two
-// connected nodes' stable row positions, not edge array order - spreads
-// those bends out instead.
-const EDGE_STEP_OFFSET = 14
-const DIRECTED_EDGE_LANES = [0.3, 0.5, 0.7]
-// Approximate rendered node card height (CSS min-height is 104px; a
-// little headroom for the subtitle/meta line), used only to size the
-// vertical scrollbar's thumb/track - not layout-critical precision.
-const NODE_HEIGHT_ESTIMATE = 140
+const NODE_WIDTH = 264
+const NODE_HEIGHT_ESTIMATE = 132
+const COLUMN_STEP = 360
+const ROW_STEP = 172
+const UNCORRELATED_GAP = 118
+const EDGE_STEP_OFFSET = 18
+const DIRECTED_EDGE_LANES = [0.34, 0.5, 0.66]
 const FOCUSABLE_SELECTOR = [
   'button:not([disabled])',
   '[href]',
@@ -59,21 +46,27 @@ function nodeSubtitle(node) {
 function IncidentNode({ data, selected }) {
   const { node, relativeMs, isAssociationEndpoint } = data
   const relative = formatRelativeMs(relativeMs)
+  const role = node.role || 'uncorrelated'
+  const source = node.source_file || node.source_format
+  const identity = node.request_id || node.trace_id || node.resolved_identity
 
   return (
-    <div
-      className={`incident-node role-${node.role || 'uncorrelated'}${selected ? ' selected' : ''}${isAssociationEndpoint ? ' association-endpoint' : ''}`}
-    >
+    <div className={`incident-node role-${role}${selected ? ' selected' : ''}${isAssociationEndpoint ? ' association-endpoint' : ''}`}>
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="incident-node-topline">
-        <span>{humanize(node.role || 'uncorrelated')}</span>
+        <span className="node-role">{humanize(role)}</span>
         {node.severity && <span className="node-severity">{node.severity}</span>}
       </div>
       <strong title={nodeHeadline(node)}>{nodeHeadline(node)}</strong>
-      {nodeSubtitle(node) && <p title={nodeSubtitle(node)}>{nodeSubtitle(node)}</p>}
-      <div className="incident-node-meta">
+      {nodeSubtitle(node) && <p className="node-subtitle" title={nodeSubtitle(node)}>{nodeSubtitle(node)}</p>}
+      <div className="incident-node-context">
+        {source && <span title={source}>{source}</span>}
         {relative && <span>{relative}</span>}
+      </div>
+      <div className="incident-node-meta">
+        {identity && <span title={identity}>{identity}</span>}
         {isPresent(node.http_status) && <span>HTTP {node.http_status}</span>}
+        {Number(node.occurrence_count) > 1 && <span>×{node.occurrence_count}</span>}
       </div>
       <Handle type="source" position={Position.Right} isConnectable={false} />
     </div>
@@ -247,70 +240,84 @@ function buildFlowNodes(component) {
   const timelineById = new Map(
     (component.timeline || []).map((entry) => [String(entry.node_id), entry]),
   )
-  const sorted = [...(component.nodes || [])].sort((left, right) => {
+  const nodes = [...(component.nodes || [])]
+  const directed = component.edges || []
+  const validIds = new Set(nodes.map((node) => String(node.id)))
+
+  // Compute a deterministic left-to-right depth from the backend's directed DAG.
+  // Role is still authoritative and visible; depth only prevents dense graphs from
+  // collapsing every propagation node into one giant visual column.
+  const incoming = new Map(nodes.map((node) => [String(node.id), []]))
+  directed.forEach((edge) => {
+    const source = String(edge.source_id ?? edge.source)
+    const target = String(edge.target_id ?? edge.target)
+    if (validIds.has(source) && validIds.has(target)) incoming.get(target).push(source)
+  })
+  const depthMemo = new Map()
+  const depthOf = (id, visiting = new Set()) => {
+    if (depthMemo.has(id)) return depthMemo.get(id)
+    if (visiting.has(id)) return 0
+    const parents = incoming.get(id) || []
+    if (parents.length === 0) { depthMemo.set(id, 0); return 0 }
+    const nextVisiting = new Set(visiting); nextVisiting.add(id)
+    const depth = Math.min(12, 1 + Math.max(...parents.map((parent) => depthOf(parent, nextVisiting))))
+    depthMemo.set(id, depth)
+    return depth
+  }
+
+  const sorted = nodes.sort((left, right) => {
+    const leftId = String(left.id)
+    const rightId = String(right.id)
+    const depthDifference = depthOf(leftId) - depthOf(rightId)
+    if (depthDifference !== 0) return depthDifference
     const roleDifference = (ROLE_ORDER[left.role] ?? 3) - (ROLE_ORDER[right.role] ?? 3)
     if (roleDifference !== 0) return roleDifference
-    const leftTime = timelineById.get(String(left.id))?.relative_ms
-    const rightTime = timelineById.get(String(right.id))?.relative_ms
-    if (isPresent(leftTime) && isPresent(rightTime) && leftTime !== rightTime) return leftTime - rightTime
+    const leftTime = timelineById.get(leftId)?.relative_ms
+    const rightTime = timelineById.get(rightId)?.relative_ms
+    if (isPresent(leftTime) && isPresent(rightTime) && Number(leftTime) !== Number(rightTime)) return Number(leftTime) - Number(rightTime)
     if (isPresent(leftTime) !== isPresent(rightTime)) return isPresent(leftTime) ? -1 : 1
-    return String(left.id).localeCompare(String(right.id))
+    return leftId.localeCompare(rightId)
   })
 
-  const roleTotals = sorted.reduce((totals, node) => {
-    const role = Object.prototype.hasOwnProperty.call(ROLE_ORDER, node.role) ? node.role : 'uncorrelated'
-    totals.set(role, (totals.get(role) || 0) + 1)
-    return totals
-  }, new Map())
-  const primaryRowCount = Math.max(
-    0,
-    ...['root', 'propagation', 'victim'].map((role) => (
-      Math.min(MAX_ROWS_PER_COLUMN, roleTotals.get(role) || 0)
-    )),
-  )
-  const rootColumns = Math.max(1, Math.ceil((roleTotals.get('root') || 0) / MAX_ROWS_PER_COLUMN))
-  const propagationColumns = Math.max(
-    1,
-    Math.ceil((roleTotals.get('propagation') || 0) / MAX_ROWS_PER_COLUMN),
-  )
-  const roleX = {
-    root: 0,
-    propagation: rootColumns * NODE_COLUMN_STEP + LANE_GAP,
-    victim: (rootColumns + propagationColumns) * NODE_COLUMN_STEP + LANE_GAP * 2,
-  }
-  const timedValues = [...timelineById.values()]
-    .map((entry) => entry.relative_ms)
-    .filter((value) => isPresent(value))
-    .map(Number)
-  const maxRelative = timedValues.length > 0 ? Math.max(...timedValues) : 0
+  const rowsByDepth = new Map()
+  const uncorrelated = []
+  sorted.forEach((node) => {
+    const id = String(node.id)
+    if ((node.role || 'uncorrelated') === 'uncorrelated') {
+      uncorrelated.push(node)
+      return
+    }
+    const depth = depthOf(id)
+    if (!rowsByDepth.has(depth)) rowsByDepth.set(depth, [])
+    rowsByDepth.get(depth).push(node)
+  })
+  const maxPrimaryRows = Math.max(1, ...[...rowsByDepth.values()].map((items) => items.length))
 
-  const countsByRole = new Map()
   return sorted.map((node, revealIndex) => {
-    const role = Object.prototype.hasOwnProperty.call(ROLE_ORDER, node.role) ? node.role : 'uncorrelated'
-    const roleIndex = countsByRole.get(role) || 0
-    countsByRole.set(role, roleIndex + 1)
-    const column = Math.floor(roleIndex / MAX_ROWS_PER_COLUMN)
-    const row = roleIndex % MAX_ROWS_PER_COLUMN
-    const timelineEntry = timelineById.get(String(node.id))
-    const timingNudge = isPresent(timelineEntry?.relative_ms)
-      ? Math.min(70, Math.log10(Number(timelineEntry.relative_ms) + 1) * 18)
-      : 0
-
-    const isUncorrelated = role === 'uncorrelated'
-    const timeBasedX = isPresent(timelineEntry?.relative_ms) && maxRelative > 0
-      ? (Number(timelineEntry.relative_ms) / maxRelative) * roleX.victim
-      : roleX.propagation
+    const id = String(node.id)
+    const timelineEntry = timelineById.get(id)
+    const role = node.role || 'uncorrelated'
+    let x
+    let y
+    if (role === 'uncorrelated') {
+      const index = uncorrelated.findIndex((item) => String(item.id) === id)
+      x = index * (NODE_WIDTH + 54)
+      y = 58 + maxPrimaryRows * ROW_STEP + UNCORRELATED_GAP
+    } else {
+      const depth = depthOf(id)
+      const column = rowsByDepth.get(depth) || []
+      const row = column.findIndex((item) => String(item.id) === id)
+      x = depth * COLUMN_STEP
+      y = 58 + row * ROW_STEP
+    }
 
     return {
-      id: String(node.id),
+      id,
       type: 'incident',
-      position: {
-        x: (isUncorrelated ? timeBasedX : roleX[role]) + column * NODE_COLUMN_STEP + timingNudge,
-        y: isUncorrelated ? 90 + primaryRowCount * ROW_STEP + row * ROW_STEP : 50 + row * ROW_STEP,
-      },
+      position: { x, y },
       data: { node, relativeMs: timelineEntry?.relative_ms },
       className: 'graph-reveal-node',
-      style: { '--reveal-delay': `${Math.min(520, 90 + revealIndex * 42)}ms` },
+      style: { '--reveal-delay': `${Math.min(420, 50 + revealIndex * 26)}ms` },
     }
   })
 }
@@ -438,7 +445,7 @@ function collectSourceMatches(node) {
   })
 }
 
-function NodeDetails({ node, timelineEntry }) {
+function NodeDetails({ node, timelineEntry, rootCandidate }) {
   const sourceMatches = collectSourceMatches(node)
   const attributes = node.diagnostic_attributes && typeof node.diagnostic_attributes === 'object'
     ? Object.entries(node.diagnostic_attributes).filter(([, value]) => isPresent(value))
@@ -450,6 +457,9 @@ function NodeDetails({ node, timelineEntry }) {
       <h3 id="graph-detail-heading">{nodeHeadline(node)}</h3>
       <div className="detail-grid">
         <DetailField label="Role" value={node.role} transform={humanize} />
+        <DetailField label="Node ID" value={node.id} />
+        <DetailField label="Artifact ID" value={node.artifact_id} />
+        <DetailField label="Fingerprint" value={node.fingerprint} />
         <DetailField label="Service" value={node.service} />
         <DetailField label="Module" value={node.module} />
         <DetailField label="Severity" value={node.severity} />
@@ -461,7 +471,10 @@ function NodeDetails({ node, timelineEntry }) {
         <DetailField label="HTTP status" value={node.http_status} />
         <DetailField label="First seen" value={node.first_seen} transform={formatTimestamp} />
         <DetailField label="Last seen" value={node.last_seen} transform={formatTimestamp} />
+        <DetailField label="Timeline timestamp" value={timelineEntry?.timestamp} transform={formatTimestamp} />
         <DetailField label="Relative time" value={timelineEntry?.relative_ms} transform={formatRelativeMs} />
+        <DetailField label="Timeline service" value={timelineEntry?.service} />
+        <DetailField label="Timeline role" value={timelineEntry?.role} transform={humanize} />
         <DetailField label="Occurrences" value={node.occurrence_count} />
         <DetailField label="Source artifact" value={node.source_file} />
         <DetailField label="Source format" value={node.source_format} transform={humanize} />
@@ -473,6 +486,20 @@ function NodeDetails({ node, timelineEntry }) {
         />
       </div>
 
+
+      {rootCandidate?.graph_stats && (
+        <div className="detail-block">
+          <h4>Root-cause graph statistics</h4>
+          <div className="detail-grid">
+            <DetailField label="Incoming edges" value={rootCandidate.graph_stats.incoming_count} />
+            <DetailField label="Outgoing edges" value={rootCandidate.graph_stats.outgoing_count} />
+            <DetailField label="Downstream nodes" value={rootCandidate.graph_stats.downstream_count} />
+            <DetailField label="Incoming strength" value={rootCandidate.graph_stats.incoming_strength} />
+            <DetailField label="Outgoing strength" value={rootCandidate.graph_stats.outgoing_strength} />
+            <DetailField label="Ranked root strength" value={rootCandidate.root_cause_strength} />
+          </div>
+        </div>
+      )}
       <div className="copyable-identifiers">
         <CopyableValue label="Trace ID" value={node.trace_id} />
         <CopyableValue label="Request ID" value={node.request_id} />
@@ -511,7 +538,38 @@ function NodeDetails({ node, timelineEntry }) {
                 <strong>{record.service || record.event_type || record.source_file || 'Evidence'}</strong>
                 {record.severity && <span>{record.severity}</span>}
               </div>
+              <div className="evidence-field-grid">
+                <DetailField label="Evidence ID" value={record.id} />
+                <DetailField label="Artifact ID" value={record.artifact_id} />
+                <DetailField label="Event type" value={record.event_type} transform={humanize} />
+                <DetailField label="Module" value={record.module} />
+                <DetailField label="Host" value={record.host} />
+                <DetailField label="Container" value={record.container} />
+                <DetailField label="Pod" value={record.pod} />
+                <DetailField label="Endpoint" value={record.endpoint} />
+                <DetailField label="HTTP status" value={record.http_status} />
+                <DetailField label="Source format" value={record.source_format} transform={humanize} />
+                <DetailField label="Source file" value={record.source_file} />
+                <DetailField label="First line" value={record.first_line_number} />
+                <DetailField label="Last line" value={record.last_line_number} />
+                <DetailField label="Occurrences" value={record.occurrence_count} />
+                <DetailField label="First seen" value={record.first_seen} transform={formatTimestamp} />
+                <DetailField label="Last seen" value={record.last_seen} transform={formatTimestamp} />
+                <DetailField label="Identity match" value={record.identity_match_type} transform={humanize} />
+                <DetailField label="Identity strength" value={record.identity_strength} />
+                <DetailField label="OCR confidence" value={record.ocr_confidence} />
+              </div>
+              <div className="copyable-identifiers evidence-identifiers">
+                <CopyableValue label="Trace ID" value={record.trace_id} />
+                <CopyableValue label="Request ID" value={record.request_id} />
+                <CopyableValue label="Span ID" value={record.span_id} />
+                <CopyableValue label="Parent span ID" value={record.parent_span_id} />
+                <CopyableValue label="Resolved identity" value={record.resolved_identity} />
+              </div>
               {record.representative_line && <pre><code>{record.representative_line}</code></pre>}
+              {record.diagnostic_attributes && Object.keys(record.diagnostic_attributes).length > 0 && (
+                <pre><code>{JSON.stringify(record.diagnostic_attributes, null, 2)}</code></pre>
+              )}
             </article>
           ))}
         </div>
@@ -570,7 +628,7 @@ function RelationshipDetails({ kind, relationship }) {
   )
 }
 
-function DetailPanel({ selection, timelineById, onClose, panelRef }) {
+function DetailPanel({ selection, timelineById, rootCandidateById, onClose, panelRef }) {
   if (!selection) return null
   return (
     <aside
@@ -592,6 +650,7 @@ function DetailPanel({ selection, timelineById, onClose, panelRef }) {
         <NodeDetails
           node={selection.value}
           timelineEntry={timelineById.get(String(selection.value.id))}
+          rootCandidate={rootCandidateById.get(String(selection.value.id))}
         />
       ) : (
         <RelationshipDetails kind={selection.kind} relationship={selection.value} />
@@ -723,6 +782,10 @@ export default function CorrelationGraph({ component }) {
     ? Math.min(...timedEntries.map((entry) => Number(entry.relative_ms)))
     : null
   const associationCount = component.associations?.length || 0
+  const rootCandidateById = useMemo(
+    () => new Map((component.root_causes || []).map((candidate) => [String(candidate.node_id), candidate])),
+    [component.root_causes],
+  )
 
   useEffect(() => {
     if (selection) detailPanelRef.current?.focus()
@@ -925,7 +988,7 @@ export default function CorrelationGraph({ component }) {
           </div>
         )}
         <div className="graph-axis" aria-hidden="true">
-          <div className="graph-lanes"><span>Root</span><span>Propagation</span><span>Victim</span></div>
+          <div className="graph-lanes"><span>Earlier / upstream</span><span>Directed incident flow</span><span>Later / downstream</span></div>
           {maxRelative !== null && (
             <div className="graph-time-range">
               <span>{formatRelativeMs(minRelative)}</span>
@@ -970,7 +1033,7 @@ export default function CorrelationGraph({ component }) {
             }}
             proOptions={{ hideAttribution: true }}
           >
-            <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} color="#303847" />
+            <Background variant={BackgroundVariant.Dots} gap={28} size={1} color="#28313d" />
             <Controls showFitView={false} showInteractive={false} position="bottom-left">
               <ControlButton
                 className="graph-control-button"
@@ -1000,6 +1063,7 @@ export default function CorrelationGraph({ component }) {
         <DetailPanel
           selection={selection}
           timelineById={timelineById}
+          rootCandidateById={rootCandidateById}
           onClose={closeDetail}
           panelRef={detailPanelRef}
         />

@@ -6,6 +6,8 @@ fallback only ever engages when none of them found anything, and never
 claims a real source match on its own - source_index.py's resolution step
 still has to find the path unambiguously in the real indexed source tree.
 """
+from app.services.artifact_detector import ArtifactFormat
+from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.diagnostic_parser import _parse_stack_frames, normalize_text_event
 from app.services.log_praser import ParsedEvent, StackFrame
 from app.services.source_index import build_index, correlate_event
@@ -110,3 +112,54 @@ def test_generic_frame_with_no_matching_source_file_produces_no_match(tmp_path):
 
 def test_generic_frame_never_fabricates_a_match_without_a_source_index():
     assert correlate_event(_event_with_generic_frame("main.go", 1), None) == []
+
+
+# --- huge-line performance guard: _LOOSE_SOURCE_LOCATION_HINT gating -------
+#
+# _contains_stack_frame() only runs the expensive named-group
+# GENERIC_SOURCE_LOCATION_PATTERN when the cheap _LOOSE_SOURCE_LOCATION_HINT
+# substring scan already found a plausible ".ext:digit" shape - otherwise a
+# single pathologically huge line with no such shape anywhere would still
+# make the generic pattern scan across all of it. This is a semantic
+# regression test (no timing assertion - see the fix's own rationale):
+# proves a huge adversarial line does not prevent the surrounding real
+# evidence from parsing normally through the actual bounded streaming path.
+
+
+def test_pathological_huge_line_does_not_prevent_surrounding_evidence_from_parsing(tmp_path):
+    # No '.', no digits adjacent anywhere - _LOOSE_SOURCE_LOCATION_HINT can
+    # never match this, so GENERIC_SOURCE_LOCATION_PATTERN must never even
+    # run against it.
+    huge_benign_line = "x" * 2_000_000
+    content = (
+        "2026-01-01 10:00:00 ERROR service=payment-api "
+        "Traceback (most recent call last):\n"
+        '  File "/srv/worker.py", line 42, in run\n'
+        '    raise RuntimeError("database timeout")\n'
+        "RuntimeError: database timeout\n"
+        + huge_benign_line + "\n"
+        "2026-01-01 10:00:05 ERROR service=payment-api "
+        "second failure at /srv/other.py:99\n"
+    )
+    path = tmp_path / "huge_line.log"
+    path.write_text(content, encoding="utf-8")
+
+    records = list(
+        stream_artifact_events(
+            file_path=str(path),
+            artifact_format=ArtifactFormat.STACK_TRACE,
+            source_file="huge_line.log",
+        )
+    )
+    events = [record.event for record in records if record.event is not None]
+
+    # The complete traceback before the huge line still parses normally.
+    first = next(e for e in events if e.exception_type == "RuntimeError")
+    assert len(first.stack_frames) == 1
+    assert first.stack_frames[0].file == "/srv/worker.py"
+    assert first.stack_frames[0].line == 42
+
+    # The generic-source-location failure after the huge line still parses
+    # normally too - the huge line does not poison the artifact/stream.
+    second = next(e for e in events if "other.py" in e.raw_line)
+    assert any(f.file == "/srv/other.py" and f.line == 99 for f in second.stack_frames)

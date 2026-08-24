@@ -136,6 +136,58 @@ def test_bump_processing_heartbeat_throttle_cache_is_bounded(monkeypatch):
     assert len(analysis_task._last_heartbeat_write) == 3
 
 
+def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch, tmp_path):
+    """A single genuinely long _process_artifact() run (many parser
+    batches) must refresh the heartbeat at a coarse persisted-progress
+    boundary, not just at task/stage entry - otherwise a healthy analysis
+    stuck processing one huge artifact for longer than
+    _STALE_ANALYSIS_THRESHOLD_SECONDS could look orphaned to recovery.
+    create_batches()/_persist_artifact_batch() are faked to control the
+    batch count directly, independent of what a real file would produce -
+    the real _bump_processing_heartbeat() (and its real throttle/DB write)
+    still run underneath the spy."""
+    monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing", processing_heartbeat_at=None)
+    artifact_path = tmp_path / "a.log"
+    artifact_path.write_text("2026-01-01 10:00:00 ERROR service=a boom\n")
+    artifact = _artifact(
+        db, analysis, status="pending", saved_file_path=str(artifact_path),
+        size_bytes=artifact_path.stat().st_size, original_filename="a.log",
+    )
+
+    monkeypatch.setattr(analysis_task, "create_batches", lambda records: [["b1"], ["b2"], ["b3"]])
+    monkeypatch.setattr(analysis_task, "_persist_artifact_batch", lambda **kwargs: 1)
+    monkeypatch.setattr(analysis_task, "_publish_ingestion_progress", lambda **kwargs: -1)
+
+    heartbeat_calls = []
+    real_bump = analysis_task._bump_processing_heartbeat
+
+    def spy_bump(db_arg, analysis_id):
+        heartbeat_calls.append(analysis_id)
+        return real_bump(db_arg, analysis_id)
+
+    monkeypatch.setattr(analysis_task, "_bump_processing_heartbeat", spy_bump)
+
+    parsed_count = analysis_task._process_artifact(db=db, analysis=analysis, artifact=artifact)
+
+    # Invoked once per persisted batch (the cheap Python call this section
+    # requires)...
+    assert heartbeat_calls == [analysis.id, analysis.id, analysis.id]
+    # ...but real_bump's own 60s throttle (proven independently above)
+    # still means this never becomes three real DB writes - a single write
+    # is enough to prove the call site is wired through to it at all.
+    db.expire_all()
+    assert analysis.processing_heartbeat_at is not None
+    # The heartbeat addition changes nothing about parsing/checkpoint
+    # results: three fake batches of 1 record each still sum to 3, and the
+    # artifact still reaches its normal terminal checkpoint state.
+    assert parsed_count == 3
+    assert artifact.status == "completed"
+    assert artifact.processed_bytes == artifact.size_bytes
+
+
 # --- Part T: the stale threshold is a conservative, simple constant --------
 
 

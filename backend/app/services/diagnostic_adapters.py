@@ -10,7 +10,7 @@ from app.core.processing_config import ARTIFACT_DETECTION_SAMPLE_BYTES, DIAGNOST
 from app.utils.bounded_json import BoundedJsonStream
 from app.utils.file_reader import stream_text_lines
 from .artifact_detector import ArtifactFormat
-from .diagnostic_parser import EXCEPTION_PATTERN, GENERIC_SOURCE_LOCATION_PATTERN, JAVA_FRAME_PATTERN, NODE_FRAME_PATTERN, PYTHON_FRAME_PATTERN, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
+from .diagnostic_parser import EXCEPTION_PATTERN, GENERIC_SOURCE_LOCATION_PATTERN, JAVA_FRAME_PATTERN, NODE_FRAME_PATTERN, PYTHON_FRAME_PATTERN, _LOOSE_SOURCE_LOCATION_HINT, fast_path_prefixed_event, level_from_http_status, normalize_level, normalize_structured_event, normalize_text_event, parse_timestamp, structured_event_may_be_important
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
 from app.services.image_text_extractor import extract_text_from_image_with_confidence
@@ -584,19 +584,14 @@ def _default_level_for_bare_stack_frame(event: ParsedEvent | None, raw_text: str
 
 
 def _contains_stack_frame(raw_text: str) -> bool:
-    """A structurally-recognized stack frame line (Python/Java/Node, or the
-    generic path:line[:column] shape covering Go/Rust/Ruby/.NET/C/C++ etc -
-    the same conventions _parse_stack_frames already decodes; nothing new
-    here) is inherently diagnostic on its own. Frame chains only ever occur
-    in crash/exception output, even when the explicit ERROR/Traceback
-    keyword line that normally accompanies them is missing from what was
-    actually captured - e.g. a cropped terminal screenshot, or a log format
-    that omits the header word entirely."""
     return bool(
         PYTHON_FRAME_PATTERN.search(raw_text)
         or JAVA_FRAME_PATTERN.search(raw_text)
         or NODE_FRAME_PATTERN.search(raw_text)
-        or GENERIC_SOURCE_LOCATION_PATTERN.search(raw_text)
+        or (
+            _LOOSE_SOURCE_LOCATION_HINT.search(raw_text)
+            and GENERIC_SOURCE_LOCATION_PATTERN.search(raw_text)
+        )
         or _LOOSE_FRAME_MARKER_RE.search(raw_text)
     )
 

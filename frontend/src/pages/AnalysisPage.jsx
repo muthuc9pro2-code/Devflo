@@ -11,12 +11,6 @@ import { useRouter } from '../router/useRouter'
 
 const DURABLE_CHECK_INTERVAL_MS = 15_000
 const RECONNECT_DELAY_MS = 1_200
-// How long the brief "Analysis cancelled" notice stays up (direct
-// navigation / reconnect / live-SSE-observed cancellation) before this
-// page moves on by itself - a button-click cancel (Part N) skips this
-// entirely and navigates away immediately, since the user already knows
-// what they just did.
-const CANCELLED_NOTICE_MS = 1_800
 
 function readUploadManifest(analysisId) {
   try {
@@ -91,7 +85,6 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
     let closeEventSource = null
     let reconnectTimer = null
     let durableTimer = null
-    let cancelledNoticeTimer = null
     let requestInFlight = false
     let highWaterProgress = 0
     let hasReportedSettled = false
@@ -100,10 +93,8 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
     const clearTimers = () => {
       if (reconnectTimer) window.clearTimeout(reconnectTimer)
       if (durableTimer) window.clearTimeout(durableTimer)
-      if (cancelledNoticeTimer) window.clearTimeout(cancelledNoticeTimer)
       reconnectTimer = null
       durableTimer = null
-      cancelledNoticeTimer = null
     }
 
     const closeStream = () => {
@@ -176,10 +167,12 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
       reportSettled()
     }
 
-    // Used when cancellation is *observed* rather than just performed by
-    // this tab (direct navigation to an already-cancelled id, a durable
-    // reconnect poll, or a live SSE "cancelled" event arriving while this
-    // page is open) - briefly explains what happened, then moves on.
+    // The one cancelled-screen path, used identically whether cancellation
+    // was performed by this tab (button click) or merely *observed* (direct
+    // navigation to an already-cancelled id, a durable reconnect poll, or a
+    // live SSE "cancelled" event arriving while this page is open): shows
+    // the cancelled confirmation screen and stays there - the user leaves
+    // by explicitly clicking "New investigation", never automatically.
     const finishWithCancelled = () => {
       if (disposed || terminal) return
       markCancelledLocally()
@@ -190,9 +183,6 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
         connectionState: 'closed',
         error: '',
       }))
-      cancelledNoticeTimer = window.setTimeout(() => {
-        if (!disposed) navigate('/new')
-      }, CANCELLED_NOTICE_MS)
     }
 
     const applyDurableState = (state) => {
@@ -360,11 +350,7 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
       try {
         await cancelAnalysis(analysisId)
         if (disposed || terminal) return
-        // Success is intentional and already understood by the user (they
-        // just clicked the button) - no intermediate notice, straight to
-        // /new, unlike the "observed elsewhere" finishWithCancelled path.
-        markCancelledLocally()
-        navigate('/new')
+        finishWithCancelled()
       } catch (error) {
         cancelRequestInFlight = false
         if (disposed) return
@@ -441,9 +427,11 @@ export default function AnalysisPage({ analysisId, historyItem, onSettled, onSta
         <div className="state-icon state-icon-warning" aria-hidden="true">–</div>
         <p className="eyebrow">Analysis cancelled</p>
         <h1>The investigation was cancelled and its generated analysis data was discarded.</h1>
-        <button type="button" className="btn-primary" onClick={() => navigate('/new')}>
-          New investigation
-        </button>
+        <div className="state-actions">
+          <button type="button" className="btn-primary" onClick={() => navigate('/new')}>
+            New investigation
+          </button>
+        </div>
       </div>
     )
   }
