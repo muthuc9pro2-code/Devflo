@@ -29,15 +29,15 @@ celery_app.conf.update(
         "schedule": 60 * 60,
         },
         # Low-cadence orphan/stale-analysis recovery (see
-        # app/tasks/analysis.py:recover_stale_analyses) - 5 minutes is
+        # app/tasks/analysis.py:recover_stale_analyses) - 60 seconds is
         # frequent enough to reclaim a genuinely-orphaned analysis
-        # reasonably promptly after it crosses the (much larger, 10
-        # minute) staleness threshold, while staying negligible DB load:
-        # one bounded, indexed query plus at most
-        # _RECOVERY_SCAN_BATCH_LIMIT small conditional UPDATEs every tick.
+        # reasonably promptly after it crosses the (larger, 300 second)
+        # staleness threshold, while staying negligible DB load: one
+        # bounded, indexed query plus at most _RECOVERY_SCAN_BATCH_LIMIT
+        # small conditional UPDATEs every tick.
         "recover-stale-analyses": {
         "task": "app.tasks.analysis.recover_stale_analyses",
-        "schedule": 5 * 60,
+        "schedule": 60,
         },
     },
     timezone="UTC"

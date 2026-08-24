@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
@@ -192,12 +193,16 @@ def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch
 
 
 def test_stale_threshold_is_a_single_conservative_constant():
-    # 10 minutes: comfortably above any single normal processing stage
-    # (parsing, OCR, source clone/prep, Gemini retries) while still
-    # reclaiming a genuinely orphaned analysis in bounded time. See the
-    # comment above _STALE_ANALYSIS_THRESHOLD_SECONDS for the full
-    # rationale - this just pins the value against silent drift.
-    assert analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS == 600
+    # 300 seconds (5 minutes): comfortably above any single normal
+    # processing stage (parsing - refreshed every persisted batch; OCR -
+    # bounded by MAX_OCR_IMAGE_PIXELS/MAX_OCR_IMAGE_BYTES; source clone/
+    # prep - bounded by GITHUB_CLONE_TIMEOUT_SECONDS plus bounded
+    # extraction/indexing; Gemini retries - refreshed once the call
+    # resolves) while still reclaiming a genuinely orphaned analysis in
+    # bounded time. See the comment above _STALE_ANALYSIS_THRESHOLD_SECONDS
+    # for the full rationale - this just pins the value against silent
+    # drift.
+    assert analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS == 300
 
 
 # --- Part U/V: recover_stale_analyses scan + atomic claim -------------------
@@ -234,6 +239,40 @@ def test_recover_stale_analyses_redispatches_when_heartbeat_is_older_than_thresh
     analysis = _stale_analysis(
         db, alice, age_seconds=analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS + 30
     )
+    analysis_id = analysis.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 1
+    assert delayed == [analysis_id]
+
+
+def test_recover_stale_analyses_does_not_claim_activity_299_seconds_old(monkeypatch):
+    """Precise boundary check for the current 300-second threshold (the
+    developer's own intentional change from 600s) - 299 seconds old must
+    still read as healthy, not stale."""
+    db = _session()
+    alice = _user(db)
+    _stale_analysis(db, alice, age_seconds=299)
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 0
+    assert delayed == []
+
+
+def test_recover_stale_analyses_claims_activity_301_seconds_old(monkeypatch):
+    """The other side of the same boundary: just past 300 seconds old is
+    recoverable."""
+    db = _session()
+    alice = _user(db)
+    analysis = _stale_analysis(db, alice, age_seconds=301)
     analysis_id = analysis.id
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     delayed = []
@@ -521,4 +560,138 @@ def test_recovered_zombie_finalizes_end_to_end_without_reparsing_completed_artif
     reloaded_artifact = db2.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
     assert reloaded_artifact.processed_bytes == 100
     assert reloaded_artifact.last_processed_line == 5
+    db2.close()
+
+
+# --- DB-outage-left processing state remains recoverable (audit Section 8) -
+
+
+def test_artifact_left_processing_after_a_db_outage_is_recoverable_with_checkpoint_intact(monkeypatch):
+    """The exact observed-in-production shape: MySQL disappears mid-
+    artifact, the artifact task's own generic except-block re-raises a
+    real OperationalError, and _mark_analysis_failed cannot write "failed"
+    either (its own independent swallow-on-failure guarantee is proven in
+    isolation by test_mark_analysis_failed_never_overwrites_cancelled's
+    sibling tests in test_analysis_cancellation.py - stubbed here rather
+    than re-derived). The Analysis row must be left exactly as it was
+    ("processing", never resurrected to "failed"), the last successfully
+    committed artifact checkpoint and its Evidence must be untouched, and
+    once heartbeat goes stale the existing recovery scan must still find
+    and reclaim it - no special-casing for how the exception originated."""
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    artifact = _artifact(
+        db, analysis, status="processing", processed_bytes=500, last_processed_line=10,
+    )
+    db.add(Evidence(
+        analysis_id=analysis.id, artifact_id=artifact.id, correlation_key="k1",
+        fingerprint="fp1", first_line_number=1, last_line_number=1,
+        severity="ERROR", event_type="exception",
+    ))
+    db.commit()
+    analysis_id = analysis.id
+    artifact_id = artifact.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+
+    def raise_operational_error(**kwargs):
+        raise OperationalError(
+            "UPDATE analysis_artifacts ...", {},
+            Exception("(2003, \"Can't connect to MySQL server on 'db:3306'\")"),
+        )
+
+    monkeypatch.setattr(analysis_task, "_process_artifact", raise_operational_error)
+    # DB is down for the whole scenario - _mark_analysis_failed's own real
+    # write would fail and swallow too (proven elsewhere); stubbed here so
+    # this test's assertions stay focused on the surrounding state.
+    monkeypatch.setattr(analysis_task, "_mark_analysis_failed", lambda db_arg, aid: None)
+
+    with pytest.raises(OperationalError):
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+
+    reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "processing"  # never falsely "failed"
+    reloaded_artifact = (
+        db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
+    )
+    assert reloaded_artifact.processed_bytes == 500  # pre-outage checkpoint intact
+    assert reloaded_artifact.last_processed_line == 10
+    assert db.query(Evidence).filter(Evidence.analysis_id == analysis_id).count() == 1
+
+    # "MySQL later returns" - simulated here as time passing far enough
+    # that the heartbeat set before the outage is now stale.
+    db.query(Analysis).filter(Analysis.id == analysis_id).update(
+        {
+            "processing_heartbeat_at": datetime.now(timezone.utc)
+            - timedelta(seconds=analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS + 30)
+        }
+    )
+    db.commit()
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed = analysis_task.recover_stale_analyses.run()
+
+    assert claimed == 1
+    assert delayed == [analysis_id]
+
+
+# --- Gemini/finalize heartbeat coverage (audit Section 3: no client-side ---
+# timeout on generate_investigation_explanation) -----------------------------
+
+
+def test_finalize_bumps_heartbeat_after_gemini_resolves(monkeypatch):
+    """generate_investigation_explanation() has no client-side timeout
+    (google-genai's default is unbounded) and can retry up to
+    _MAX_ATTEMPTS times, so real wall-clock time may pass between
+    _finalize_analysis_task's single entry-heartbeat and its final commit.
+    Proven here on the zero-evidence/fallback branch (the same branch
+    test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_
+    gemini_was_running in test_analysis_cancellation.py already exercises
+    for the cancellation race) by spying on the real heartbeat helper."""
+    monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
+
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(
+        db, alice, status="processing", processing_heartbeat_at=None,
+    )
+    _artifact(
+        db, analysis, status="completed",
+        fallback_context={"kind": "text", "text": "payment worker stops after restart"},
+    )
+    analysis_id = analysis.id
+    db.close()
+
+    fake_result = GeminiInvestigationResponse(
+        title="t", summary="s", probable_root_causes=[], what_happened=[],
+        source_code_findings=[], recommended_actions=[], uncertainties=[],
+    )
+    monkeypatch.setattr(
+        analysis_task, "generate_investigation_explanation", lambda ctx: fake_result
+    )
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: None)
+
+    heartbeat_calls = []
+    real_bump = analysis_task._bump_processing_heartbeat
+
+    def spy_bump(db_arg, aid):
+        heartbeat_calls.append(aid)
+        return real_bump(db_arg, aid)
+
+    monkeypatch.setattr(analysis_task, "_bump_processing_heartbeat", spy_bump)
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+
+    # Once at finalize entry, once more after Gemini resolves.
+    assert heartbeat_calls == [analysis_id, analysis_id]
+    db2 = session_factory()
+    reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "completed"
+    assert reloaded.processing_heartbeat_at is not None
     db2.close()

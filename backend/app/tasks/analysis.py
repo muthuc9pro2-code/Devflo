@@ -844,6 +844,16 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                         analysis_id,
                     )
                     analysis.ai_analysis = None
+                # generate_investigation_explanation() has no client-side
+                # timeout (google-genai's own default is unbounded - see
+                # _client's construction above) and can retry up to
+                # _MAX_ATTEMPTS times, so real wall-clock time may have
+                # passed here that the entry-only heartbeat above never
+                # covered. Refreshed once, after the call resolves either
+                # way (success or GeminiUnavailableError) - not a timeout
+                # or retry-count change, just keeping this analysis
+                # visibly alive to recover_stale_analyses while it waits.
+                _bump_processing_heartbeat(db, analysis_id)
                 source_outcome = build_source_outcome_payload(analysis)
                 if source_outcome is not None:
                     fallback_payload["source"] = source_outcome
@@ -1104,6 +1114,11 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     analysis_id,
                 )
                 analysis.ai_analysis = None
+            # See the fallback branch above: Gemini has no client-side
+            # timeout and may retry, so refresh the heartbeat once the
+            # call resolves either way rather than relying solely on the
+            # entry-only heartbeat above.
+            _bump_processing_heartbeat(db, analysis_id)
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 correlation_payload["source"] = source_outcome
@@ -1213,6 +1228,11 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     analysis_id,
                 )
                 analysis.ai_analysis = None
+            # See the fallback branch above: Gemini has no client-side
+            # timeout and may retry, so refresh the heartbeat once the
+            # call resolves either way rather than relying solely on the
+            # entry-only heartbeat above.
+            _bump_processing_heartbeat(db, analysis_id)
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
@@ -2247,14 +2267,19 @@ def _known_terminal_artifact_outcomes(
 # --- Stale/orphan recovery (Part R-V) -----------------------------------
 #
 # Conservative on purpose: this must never fire during a normal single-
-# stage pause (large parsing, OCR across up to MAX_OCR_IMAGES_PER_
-# INVESTIGATION images, a GitHub clone up to GITHUB_CLONE_TIMEOUT_SECONDS,
-# Gemini's own bounded retries/network waits) and must never duplicate a
-# perfectly healthy in-flight workflow. 10 minutes is comfortably above
-# every one of those individual stage durations while still being short
+# stage pause (large parsing - refreshed every persisted batch, see
+# _process_artifact's _bump_processing_heartbeat call -, one image's OCR,
+# a GitHub clone bounded by GITHUB_CLONE_TIMEOUT_SECONDS (60s) plus bounded
+# ZIP extraction/indexing, or a Gemini call/retry - refreshed once it
+# resolves, see _finalize_analysis_task's post-Gemini heartbeat calls,
+# since the google-genai client has no configured request timeout) and
+# must never duplicate a perfectly healthy in-flight workflow. 300 seconds
+# (5 minutes) is comfortably above every one of those individual stage
+# durations - each is either itself bounded well under a minute, or gets
+# its own heartbeat refresh once it resolves - while still being short
 # enough that a genuinely-orphaned analysis (worker killed, Redis/broker
 # work lost, machine interrupted) does not sit unrecoverable indefinitely.
-_STALE_ANALYSIS_THRESHOLD_SECONDS = 600
+_STALE_ANALYSIS_THRESHOLD_SECONDS = 300
 
 # Bounded per scan tick - recovery redispatches at most this many stale
 # analyses per Beat firing, so even a large backlog after an extended
