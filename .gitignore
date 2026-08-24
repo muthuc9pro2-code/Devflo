@@ -40,6 +40,9 @@ dist/
 
 uploads/
 
+backend/celerybeat-schedule
+backend/dump.rdb
+
 *.tmp
 *.swp
 *.bak

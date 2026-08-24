@@ -1,13 +1,10 @@
-"""Targeted tests for the final backend hardening pass ONLY - diagnostic_
+"""Targeted tests for: diagnostic_
 attributes, low-structure supplemental context, not_linked isolation from
 primary Gemini reasoning, end-to-end bounded evidence selection, source
 index reuse, SPAN_ID/SOURCE correlation signals, the completed evidence/
 node payload contract, the root_causes contract, the correlated Gemini
 byte budget, real sub-second timestamp precision, the association-only
 causal-language guard, and OCR final-exception-summary preservation.
-
-Does not re-run the full pre-existing suite - see the final report for
-what was verified by direct inspection vs. by these pytest cases.
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -209,7 +206,7 @@ def test_non_primary_component_excluded_from_gemini_and_frontend_primary_graph()
     assert 4 not in gemini_evidence_ids and 5 not in gemini_evidence_ids
 
     # Frontend correlated graph is ALSO restricted to the primary
-    # component only (final hardening pass) - honestly counted, not
+    # component only - honestly counted, not
     # silently claimed as returned.
     assert len(frontend["components"]) == 1
     assert frontend["component_count"] == 1
@@ -397,7 +394,7 @@ def test_ocr_final_summary_preservation_is_generic_not_import_error_only():
     assert events[0].event.exception_type == "RuntimeException"
 
 
-# --- Section 4: end-to-end bounded evidence selection -----------------------
+# --- End-to-end bounded evidence selection -----------------------------------
 
 
 def _sqlite_analysis_with_evidence(monkeypatch, evidence_count: int):
@@ -492,7 +489,7 @@ def test_bounded_selection_fast_path_matches_full_query_when_under_bound():
     assert len(selected) == 3
 
 
-# --- Section 6: source index reuse ------------------------------------------
+# --- Source index reuse -------------------------------------------------------
 
 
 def test_source_index_is_not_rebuilt_once_per_artifact(tmp_path, monkeypatch):
@@ -589,7 +586,7 @@ def test_source_signal_only_fires_on_identical_file_and_line():
     assert len(run2.result.components) == 2  # never merged on "both have some match"
 
 
-# --- Section 2: low-structure survives a mixed investigation ---------------
+# --- Low-structure survives a mixed investigation ----------------------------
 
 
 def _db_with_schema(monkeypatch):

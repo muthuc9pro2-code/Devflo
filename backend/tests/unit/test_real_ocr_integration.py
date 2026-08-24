@@ -1,4 +1,4 @@
-"""Real-OCR integration regression (FIX 8): the mocked OCR tests in
+"""Real-OCR integration regression: the mocked OCR tests in
 test_image_ocr_record_reconstruction.py prove record-reconstruction logic
 against hand-written OCR text, but that is not proof RapidOCR's actual
 output on a real screenshot flows through the pipeline correctly - a
@@ -15,7 +15,7 @@ The fixture (tests/fixtures/images/real_import_error_screenshot.jpeg) is a
 real screenshot a Devflo user actually uploaded during manual testing of
 this exact repository (a VS Code terminal showing a genuine ImportError:
 `from app.services.email_service import send_password_reset_email` failing
-because that function did not exist yet - see FIX 1). It was available
+because that function did not exist yet). It was available
 locally (backend/uploads/) at the time this test was written and has been
 committed as a permanent fixture so this regression does not depend on
 ephemeral upload state.
@@ -46,7 +46,7 @@ def test_real_screenshot_produces_coherent_non_fragmented_evidence():
     # against).
     assert events
 
-    # FIX 2's actual target: the real "File ..." frame chain in this
+    # The real "File ..." frame chain in this
     # screenshot must not fragment into one singleton record per frame
     # line. There are 5 frame lines in the real captured text (importlib
     # bootstrap x3, main.py, auth.py) - a handful of coherent records, not

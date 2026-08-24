@@ -1,4 +1,4 @@
-"""Investigation routing (Section 7): CORRELATED must be chosen only when
+"""Investigation routing: CORRELATED must be chosen only when
 real correlatable structure exists, using the exact same relationship
 semantics correlation_engine.build_correlation_edges uses - never a second,
 independently-drifting router-only heuristic.
@@ -18,7 +18,7 @@ Regression coverage for two real bugs in the previous router:
      a real parent.span_id == child.parent_span_id match via
      find_parent_span_candidate().
 
-Section 4 hardening: choose_investigation_path() no longer queries the DB
+choose_investigation_path() does not query the DB
 itself - it is a thin policy wrapper over an already-loaded evidence_rows
 list. _route() below does the query these tests still need (a real sqlite
 DB is still the most direct way to build/persist Evidence fixtures).
@@ -113,7 +113,7 @@ def test_real_parent_child_span_is_correlated():
         assert _route(db) == InvestigationPath.CORRELATED
 
 
-# --- Scenario O: parent_span_id present but the actual parent row is absent
+# --- parent_span_id present but the actual parent row is absent -----------
 
 
 def test_parent_span_id_present_without_a_matching_parent_row_stays_simple():
@@ -134,7 +134,7 @@ def test_parent_span_id_present_without_a_matching_parent_row_stays_simple():
         assert _route(db) == InvestigationPath.SIMPLE
 
 
-# --- Scenario M: the correlation_key sentinel bug -------------------------
+# --- The correlation_key sentinel bug --------------------------------------
 
 
 def test_shared_sentinel_correlation_key_alone_does_not_route_correlated():
@@ -175,7 +175,7 @@ def test_two_unrelated_untraced_rows_with_different_ids_stay_simple():
         assert _route(db) == InvestigationPath.SIMPLE
 
 
-# --- Section 4 hardening: no DB query of its own ---------------------------
+# --- No DB query of its own -------------------------------------------------
 
 
 def test_choose_investigation_path_performs_no_db_query():

@@ -47,7 +47,7 @@ from app.services.investigation_context import (
 )
 from app.tasks import analysis as analysis_task
 
-# Section 26: unit tests must never require the real Gemini API/network/
+# Unit tests must never require the real Gemini API/network/
 # quota - this is the same fixed, deterministic result every mocked
 # _finalize_analysis_task run in this file uses instead.
 _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
@@ -391,7 +391,7 @@ def test_multiple_components_remain_separate_and_never_labeled_unrelated():
     assert len(run.result.components) == 2  # correlation itself still finds both, never merges them
 
     payload = build_correlation_payload(run, rows, artifacts=artifacts)
-    # Final hardening pass: the frontend graph represents the PRIMARY
+    # The frontend graph represents the PRIMARY
     # incident only - the non-primary (isolated) component is excluded
     # from components[] but still honestly counted, never silently
     # claimed as returned, and its artifact still gets a real per-artifact
@@ -493,7 +493,7 @@ def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
     analysis_task._finalize_analysis_task.run([], analysis_id, None)
 
     # investigation_result is the single authoritative full final payload -
-    # published exactly once, never twice (see FIX 4: there used to also be
+    # published exactly once, never twice (there used to also be
     # a duplicate correlation_result event carrying the identical payload).
     assert len(investigation_calls) == 1
     assert investigation_calls[0]["investigation_path"] == "correlated"
@@ -502,7 +502,7 @@ def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
 
 
 def test_correlation_result_event_no_longer_exists(monkeypatch):
-    """Regression guard for FIX 4 (analysis_events.py): the duplicate
+    """Regression guard (analysis_events.py): the duplicate
     correlation_result event (a second full node/edge/evidence graph over
     SSE for the same finished computation, with no frontend consumer) was
     removed rather than kept "for compatibility" - this pins that

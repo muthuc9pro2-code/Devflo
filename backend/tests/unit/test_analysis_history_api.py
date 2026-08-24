@@ -1,9 +1,9 @@
-"""Section L: History API tests (GET /analysis/history, GET /analysis/{id}).
+"""History API tests (GET /analysis/history, GET /analysis/{id}).
 
-Scenarios 1-14 and 17 from the History spec - scenarios 15 (persist-before-
-publish ordering) and 16 (legacy analyses without result_snapshot) are
-covered directly against reconstruct_current_investigation_result /
-_finalize_analysis_task in test_result_snapshot.py, not duplicated here.
+Persist-before-publish ordering and legacy analyses without a
+result_snapshot are covered directly against
+reconstruct_current_investigation_result / _finalize_analysis_task in
+test_result_snapshot.py, not duplicated here.
 
 Endpoint functions are called directly (db/current_user/response passed in
 explicitly) rather than through a FastAPI TestClient - the same pattern the
@@ -58,7 +58,7 @@ def _artifact(db, analysis, position=0) -> AnalysisArtifact:
     return artifact
 
 
-# --- Scenarios 1-2: ownership scoping --------------------------------------
+# --- Ownership scoping -------------------------------------------------------
 
 
 def test_history_only_returns_the_current_users_own_analyses():
@@ -101,7 +101,7 @@ def test_fetching_a_nonexistent_analysis_id_also_404s():
     assert error.value.status_code == 404
 
 
-# --- Scenario 3: newest-first ------------------------------------------
+# --- Newest-first ---------------------------------------------------------
 
 
 def test_history_is_ordered_newest_first():
@@ -117,7 +117,7 @@ def test_history_is_ordered_newest_first():
     assert [item.analysis_id for item in page.items] == [newest.id, middle.id, oldest.id]
 
 
-# --- Scenario 4: pagination is deterministic and bounded -------------------
+# --- Pagination is deterministic and bounded --------------------------------
 
 
 def test_history_pagination_is_deterministic_and_bounded():
@@ -170,7 +170,7 @@ def test_invalid_history_cursor_is_rejected():
     assert error.value.status_code == 400
 
 
-# --- Scenarios 5-6: history list is cheap -----------------------------------
+# --- History list is cheap ---------------------------------------------------
 
 
 def test_history_list_never_touches_correlation_or_gemini(monkeypatch):
@@ -197,7 +197,7 @@ def test_history_list_never_touches_correlation_or_gemini(monkeypatch):
     assert len(page.items) == 1  # returned successfully without touching either
 
 
-# --- Scenarios 7-9: completed detail uses the persisted snapshot -----------
+# --- Completed detail uses the persisted snapshot -----------------------------
 
 
 def test_completed_detail_returns_the_persisted_result_snapshot():
@@ -250,7 +250,7 @@ def test_completed_detail_never_calls_gemini_or_reruns_correlation_when_snapshot
     assert response.status_code == 200
 
 
-# --- Scenarios 10-12: in-progress / completed progress contract ------------
+# --- In-progress / completed progress contract --------------------------------
 
 
 def test_in_progress_detail_reports_persisted_byte_progress():
@@ -295,7 +295,7 @@ def test_completed_detail_reports_progress_99_never_100():
     assert body["progress"] != 100
 
 
-# --- Scenarios 13-14: SIMPLE/CORRELATED history restoration ----------------
+# --- SIMPLE/CORRELATED history restoration -------------------------------
 
 
 def test_simple_history_restores_the_exact_stored_response():
@@ -353,7 +353,7 @@ def test_correlated_history_restores_the_exact_stored_graph_and_timeline():
     assert body == snapshot
 
 
-# --- Scenario 17: no internal fields leaked ---------------------------------
+# --- No internal fields leaked ------------------------------------------------
 
 
 def test_history_list_does_not_expose_saved_file_path_or_source_reference():

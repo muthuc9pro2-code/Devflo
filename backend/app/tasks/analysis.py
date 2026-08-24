@@ -178,7 +178,7 @@ def _finalize_commit_if_processing(
 #
 # Analysis.processing_heartbeat_at is a throttled liveness signal, never a
 # second progress-tracking system: ordinary per-batch artifact commits
-# deliberately do not dirty the shared Analysis row (Section 5), so this
+# deliberately do not dirty the shared Analysis row, so this
 # is the one place that does, and only rarely.
 _HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 
@@ -200,9 +200,10 @@ def _bump_processing_heartbeat(db: Session, analysis_id: int) -> None:
 
     Throttled to at most once per _HEARTBEAT_MIN_INTERVAL_SECONDS per
     analysis_id, independent of how often the caller invokes this - this
-    is what keeps it from recreating the shared-Analysis-row contention
-    Section 5 removed: even a burst of many batches within the throttle
-    window writes the heartbeat at most once, not once per batch.
+    is what keeps it from recreating the shared-Analysis-row write
+    contention a per-batch heartbeat write would otherwise cause: even a
+    burst of many batches within the throttle window writes the heartbeat
+    at most once, not once per batch.
     """
     now = perf_counter()
     last = _last_heartbeat_write.get(analysis_id, 0.0)
@@ -258,7 +259,7 @@ def process_analysis(analysis_id: int):
             logger.warning("Analysis %s not found", analysis_id)
             return
 
-        # Terminal-state guard (Part W): cancelled/completed/failed never
+        # Terminal-state guard: cancelled/completed/failed never
         # transition back into "processing" - a duplicate/redelivered
         # dispatch message for any of these is always a no-op. Only
         # pending/processing may proceed (processing is legitimate here
@@ -305,7 +306,7 @@ def process_analysis(analysis_id: int):
             if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
         ]
 
-        # Part Z zombie case: every artifact already reached SOME terminal
+        # Zombie-recovery case: every artifact already reached SOME terminal
         # outcome - completed included, not just the 4 statuses excluded
         # from dispatch above (a "completed" artifact is still present in
         # artifact_ids, since redispatching it is harmless: _process_
@@ -328,7 +329,7 @@ def process_analysis(analysis_id: int):
         )
         needs_source_prep = bool(analysis.source_kind) and not finalize_only
 
-        # Re-check immediately before dispatch (Part E): cheap, and closes
+        # Re-check immediately before dispatch: cheap, and closes
         # the (small) window since the entry check above in case a cancel
         # request raced in during this synchronous setup.
         if _is_analysis_cancelled(db, analysis_id):
@@ -399,7 +400,7 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             )
             return 0
 
-        # Cancellation checkpoint (Part E/Q Case 2): a stale/redelivered
+        # Cancellation checkpoint: a stale/redelivered
         # task for an analysis the user has since cancelled must return
         # cleanly - no source-index prep, no parsing, no Evidence, no
         # status resurrection. Checked once here, before any expensive
@@ -434,7 +435,7 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
         # See _GLOBAL_LINE_NUMBER_STRIDE above: deterministic per-position
         # band instead of a cross-artifact running total, since concurrent
         # artifacts have no well-defined "how many lines came before them".
-        # A plain local variable (Section 5) - not analysis.last_processed_line
+        # A plain local variable - not analysis.last_processed_line
         # - so this never dirties the shared Analysis row: concurrent
         # artifact tasks previously all wrote to that one row on every
         # batch commit (see _persist_artifact_batch), causing unnecessary
@@ -510,7 +511,7 @@ def _prepare_source_task(analysis_id: int) -> None:
             logger.warning("Analysis %s not found for source prep", analysis_id)
             return
 
-        # Cancellation checkpoint (Part E/I): a cancelled analysis must
+        # Cancellation checkpoint: a cancelled analysis must
         # never start source preparation, and its source_status must never
         # be written by this task at all - not "ready", not "unavailable".
         if analysis.status == "cancelled":
@@ -533,9 +534,8 @@ def _prepare_source_task(analysis_id: int) -> None:
         source_prep_start = perf_counter()
         _prepare_source_index(analysis)
 
-        # Re-check after preparation, before persisting the "ready" state
-        # (Part E: "after preparation before persisting ready state where
-        # practical") - source prep (a real git clone/ZIP extraction) can
+        # Re-check after preparation, before persisting the "ready" state -
+        # source prep (a real git clone/ZIP extraction) can
         # take real wall-clock time, during which the analysis may have
         # been cancelled. A cancelled analysis must never be marked source-
         # ready; the prepared tree is discarded instead.
@@ -638,7 +638,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             logger.warning("Analysis %s not found at finalize time", analysis_id)
             return
 
-        # Cancellation checkpoint, immediately on entry (Part J): a stale/
+        # Cancellation checkpoint, immediately on entry: a stale/
         # redelivered/recovery-triggered finalize for an analysis the user
         # has since cancelled must do nothing - the cancel endpoint already
         # durably reset/cleared everything for it. "failed" is likewise
@@ -682,7 +682,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
         _bump_processing_heartbeat(db, analysis_id)
 
-        # Section 9: every artifact task that could ever use the physical
+        # Every artifact task that could ever use the physical
         # prepared source tree (to correlate stack frames and persist
         # source_matches into Evidence) has now finished - the tree itself
         # is no longer needed for anything below, including a later
@@ -792,7 +792,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             # WHOLE analysis retained zero evidence, every one of them is
             # necessarily a zero-evidence artifact - one bounded query,
             # reused both for the artifacts[] outcome list and to check for
-            # a captured Sections 9-12 fallback context (never a second
+            # a captured fallback context (never a second
             # read/re-OCR - fallback_context was already captured during
             # each artifact's own ingestion pass in _process_artifact).
             zero_evidence_artifacts = (
@@ -821,7 +821,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     return
                 try:
                     gemini_result = generate_investigation_explanation(fallback_llm_context)
-                    # Part F/J: the external call may have taken real time -
+                    # The external call may have taken real time -
                     # a cancellation that landed while it was in flight must
                     # discard this result rather than persist it.
                     if _bail_if_cancelled(db, analysis_id, "after Gemini (fallback)"):
@@ -857,10 +857,10 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 source_outcome = build_source_outcome_payload(analysis)
                 if source_outcome is not None:
                     fallback_payload["source"] = source_outcome
-                # Persist-before-publish (locked requirement) - see the
-                # CORRELATED branch below for the full rationale. Final
-                # transactional fence immediately before persistence (Part
-                # J): stale finalization must never do cancelled -> completed.
+                # Persist-before-publish - see the CORRELATED branch below
+                # for the full rationale. Final transactional fence
+                # immediately before persistence: stale finalization must
+                # never do cancelled -> completed.
                 if not _finalize_commit_if_processing(
                     db, analysis, result_snapshot=fallback_payload, stage="fallback"
                 ):
@@ -889,9 +889,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             source_outcome = build_source_outcome_payload(analysis)
             if source_outcome is not None:
                 zero_evidence_payload["source"] = source_outcome
-            # Persist-before-publish (locked requirement) - see the
-            # CORRELATED branch below for the full rationale. Final
-            # transactional fence immediately before persistence (Part J).
+            # Persist-before-publish - see the CORRELATED branch below for
+            # the full rationale. Final transactional fence immediately
+            # before persistence.
             if not _finalize_commit_if_processing(
                 db, analysis, result_snapshot=zero_evidence_payload, stage="zero-evidence"
             ):
@@ -919,7 +919,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
             return
 
-        # Section 4 (final hardening pass): persist identities once, then
+        # Persist identities once, then
         # select ONE bounded working Evidence set from MySQL - used
         # identically for routing, correlation (CORRELATED), and the
         # frontend/Gemini payload (SIMPLE), so route/graph/payload can
@@ -1020,13 +1020,13 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 .all()
             )
 
-            # Section 2: an artifact that retained zero structured Evidence
+            # An artifact that retained zero structured Evidence
             # of its own but did capture useful fallback text/OCR content
             # during its own ingestion pass (never a second read/OCR) must
             # not silently disappear just because OTHER artifacts in this
             # same analysis have real structured Evidence - it becomes
             # bounded, clearly-non-causal supplemental context instead.
-            # Section 4 hardening: membership comes from the REAL per-
+            # Membership comes from the REAL per-
             # artifact map, not the bounded evidence_rows working set - an
             # artifact whose Evidence exists in MySQL but did not survive
             # the bounded selection must never be mislabeled as
@@ -1086,7 +1086,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 return
             try:
                 gemini_result = generate_investigation_explanation(llm_context)
-                # Part F/J: the external call may have taken real time -
+                # The external call may have taken real time -
                 # discard this result rather than persist it if cancelled
                 # while it was in flight.
                 if _bail_if_cancelled(db, analysis_id, "after Gemini (correlated)"):
@@ -1122,15 +1122,14 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 correlation_payload["source"] = source_outcome
-            # Persist-before-publish (locked requirement): the exact same
+            # Persist-before-publish: the exact same
             # bounded payload about to be published as investigation_result
             # is committed to the DB FIRST. If the live SSE event is lost
             # immediately afterward (client disconnected, process crashed),
             # History/reconnect must already have the authoritative result
             # rather than racing a result that only ever went out over the
-            # wire. Final transactional fence immediately before persistence
-            # (Part J): stale finalization must never do
-            # cancelled -> completed.
+            # wire. Final transactional fence immediately before persistence:
+            # stale finalization must never do cancelled -> completed.
             if not _finalize_commit_if_processing(
                 db, analysis, result_snapshot=correlation_payload, stage="correlated"
             ):
@@ -1171,9 +1170,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 .all()
             )
 
-            # Section 2: same low-structure-survives-a-mixed-investigation
+            # Same low-structure-survives-a-mixed-investigation
             # treatment as the CORRELATED branch above - membership from the
-            # REAL per-artifact map (Section 4 hardening), not the bounded
+            # REAL per-artifact map, not the bounded
             # evidence_rows working set.
             simple_artifact_ids_with_evidence = set(evidence_counts_by_artifact.keys())
             simple_supplemental_artifacts = [
@@ -1192,9 +1191,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 supplemental_artifacts=simple_supplemental_artifacts,
             )
 
-            # Prepared for the Gemini integration to be wired in next -
-            # mirrors the CORRELATED branch's llm_context above; no Gemini
-            # SDK/API call exists in this codebase yet.
+            # Mirrors the CORRELATED branch's llm_context above.
             simple_llm_context = build_simple_llm_context(
                 analysis_id,
                 evidence_rows,
@@ -1208,7 +1205,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 return
             try:
                 gemini_result = generate_investigation_explanation(simple_llm_context)
-                # Part F/J: the external call may have taken real time -
+                # The external call may have taken real time -
                 # discard this result rather than persist it if cancelled
                 # while it was in flight.
                 if _bail_if_cancelled(db, analysis_id, "after Gemini (simple)"):
@@ -1236,9 +1233,9 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
-            # Persist-before-publish (locked requirement) - see the
-            # CORRELATED branch above for the full rationale. Final
-            # transactional fence immediately before persistence (Part J).
+            # Persist-before-publish - see the CORRELATED branch above for
+            # the full rationale. Final transactional fence immediately
+            # before persistence.
             if not _finalize_commit_if_processing(
                 db, analysis, result_snapshot=simple_payload, stage="simple"
             ):
@@ -1273,8 +1270,8 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 def _capture_small_text_artifact_fallback(saved_file_path: str) -> dict | None:
     """A bounded (<= SIMPLE_FALLBACK_MAX_TEXT_BYTES) prefix read of an
     already-confirmed-small (<= SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES, a few
-    MiB at most) text artifact - not the "reopen a 1 GiB artifact" cost
-    Section 9 warns against, and never a second pass over the artifact's
+    MiB at most) text artifact - never the cost of reopening a full 1 GiB
+    artifact, and never a second pass over the artifact's
     real parsing/retention path (stream_artifact_events runs exactly once,
     immediately after this, unaffected by it)."""
     with open(saved_file_path, "rb") as handle:
@@ -1290,7 +1287,7 @@ def _process_artifact(
     source_index=None,
     global_line_number: int | None = None,
 ) -> int:
-    # Section 5: an explicit local starting line number rather than reading
+    # An explicit local starting line number rather than reading
     # analysis.last_processed_line - the caller (_process_artifact_task) no
     # longer maintains that shared-row attribute at all. Falls back to
     # reading it only for callers that still seed it directly (e.g. legacy/
@@ -1383,7 +1380,7 @@ def _process_artifact(
             source_index=source_index,
         )
         if batch_result is None:
-            # Cancellation fence tripped (Part D/F): this batch was
+            # Cancellation fence tripped: this batch was
             # deliberately not persisted, and this analysis is cancelled -
             # stop consuming the generator and return immediately. Do NOT
             # fall through to the terminal size-check/status="completed"
@@ -1398,8 +1395,7 @@ def _process_artifact(
             return parsed_count
         parsed_count += batch_result
         # Best-effort liveness refresh at a coarse persisted-progress
-        # boundary (Section: heartbeat during long artifact processing) -
-        # safe to call once per batch only because _bump_processing_
+        # boundary - safe to call once per batch only because _bump_processing_
         # heartbeat itself throttles to at most one real DB write per
         # _HEARTBEAT_MIN_INTERVAL_SECONDS per analysis; a single genuinely
         # long artifact (many batches, well past that interval) would
@@ -1433,7 +1429,7 @@ def _process_artifact(
             f"Artifact {artifact.id} changed during processing; checkpoint not completed"
         )
 
-    # Section 5: only this artifact's own row is updated here - the shared
+    # Only this artifact's own row is updated here - the shared
     # Analysis.processed_bytes/last_processed_line are never mutated during
     # per-artifact/per-batch processing (see _persist_artifact_batch),
     # only recomputed once from AnalysisArtifact rows at
@@ -1606,16 +1602,17 @@ def _persist_artifact_batch(
     _correlate_source_events(important_events, source_index)
     _assign_batch_fingerprints(important_events)
 
-    # Cancel-vs-Evidence-commit race fence (Part D). A plain unlocked
+    # Cancel-vs-Evidence-commit race fence. A plain unlocked
     # SELECT here would still leave a check-then-commit gap a concurrent
     # cancel could land in. with_for_update(read=True) instead takes a
     # SHARED row lock on this one Analysis row (MySQL: LOCK IN SHARE MODE),
     # held only until this same transaction's commit/rollback below:
     #   - multiple concurrent artifact-batch transactions taking a SHARED
     #     lock never block each other - this is NOT the shared-Analysis-
-    #     row UPDATE contention Section 5 removed, and that stays removed;
-    #     under normal operation (no cancellation in flight) this never
-    #     blocks anything and costs one extra indexed single-row read.
+    #     row UPDATE contention a per-batch write would cause, and that
+    #     stays avoided; under normal operation (no cancellation in
+    #     flight) this never blocks anything and costs one extra indexed
+    #     single-row read.
     #   - it DOES block against the cancel endpoint's own brief, rare
     #     UPDATE (an EXCLUSIVE lock), and only for the handful of
     #     milliseconds that commit takes - once unblocked, it is
@@ -1626,7 +1623,7 @@ def _persist_artifact_batch(
     # nonzero Evidence from a batch that "raced" it. Any batch that
     # commits BEFORE the cancellation tombstone wins is still caught by
     # the cancel endpoint's own Evidence cleanup, which runs AFTER its
-    # tombstone commits (Part C/G) and deletes everything present at that
+    # tombstone commits and deletes everything present at that
     # moment, including this kind of just-committed batch.
     current_status = (
         db.query(Analysis.status)
@@ -1645,7 +1642,7 @@ def _persist_artifact_batch(
         artifact_id=artifact.id,
     )
 
-    # Section 5: only this artifact's own row is dirtied here (never the
+    # Only this artifact's own row is dirtied here (never the
     # shared Analysis row) - concurrent artifact tasks each commit their
     # own row without contending for a lock on one shared row per batch.
     # Analysis.processed_bytes/last_processed_line are recomputed once
@@ -1676,7 +1673,7 @@ def _correlate_source_events(events, source_index) -> None:
         event.source_matches = correlate_event(event, source_index)
 
 
-# Section 6: a small, bounded, process-LOCAL cache of already-built
+# A small, bounded, process-LOCAL cache of already-built
 # SourceIndex objects, keyed by analysis_id. This is a pure optimization,
 # never the sole correctness mechanism - Celery workers are separate OS
 # processes with no shared memory, so a worker handling several artifacts
@@ -1891,12 +1888,12 @@ def _cleanup_completed_diagnostic_files(db: Session, analysis_id: int) -> None:
 def cancel_analysis_and_cleanup(db: Session, analysis_id: int) -> str | None:
     """Durably cancel one analysis and best-effort reclaim everything
     generated for it. Called synchronously from the HTTP cancel endpoint
-    (FastAPI, not Celery) - never depends on a free Celery worker slot
-    (Part F): the tombstone commit below is the entire "cancellation
+    (FastAPI, not Celery) - never depends on a free Celery worker slot:
+    the tombstone commit below is the entire "cancellation
     happened" guarantee, independent of whether/when any in-flight worker
     ever observes it.
 
-    Ordering (Part C) is the whole safety story here:
+    The ordering below is the whole safety story here:
       1/2. the durable tombstone (status="cancelled") is established and
            committed FIRST, before any destructive cleanup;
       3.   analysis-scoped generated-data cleanup (Evidence, ai_analysis,
@@ -1933,7 +1930,7 @@ def cancel_analysis_and_cleanup(db: Session, analysis_id: int) -> str | None:
 
     # 3: analysis-scoped generated-data cleanup. Evidence deletion here is
     # what closes the cancel-vs-Evidence-commit race together with the
-    # per-batch fence in _persist_artifact_batch (Part D): any batch that
+    # per-batch fence in _persist_artifact_batch: any batch that
     # already committed Evidence before this tombstone won is captured by
     # this DELETE (it deletes everything present at this moment); any
     # batch whose own fence observes the now-committed tombstone rolls
@@ -2004,7 +2001,7 @@ def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
         if analysis is None:
             return
-        # Part J: cancelled is terminal and user-authoritative - an
+        # Cancelled is terminal and user-authoritative - an
         # unexpected exception elsewhere in a stale/redelivered task for an
         # already-cancelled analysis must never resurrect/reinterpret it as
         # "failed". completed is left the same way for symmetry, though in
@@ -2073,7 +2070,7 @@ def reconstruct_current_investigation_result(
             return payload
         return build_zero_evidence_payload(analysis_id, artifacts=artifacts)
 
-    # Section 4 hardening: this read/reconstruction path gets the same
+    # This read/reconstruction path gets the same
     # bounded-selection-before-route treatment as the live finalize path -
     # ONE bounded working Evidence set, used identically for routing,
     # correlation, and the SIMPLE payload (never a second, unbounded
@@ -2264,7 +2261,7 @@ def _known_terminal_artifact_outcomes(
     ]
 
 
-# --- Stale/orphan recovery (Part R-V) -----------------------------------
+# --- Stale/orphan recovery ----------------------------------------------
 #
 # Conservative on purpose: this must never fire during a normal single-
 # stage pause (large parsing - refreshed every persisted batch, see
@@ -2293,7 +2290,7 @@ def recover_stale_analyses() -> int:
     """Celery Beat periodic task (see celery_app.py's beat_schedule) - the
     ONLY place Devflo ever redispatches a pending/processing analysis after
     an unexpected interruption. Deliberately NOT run on FastAPI startup
-    and NOT triggered by frontend page load (Part R/U): either would risk
+    and NOT triggered by frontend page load: either would risk
     duplicating a perfectly healthy in-flight Celery workflow on a plain
     API-process restart, which has nothing to do with whether the actual
     worker/broker work is still alive.
@@ -2305,7 +2302,7 @@ def recover_stale_analyses() -> int:
     completed/failed analyses are never candidates (excluded by the status
     filter itself).
 
-    Claim is atomic and race-safe (Part V) against a second concurrent
+    Claim is atomic and race-safe against a second concurrent
     scan, or this same task overlapping its own next Beat tick if a prior
     run is unexpectedly slow: each candidate is claimed with one
     conditional UPDATE ... WHERE status IN (...) AND heartbeat is still

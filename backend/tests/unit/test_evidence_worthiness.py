@@ -1,4 +1,4 @@
-"""Section 8: one canonical is_evidence_worthy() predicate, reused as the
+"""One canonical is_evidence_worthy() predicate, reused as the
 actual final persistence gate (app/tasks/analysis.py._persist_artifact_batch)
 instead of an inlined, independently-drifting event.level check.
 
@@ -33,7 +33,6 @@ def test_important_severity_is_evidence_worthy():
 
 
 def test_real_exception_type_is_evidence_worthy_even_at_info_level():
-    """Scenario K: explicit INFO with a real exception must be retained."""
     assert is_evidence_worthy(_event(level="INFO", exception_type="ConnectionError"))
 
 
@@ -74,8 +73,6 @@ def test_non_opentelemetry_trace_id_alone_is_not_evidence_worthy():
 
 
 def test_ordinary_info_heartbeat_is_not_evidence_worthy():
-    """Scenario L: an ordinary INFO heartbeat with no other real signal
-    must not be retained."""
     assert not is_evidence_worthy(
         _event(level="INFO", raw_line="health check succeeded")
     )

@@ -147,8 +147,8 @@ def test_identical_bytes_different_filename_is_flagged_duplicate():
 def test_duplicate_staged_bytes_are_deleted_but_metadata_and_canonical_survive(
     tmp_path, monkeypatch
 ):
-    """Section 6: duplicate rows were previously marked "duplicate" in the
-    DB but their staged physical bytes were never reclaimed. Only the
+    """Duplicate rows are marked "duplicate" in the
+    DB and their staged physical bytes are reclaimed. Only the
     duplicate's file must be deleted - never the canonical's - and only
     after the DB has durably established the relationship; all metadata
     (filename, duplicate_of_artifact_id) must remain queryable."""

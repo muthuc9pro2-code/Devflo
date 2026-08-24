@@ -1,6 +1,6 @@
-"""Analysis Lifecycle Hardening - orphan/stale-analysis recovery (Parts
-R-Z). Explicit cancellation tests live in test_analysis_cancellation.py;
-this file covers the OTHER half of the lifecycle prompt: what happens
+"""Orphan/stale-analysis recovery.
+Explicit cancellation tests live in test_analysis_cancellation.py;
+this file covers the other half of the analysis lifecycle: what happens
 when a worker/Redis/machine is unexpectedly interrupted rather than the
 user cancelling on purpose.
 """
@@ -60,7 +60,7 @@ def _artifact(db, analysis, position=0, status="pending", **kwargs) -> AnalysisA
     return artifact
 
 
-# --- Part S: the throttled heartbeat ----------------------------------------
+# --- The throttled heartbeat ----------------------------------------------
 
 
 def test_bump_processing_heartbeat_writes_on_first_call(monkeypatch):
@@ -189,7 +189,7 @@ def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch
     assert artifact.processed_bytes == artifact.size_bytes
 
 
-# --- Part T: the stale threshold is a conservative, simple constant --------
+# --- The stale threshold is a conservative, simple constant ---------------
 
 
 def test_stale_threshold_is_a_single_conservative_constant():
@@ -205,7 +205,7 @@ def test_stale_threshold_is_a_single_conservative_constant():
     assert analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS == 300
 
 
-# --- Part U/V: recover_stale_analyses scan + atomic claim -------------------
+# --- recover_stale_analyses scan + atomic claim ----------------------------
 
 
 def _stale_analysis(db, user, *, status="processing", age_seconds=None, **kwargs):
@@ -317,7 +317,7 @@ def test_recover_stale_analyses_never_claims_a_terminal_analysis(monkeypatch, st
 
 
 def test_recover_stale_analyses_claim_is_atomic_against_a_concurrent_second_scan(monkeypatch):
-    """Part V: two scans (or a scan racing this same task's next tick)
+    """Two scans (or a scan racing this same task's next tick)
     must never produce two logical redispatches for the same orphaned
     analysis - the second scan's conditional UPDATE affects zero rows
     once the first scan already refreshed the heartbeat, so it claims
@@ -353,7 +353,7 @@ def test_recover_stale_analyses_scan_is_bounded_per_tick(monkeypatch):
     assert claimed_count == limit  # bounded, not all (limit + 5)
 
 
-# --- Part W: process_analysis terminal guards allow legitimate redispatch --
+# --- process_analysis terminal guards allow legitimate redispatch ---------
 
 
 def test_process_analysis_allows_a_recovered_processing_analysis_to_redispatch(monkeypatch):
@@ -396,11 +396,11 @@ def test_process_analysis_never_redispatches_a_terminal_analysis(monkeypatch, st
     analysis_task.process_analysis.run(analysis.id)  # must not raise
 
 
-# --- Part Y: source recovery does not reclone or retry unnecessarily -------
+# --- Source recovery does not reclone or retry unnecessarily --------------
 
 
 def test_prepare_source_task_reuses_the_ready_marker_instead_of_recloning(monkeypatch, tmp_path):
-    """Part Y's "don't reclone when already ready" is satisfied one layer
+    """Not recloning when already ready is satisfied one layer
     down from _prepare_source_task: source_archive.prepare_source() itself
     is idempotent via an on-disk ready marker (see its own docstring -
     "resuming a GitHub-sourced analysis always fails outright (git clone
@@ -456,7 +456,7 @@ def test_prepare_source_task_does_not_retry_when_source_is_already_unavailable(m
     assert analysis.source_status == "unavailable"
 
 
-# --- Part Z: zombie recovery (all artifacts terminal, finalize missing) ----
+# --- Zombie recovery (all artifacts terminal, finalize missing) -----------
 
 
 def test_process_analysis_finalizes_directly_when_every_artifact_is_already_terminal(monkeypatch):
@@ -563,7 +563,7 @@ def test_recovered_zombie_finalizes_end_to_end_without_reparsing_completed_artif
     db2.close()
 
 
-# --- DB-outage-left processing state remains recoverable (audit Section 8) -
+# --- DB-outage-left processing state remains recoverable ------------------
 
 
 def test_artifact_left_processing_after_a_db_outage_is_recoverable_with_checkpoint_intact(monkeypatch):
@@ -636,8 +636,8 @@ def test_artifact_left_processing_after_a_db_outage_is_recoverable_with_checkpoi
     assert delayed == [analysis_id]
 
 
-# --- Gemini/finalize heartbeat coverage (audit Section 3: no client-side ---
-# timeout on generate_investigation_explanation) -----------------------------
+# --- Gemini/finalize heartbeat coverage (no client-side timeout on --------
+# generate_investigation_explanation) ---------------------------------------
 
 
 def test_finalize_bumps_heartbeat_after_gemini_resolves(monkeypatch):

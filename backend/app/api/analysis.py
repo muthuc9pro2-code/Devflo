@@ -519,7 +519,7 @@ def cancel_analysis(
         # already confirmed above, so this only means the row is gone.
         raise HTTPException(status_code=404, detail="Analysis not found")
 
-    # Best-effort live notification only (Part K) - DB is already
+    # Best-effort live notification only - DB is already
     # authoritative regardless of whether this is ever delivered; a lost
     # event is fully reconstructed by the next durable GET/reconnect via
     # compute_current_analysis_state's "cancelled" branch.

@@ -1,4 +1,4 @@
-"""Item 3: correlation signal de-duplication.
+"""Correlation signal de-duplication.
 
 resolved_identity is DERIVED from trace_id first, then request_id (see
 persist_resolved_identities/persistent_identity_resolver.py) - so a pair

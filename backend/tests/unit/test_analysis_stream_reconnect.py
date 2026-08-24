@@ -253,7 +253,7 @@ async def test_stale_queued_progress_tick_does_not_regress_the_client(monkeypatc
     await generator.aclose()
 
 
-# --- Additional Requirement 1/2/3: terminal-state behavior ---------------
+# --- Terminal-state behavior ----------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -300,7 +300,7 @@ async def test_failed_initial_snapshot_yields_state_then_terminates(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_cancelled_initial_snapshot_yields_state_then_terminates(monkeypatch):
-    """Part K: a snapshot that is already "cancelled" (the analysis was
+    """A snapshot that is already "cancelled" (the analysis was
     cancelled before this client ever connected/reconnected) must behave
     exactly like completed/failed above - one state event, then done. No
     fake progress=100, no investigation_result."""
@@ -324,7 +324,7 @@ async def test_cancelled_initial_snapshot_yields_state_then_terminates(monkeypat
 
 @pytest.mark.asyncio
 async def test_live_cancelled_event_is_yielded_once_then_terminates(monkeypatch):
-    """Part K: a client already watching a still-processing analysis that
+    """A client already watching a still-processing analysis that
     gets cancelled mid-stream must receive the live "cancelled" event
     (published by POST /analysis/{id}/cancel) exactly once, then the
     stream ends - the same terminal treatment as a live investigation_result."""
@@ -403,7 +403,7 @@ async def test_live_investigation_result_is_yielded_once_then_terminates(monkeyp
         await generator.__anext__()
 
 
-# --- Additional Requirement 4: async Redis polling is actually used ------
+# --- Async Redis polling is actually used ---------------------------------
 
 
 @pytest.mark.asyncio
@@ -439,7 +439,7 @@ async def test_async_redis_polling_is_used(monkeypatch):
     await generator.aclose()
 
 
-# --- Additional Requirement 5: heartbeat ---------------------------------
+# --- Heartbeat --------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -463,7 +463,7 @@ async def test_heartbeat_emits_keep_alive_comment_without_a_progress_or_result_e
     await generator.aclose()
 
 
-# --- Additional Requirement 6: DB Session closed before the wait loop ----
+# --- DB Session closed before the wait loop --------------------------------
 
 
 @pytest.mark.asyncio
@@ -492,7 +492,7 @@ async def test_db_session_is_closed_before_waiting_for_later_redis_messages(monk
     await generator.aclose()
 
 
-# --- Additional Requirement 7: Redis failure terminates cleanly ----------
+# --- Redis failure terminates cleanly ---------------------------------------
 
 
 @pytest.mark.asyncio
@@ -556,7 +556,7 @@ async def test_redis_disconnect_during_polling_terminates_stream_without_mutatin
     assert analysis.status == "processing"
 
 
-# --- Additional Requirement 8: malformed Redis messages are skipped -----
+# --- Malformed Redis messages are skipped -----------------------------------
 
 
 @pytest.mark.asyncio

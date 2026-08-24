@@ -104,10 +104,10 @@ def test_correlated_frontend_payload_uses_explicit_strength_names():
 
 
 def test_node_carries_its_own_role_and_root_cause_strength():
-    """Section 17: a node is self-sufficient - the frontend must not have
+    """A node is self-sufficient - the frontend must not have
     to cross-reference the separate root_causes[] array merely to know
-    whether a node is the root, a propagation step, or a victim. Section 9
-    additionally narrows root_causes[] to actual role=="root" candidates
+    whether a node is the root, a propagation step, or a victim.
+    root_causes[] is additionally narrowed to actual role=="root" candidates
     only, so every node (including propagation/victim ones no longer
     listed there at all) must still carry its own role/root_cause_strength
     directly."""
@@ -312,7 +312,7 @@ def test_gemini_context_still_reaches_a_source_match_outside_top_roots():
     assert source_matched["source_matches"][0]["line_number"] == 42
 
     # Root-cause ranking/roles themselves are untouched by this widening.
-    # Section 9: displayed root_candidates is narrowed to actual
+    # Displayed root_candidates is narrowed to actual
     # role=="root" candidates only (evidence-2/3 are propagation/victim).
     assert [c["node_id"] for c in context["components"][0]["root_candidates"]] == [
         "evidence-1",
@@ -417,7 +417,7 @@ def test_simple_gemini_context_still_carries_available_evidence_fields():
 def test_missing_optional_fields_do_not_break_serialization():
     # A genuinely isolated singleton (a lone sparse row with no correlating
     # signal at all) is now excluded from build_correlation_payload's
-    # components[] entirely (final hardening pass: components[] is the
+    # components[] entirely (components[] is the
     # PRIMARY incident only) before its node-level serialization could
     # even be exercised here - so `sparse` gets one same-artifact,
     # same-service companion (a real structural signal, unrelated to any

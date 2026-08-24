@@ -1,4 +1,4 @@
-"""Item 4: identity graph complexity bounding.
+"""Identity graph complexity bounding.
 
 iter_identity_candidate_pairs replaces the previous per-source full-group
 scan (O(n^2) candidate pairs for one giant shared-identity group - 5000

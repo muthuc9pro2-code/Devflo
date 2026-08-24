@@ -1,10 +1,10 @@
-"""Item 5: parent-span semantics.
+"""Parent-span semantics.
 
 An exact parent.span_id == child.parent_span_id match (with compatible
 trace identity) proves DIRECTION in trace topology - it does not by itself
 prove that the parent's failure physically caused the child's failure.
-relationship_type is now "explicit_parent_child" (never "causal", which
-this pass stops generating - though legacy persisted result_snapshot JSON
+relationship_type is "explicit_parent_child" (never "causal", which
+Devflo no longer generates - though legacy persisted result_snapshot JSON
 may still contain it, and the frontend must keep rendering that safely).
 """
 from datetime import datetime, timedelta, timezone

@@ -1,4 +1,4 @@
-"""Item 1: upload & OCR resource limits.
+"""Upload & OCR resource limits.
 
 MAX_DIAGNOSTIC_ARTIFACTS bounds artifact/task/DB fan-out from a huge batch
 of tiny files; MAX_OCR_IMAGES_PER_INVESTIGATION bounds RapidOCR's own

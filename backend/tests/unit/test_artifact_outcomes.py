@@ -10,7 +10,7 @@ test_investigation_context.py's style, with a real run_correlation()) and an
 end-to-end real-sqlite `_finalize_analysis_task` run proving the production
 wiring: a zero-evidence artifact never blocks the analysis, never removes
 other artifacts' evidence, and shows up in the published investigation_result
-payload (the single authoritative final SSE event - see FIX 4/analysis_events.py).
+payload (the single authoritative final SSE event - see analysis_events.py).
 """
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -29,7 +29,7 @@ from app.services.investigation_context import (
 )
 from app.tasks import analysis as analysis_task
 
-# Section 26: unit tests must never require the real Gemini API/network/
+# Unit tests must never require the real Gemini API/network/
 # quota - this is the same fixed, deterministic result every mocked
 # _finalize_analysis_task run in this file uses instead.
 _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
@@ -182,7 +182,7 @@ def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
     """A third artifact's evidence has no shared trace/request/etc. with
     the main incident and so lands in its own connected component - it must
     still be reported as evidence_count > 0, never conflated with "no
-    evidence extracted" - and, per Section 14, is deterministically
+    evidence extracted" - and is deterministically
     reported as not_linked to the primary (artifact 101+102) incident
     rather than silently indistinguishable from it."""
     base = datetime.now(timezone.utc)
@@ -216,7 +216,7 @@ def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
 
 def test_artifact_with_evidence_split_across_primary_and_isolated_is_partially_linked():
     """One artifact contributes evidence to BOTH the primary incident and
-    a separate isolated component - Section 14's partially_linked case."""
+    a separate isolated component - the partially_linked case."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
@@ -392,7 +392,7 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
 
     analysis_task._finalize_analysis_task.run([], analysis_id, None)
 
-    # Requirement 3/7: overall analysis still succeeds normally.
+    # The overall analysis still succeeds normally.
     session_factory = analysis_task.sessionLocal
     db = session_factory()
     try:
@@ -402,12 +402,12 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
         db.close()
 
     # investigation_result is the single authoritative final SSE event -
-    # published exactly once for this analysis (see FIX 4).
+    # published exactly once for this analysis.
     assert len(investigation_results) == 1
     payload = investigation_results[0]
     assert payload["investigation_path"] == "correlated"
 
-    # Requirement 4: the real evidence from the two contributing artifacts
+    # The real evidence from the two contributing artifacts
     # is untouched - correlated normally, not diluted by the zero-evidence one.
     assert payload["evidence_count"] == 2
     assert payload["evidence_artifact_count"] == 2
@@ -423,7 +423,7 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
     assert outcome_by_id[otel_id]["evidence_count"] == 1
     assert "message" not in outcome_by_id[otel_id]
 
-    # Requirements 2/5: zero-evidence artifact reported neutrally, never as
+    # Zero-evidence artifact reported neutrally, never as
     # failed/unsupported/unrelated.
     zero = outcome_by_id[random_id]
     assert zero["source_file"] == "random.log"
@@ -434,13 +434,13 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
     )
     assert "unrelated" not in zero["message"].lower()
 
-    # Requirement 10: existing SSE progress semantics (never 100) untouched.
+    # Existing SSE progress semantics (never 100) untouched.
     assert 100 not in published_progress
     assert published_progress
 
 
 def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
-    """Requirement 7: when NO artifact produced any evidence at all, the
+    """When NO artifact produced any evidence at all, the
     existing early-return "no meaningful diagnostic evidence found" path
     must still fire, publishing the zero_evidence-shaped investigation_result
     (never a correlated-shaped one) - this task only adds per-artifact

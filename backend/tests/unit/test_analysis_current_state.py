@@ -301,13 +301,13 @@ def test_completed_correlated_analysis_includes_correlated_result():
     assert result["component_count"] == 1
     # Both rows share trace_id at the exact SAME timestamp - a real
     # relationship, but with no signal establishing which one came first,
-    # so it is an association (see FIX 4), not a fabricated causal edge.
+    # so it is an association, not a fabricated causal edge.
     assert len(result["components"][0]["nodes"]) == 2
     assert result["components"][0]["associations"]
     assert result["components"][0]["edges"] == []
 
 
-# --- Section 5: reconnect must not lose already-known artifact outcomes ---
+# --- Reconnect must not lose already-known artifact outcomes --------------
 
 
 def test_reconnect_snapshot_includes_already_known_unsupported_and_duplicate_outcomes():

@@ -210,7 +210,7 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
     marker lives beside `dest`, not inside it, so it is never picked up by
     build_index as a source file.
 
-    Index reuse (final hardening pass, Section 6): every artifact task in
+    Index reuse: every artifact task in
     an analysis previously called this function and got a full
     os.walk()-based build_index() EVERY time, even though the tree never
     changes after the first successful acquisition. A small JSON manifest

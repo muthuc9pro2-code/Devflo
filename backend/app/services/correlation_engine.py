@@ -251,10 +251,10 @@ def match_correlation_signals(
     shared_checks = (
         (CorrelationSignal.TRACE_ID, left.trace_id, right.trace_id),
         (CorrelationSignal.REQUEST_ID, left.request_id, right.request_id),
-        # A real equal span_id is a genuine identity/correlation signal
-        # (Section 7) - configured with format weights in
-        # FORMAT_SIGNAL_PRIORITY for years but never actually emitted here.
-        # This alone can never become an explicit_parent_child direction:
+        # A real equal span_id is a genuine identity/correlation signal -
+        # configured with format weights in FORMAT_SIGNAL_PRIORITY but
+        # never actually emitted here. This alone can never become an
+        # explicit_parent_child direction:
         # only an exact parent.span_id == child.parent_span_id match
         # (match_parent_span/build_correlation_edge) is treated that way -
         # resolve_pair() (build_correlation_edges) decides
@@ -305,7 +305,7 @@ def match_correlation_signals(
         )
 
     # A real, unambiguous match to the SAME source-code location on both
-    # sides (Section 7) - source_index.py's _match_frame() already never
+    # sides - source_index.py's _match_frame() already never
     # fabricates/guesses an ambiguous match, so every entry actually in
     # source_matches is already trustworthy; this only checks whether two
     # records' matches converge on the identical file+line, never merely
@@ -500,7 +500,7 @@ def iter_identity_candidate_pairs(indexes: CorrelationIndexes):
         indexes.trace_ids,
         indexes.request_ids,
         indexes.resolved_identities,
-        # A real equal span_id (Section 7) - never a directed relationship
+        # A real equal span_id - never a directed relationship
         # on its own (see match_correlation_signals), but a genuine
         # identity-tier candidate like trace_id/request_id, so it must
         # actually be discoverable as a candidate pair, not just scoreable
@@ -595,7 +595,7 @@ _STRUCTURAL_SIGNALS = frozenset({
     CorrelationSignal.ENDPOINT,
     CorrelationSignal.EXCEPTION,
     CorrelationSignal.FINGERPRINT,
-    # A genuine same-file+line source match (Section 7) is real structural
+    # A genuine same-file+line source match is real structural
     # relatedness, never fabricated (see _shared_source_location) - SPAN_ID
     # is deliberately NOT included here, it is treated as an identity-tier
     # signal (see iter_identity_candidate_pairs) like trace_id/request_id.

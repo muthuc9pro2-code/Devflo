@@ -50,7 +50,7 @@ def test_indexes_strong_identity_fields() -> None:
 
     assert indexes.trace_ids["trace-1"] == [evidence]
     assert indexes.request_ids["request-1"] == [evidence]
-    # Section 7: a list (not a single Evidence) - two different rows can
+    # A list (not a single Evidence) - two different rows can
     # share a span_id, and both must remain discoverable as parent-span/
     # identity candidates, not just the last one indexed.
     assert indexes.span_ids["span-1"] == [evidence]
@@ -281,12 +281,11 @@ def test_sparse_unrelated_evidence_cannot_receive_a_perfect_correlation() -> Non
 
 
 def test_real_matching_trace_id_still_correlates_normally() -> None:
-    """The fix must not weaken genuine matching - only remove the false
-    sentinel-based one. Both records share the SAME explicit timestamp:
+    """Both records share the SAME explicit timestamp:
     with no real time separation, a real trace_id match is still a
     genuine relationship - just an association (same incident), not a
-    fabricated causal direction (see FIX 4: equal timestamps must not gain
-    direction merely from which side happens to be evidence id 1 vs 2)."""
+    fabricated causal direction. Equal timestamps must not gain
+    direction merely from which side happens to be evidence id 1 vs 2."""
     same_time = datetime.now(timezone.utc)
     left = _evidence(1, source_format="web_server", trace_id="trace-real-1", first_seen=same_time, last_seen=same_time)
     right = _evidence(2, source_format="database", trace_id="trace-real-1", first_seen=same_time, last_seen=same_time)
@@ -350,7 +349,7 @@ def test_classify_node_role_propagation_has_both() -> None:
     )
 
 
-# --- FIX 4: association vs causation ---------------------------------------
+# --- Association vs causation -----------------------------------------------
 
 
 def test_equal_timestamp_relationship_never_gains_direction_from_evidence_id():
@@ -550,7 +549,7 @@ def test_association_only_relationship_does_not_inflate_downstream_causal_counts
     assert roles["evidence-3"] == "uncorrelated"
 
 
-# --- Section 16: explicit_parent_child vs inferred_propagation vs association --
+# --- explicit_parent_child vs inferred_propagation vs association -----------
 
 
 def test_scenario_n_exact_parent_span_is_relationship_type_explicit_parent_child():

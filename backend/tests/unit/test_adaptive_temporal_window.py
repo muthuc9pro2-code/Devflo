@@ -243,7 +243,7 @@ def test_strong_identity_correlation_result_is_unchanged():
 
 
 def test_cross_artifact_strong_signal_pair_still_correlates():
-    """Section 15: cross-artifact correlation without real trace/request
+    """Cross-artifact correlation without real trace/request
     identity needs multiple independent structural signals, not just one -
     same service AND same fingerprint together is the kind of combined
     evidence that justifies it."""
@@ -266,10 +266,10 @@ def test_cross_artifact_strong_signal_pair_still_correlates():
 
 
 def test_cross_artifact_single_structural_signal_alone_is_not_sufficient():
-    """The flip side (Scenario R): two DIFFERENT uploaded files sharing
+    """The flip side: two DIFFERENT uploaded files sharing
     only a service name, a few seconds apart, must NOT be treated as one
     incident - same-service-alone cross-artifact is exactly the weak
-    signal Section 15 requires more than one of."""
+    signal that requires more than one of it to correlate."""
     base = datetime.now(timezone.utc)
     a = _evidence(
         1, artifact_id=101, source_format="database", service="orders-db", first_seen=base

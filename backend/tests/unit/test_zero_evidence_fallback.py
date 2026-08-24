@@ -1,4 +1,4 @@
-"""Sections 9-12: zero-structured-evidence SIMPLE unstructured fallback.
+"""Zero-structured-evidence SIMPLE unstructured fallback.
 
 A user should be able to upload a small TXT with no formal ERROR/Traceback
 token, or a screenshot whose OCR text the parser could not fully structure,
@@ -190,7 +190,7 @@ def test_finalize_uses_fallback_when_whole_analysis_has_zero_evidence(monkeypatc
 
 
 def test_finalize_stays_true_zero_evidence_when_no_artifact_has_fallback_context(monkeypatch):
-    """Scenario D end to end: no usable fallback anywhere -> no Gemini call
+    """End to end: no usable fallback anywhere -> no Gemini call
     at all, the existing zero_evidence contract is unchanged."""
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_zero_evidence_analysis(
@@ -246,7 +246,7 @@ def test_reconnect_restores_fallback_result_without_calling_gemini_again(monkeyp
     assert result["ai_analysis"] == _FAKE_GEMINI_RESULT.model_dump()
 
 
-# --- Section 13: zero-evidence artifact inside a STRONG investigation -----
+# --- Zero-evidence artifact inside a STRONG investigation ------------------
 
 
 def test_fallback_never_fires_when_the_whole_analysis_already_has_real_evidence(monkeypatch):

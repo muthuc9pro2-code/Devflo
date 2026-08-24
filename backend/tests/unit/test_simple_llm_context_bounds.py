@@ -1,4 +1,4 @@
-"""FIX 5: build_simple_llm_context() must not grow unbounded.
+"""build_simple_llm_context() must not grow unbounded.
 
 Bounded-memory ingestion (a 1 GiB input processed with bounded memory) is
 worthless if every retained Evidence row is later dumped into a single

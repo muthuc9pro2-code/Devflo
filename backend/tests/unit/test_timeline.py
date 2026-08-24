@@ -1,4 +1,4 @@
-"""Section 18: a real per-component timeline built from correlation's
+"""A real per-component timeline built from correlation's
 already-loaded nodes/roles - never a second DB scan, never fabricated
 ordering for missing/equal timestamps.
 """

@@ -1,4 +1,4 @@
-"""FIX 8: adversarial regression cases for generic-text and structured
+"""Adversarial regression cases for generic-text and structured
 field extraction. The mocked/fixture-based tests elsewhere prove the
 parser handles specific known log shapes; these prove it degrades safely
 (extracts what it genuinely can, fabricates nothing, never crashes) under

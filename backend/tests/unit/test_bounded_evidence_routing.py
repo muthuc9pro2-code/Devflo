@@ -1,4 +1,4 @@
-"""Item 2: bounded evidence routing & selection.
+"""Bounded evidence routing & selection.
 
 _finalize_analysis_task selects ONE bounded working Evidence set from
 MySQL (select_bounded_evidence_from_db) BEFORE routing, then reuses that
@@ -9,7 +9,7 @@ in finalize. Real per-artifact counts (select_evidence_counts_by_artifact)
 and the real total evidence count survive truncation honestly instead of
 being silently understated by whatever subset happened to be selected.
 
-(Requirement 1 - choose_investigation_path performs no DB query - lives in
+(choose_investigation_path performing no DB query is tested in
 test_investigation_router.py, next to the rest of that module's tests.)
 """
 from datetime import datetime, timedelta, timezone

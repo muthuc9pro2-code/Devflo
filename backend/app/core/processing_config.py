@@ -58,7 +58,7 @@ SIMPLE_FALLBACK_MAX_ARTIFACT_BYTES = 2 * MEBIBYTE
 SIMPLE_FALLBACK_MAX_TEXT_BYTES = 64 * 1024
 SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES = 256 * 1024
 
-# Section 20: hard safety-net bound on how much evidence a single CORRELATED
+# Hard safety-net bound on how much evidence a single CORRELATED
 # graph (and therefore its serialized SSE/frontend payload) is allowed to
 # carry - the 1 GiB bounded-streaming-ingestion guarantee is meaningless if
 # finalize later loads/serializes an unbounded Evidence table. Evidence
@@ -91,7 +91,7 @@ BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS = CORRELATED_MAX_EVIDENCE_RECORDS * 4
 IDENTITY_FULL_PAIRWISE_MAX_GROUP_SIZE = 128
 IDENTITY_CANDIDATE_MAX_NEIGHBORS = 32
 
-# Section 21: same idea for the SIMPLE path's frontend/SSE result
+# Same idea for the SIMPLE path's frontend/SSE result
 # (build_simple_payload) - Gemini's own SIMPLE context is already bounded
 # separately (SIMPLE_LLM_MAX_EVIDENCE_RECORDS, far smaller); this only
 # protects the response/serialization size for a giant uncorrelated
@@ -130,7 +130,7 @@ DIAGNOSTIC_ATTRIBUTES_MAX_BYTES = 2 * 1024
 # that has processed many different analyses cannot grow this unboundedly.
 SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES = 8
 
-# Section 10: the final byte budget for a CORRELATED investigation's
+# The final byte budget for a CORRELATED investigation's
 # Gemini context (build_llm_context), separate from and smaller than the
 # frontend/SSE graph budget (CORRELATED_MAX_CONTEXT_BYTES above) - a large
 # bounded graph (up to CORRELATED_MAX_EVIDENCE_RECORDS) can still be far

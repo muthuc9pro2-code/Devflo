@@ -1,12 +1,6 @@
-"""Section 18: a real per-component timeline, built from the correlation
+"""A real per-component timeline, built from the correlation
 nodes/roles that are already loaded in memory by the time correlation
 finishes - never a second DB scan, never a persisted timeline subsystem.
-
-The previous process_persisted_timelines() was a genuine no-op (an empty
-function body) despite the live SSE stream publishing "Timeline
-reconstruction completed" as if real work had happened - that call and its
-progress stage are removed; this module now does the one thing worth doing
-instead.
 """
 from typing import Any
 

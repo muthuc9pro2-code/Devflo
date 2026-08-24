@@ -1,13 +1,9 @@
-"""FIX 6: the Gemini AI explanation delivered live must survive a client
-refresh/reconnect after the analysis already completed.
-
-Before this fix, _finalize_analysis_task computed gemini_result and put it
-straight into the live SSE payload, but reconstruct_current_investigation_
-result (used by compute_current_analysis_state on reconnect) re-derived only
-deterministic state from persisted Evidence/AnalysisArtifact rows - it never
-attached any ai_analysis at all. A client reconnecting after completion saw
-a payload with no ai_analysis key, and the only way to get one back would
-have been a second, non-deterministic, costly Gemini call.
+"""The Gemini AI explanation delivered live must survive a client
+refresh/reconnect after the analysis already completed:
+reconstruct_current_investigation_result (used by
+compute_current_analysis_state on reconnect) must attach the same
+persisted ai_analysis rather than requiring a second, non-deterministic,
+costly Gemini call.
 
 These tests exercise the real end-to-end path against a real (sqlite)
 database: _finalize_analysis_task.run(...) for live completion, then

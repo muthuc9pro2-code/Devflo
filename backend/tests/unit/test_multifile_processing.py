@@ -12,7 +12,7 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
 
 
 def test_two_artifacts_process_independently_with_position_based_line_bands():
-    """Section 5: each artifact computes its own starting global_line_number
+    """Each artifact computes its own starting global_line_number
     from its own position band (exactly like _process_artifact_task does),
     independent of any other artifact - no shared, accumulating checkpoint
     on the Analysis row anymore."""
@@ -39,7 +39,7 @@ def test_two_artifacts_process_independently_with_position_based_line_bands():
 
 
 def test_processing_never_mutates_the_shared_analysis_row():
-    """Section 5: batch/artifact processing must not repeatedly dirty the
+    """Batch/artifact processing must not repeatedly dirty the
     shared Analysis.processed_bytes/last_processed_line row - only this
     artifact's own row is ever written. (Recomputing the legacy aggregate
     columns once, at finalize time, is covered separately.)"""
@@ -129,7 +129,7 @@ def test_artifact_batch_correlates_only_retained_events(monkeypatch):
 
 
 def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
-    # Section 6's process-local cache is module-level and keyed by
+    # The process-local cache is module-level and keyed by
     # analysis.id - reset it so an id=9 entry left behind by another test
     # (this fixture id is reused throughout the suite) can never make this
     # test silently skip calling prepare_source.
@@ -247,7 +247,7 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
     assert artifact.detected_format == ArtifactFormat.GENERIC.value
     assert artifact.size_bytes == path.stat().st_size
     assert artifact.processed_bytes == path.stat().st_size
-    # Section 5: the shared Analysis row is no longer written by
+    # The shared Analysis row is no longer written by
     # _process_artifact - only this artifact's own row (asserted above).
     assert analysis.last_processed_line == 1
     assert analysis.processed_bytes == len(first_line)

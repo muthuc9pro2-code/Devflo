@@ -1,7 +1,7 @@
-"""Analysis Lifecycle Hardening - cancellation, cleanup, race safety
-(Parts A-D, F-J, L). Recovery/orphan-handling tests (Parts R-Z) live in
+"""Analysis lifecycle - cancellation, cleanup, race safety.
+Recovery/orphan-handling tests live in
 test_analysis_recovery.py; the live/reconnect SSE "cancelled" terminal
-state (Part K) is covered in test_analysis_stream_reconnect.py alongside
+state is covered in test_analysis_stream_reconnect.py alongside
 the existing completed/failed terminal-state tests it already has.
 
 Endpoint functions are called directly (db/current_user/response passed
@@ -78,7 +78,7 @@ def _evidence(db, analysis, artifact, correlation_key="k1", fingerprint="fp1") -
     return evidence
 
 
-# --- Part A: "cancelled" is a real terminal enum state ----------------------
+# --- "cancelled" is a real terminal enum state -------------------------
 
 
 def test_cancelled_is_a_persistable_status_value_alongside_the_new_heartbeat_column():
@@ -91,7 +91,7 @@ def test_cancelled_is_a_persistable_status_value_alongside_the_new_heartbeat_col
     assert reloaded.processing_heartbeat_at is None
 
 
-# --- Part B: POST /analysis/{id}/cancel endpoint behavior -------------------
+# --- POST /analysis/{id}/cancel endpoint behavior -----------------------
 
 
 def test_cancel_pending_analysis_succeeds(monkeypatch):
@@ -296,7 +296,7 @@ def test_cancel_endpoint_is_idempotent_when_another_request_wins_the_cancel_race
     assert db.query(Analysis).filter(Analysis.id == analysis_id).first().status == "cancelled"
 
 
-# --- Part C/D/G: cleanup ordering, cross-analysis isolation, race safety ---
+# --- Cleanup ordering, cross-analysis isolation, race safety ------------
 
 
 def test_cancel_and_cleanup_deletes_evidence_only_for_this_analysis():
@@ -395,7 +395,7 @@ def test_cancel_and_cleanup_returns_the_original_status():
     assert cancel_analysis_and_cleanup(db, analysis.id) == "processing"
 
 
-# --- Part D: the cancel-vs-Evidence-commit race, closed by the per-batch fence
+# --- The cancel-vs-Evidence-commit race, closed by the per-batch fence --
 
 
 def _retained_batch():
@@ -463,7 +463,7 @@ def test_persist_artifact_batch_persists_normally_when_not_cancelled(monkeypatch
 
 
 def test_cancellation_committed_after_a_batch_already_committed_is_still_caught_by_cleanup():
-    """The other half of the Part D race: a batch that commits its Evidence
+    """The other half of the race: a batch that commits its Evidence
     BEFORE the cancel tombstone wins is still fully reclaimed by
     cancel_analysis_and_cleanup's own DELETE, which runs after the
     tombstone commits and captures everything present at that moment."""
@@ -479,7 +479,7 @@ def test_cancellation_committed_after_a_batch_already_committed_is_still_caught_
     assert db.query(Analysis).filter(Analysis.id == analysis.id).first().status == "cancelled"
 
 
-# --- Part F/Q(case 2): cancellation checkpoints stop stale/redelivered work -
+# --- Cancellation checkpoints stop stale/redelivered work ---------------
 
 
 def test_process_analysis_does_not_dispatch_for_an_already_cancelled_analysis(monkeypatch):
@@ -534,7 +534,7 @@ def test_prepare_source_task_skips_when_already_cancelled(monkeypatch):
 
 
 def test_prepare_source_task_discards_prepared_source_when_cancelled_mid_prep(monkeypatch):
-    """Part E/I: cancellation observed by the fresh re-check performed
+    """Cancellation observed by the fresh re-check performed
     right after preparation but before persisting source_status="ready"."""
     db = _session()
     alice = _user(db)
@@ -585,7 +585,7 @@ def test_prepare_source_task_does_not_mark_unavailable_for_a_cancelled_analysis(
     assert reloaded.source_status is None  # never "unavailable"
 
 
-# --- Part J: finalize checkpoints, Gemini-result discard, mark-failed guard
+# --- Finalize checkpoints, Gemini-result discard, mark-failed guard -----
 
 
 def _db_with_schema(monkeypatch):
@@ -623,7 +623,7 @@ def test_finalize_does_nothing_for_an_already_cancelled_analysis(monkeypatch):
 
 
 def test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_gemini_was_running(monkeypatch):
-    """Part F/J: an in-flight Gemini call may finish naturally, but if
+    """An in-flight Gemini call may finish naturally, but if
     cancellation is observed once it returns, the result must be thrown
     away, never persisted - proven on the zero-evidence/fallback path."""
     from app.schemas.gemini import GeminiInvestigationResponse
@@ -670,7 +670,7 @@ def test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_gemini_w
     db2.close()
 
 
-# --- Finalizer-vs-cancel transactional race (Part J hardening) -------------
+# --- Finalizer-vs-cancel transactional race ------------------------------
 #
 # test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_
 # gemini_was_running above already covers cancellation landing DURING the
@@ -862,7 +862,7 @@ def test_mark_analysis_failed_still_marks_a_genuinely_in_flight_analysis_failed(
     assert db.query(Analysis).filter(Analysis.id == analysis.id).first().status == "failed"
 
 
-# --- Part K (durable half): compute_current_analysis_state -----------------
+# --- Durable-reconnect half: compute_current_analysis_state --------------
 
 
 def test_compute_current_analysis_state_returns_a_small_terminal_cancelled_payload():
@@ -877,7 +877,7 @@ def test_compute_current_analysis_state_returns_a_small_terminal_cancelled_paylo
     assert "investigation_result" not in state
 
 
-# --- Part L: cancelled analyses are excluded from History at the DB level --
+# --- Cancelled analyses are excluded from History at the DB level -------
 
 
 def test_history_excludes_cancelled_analyses():
