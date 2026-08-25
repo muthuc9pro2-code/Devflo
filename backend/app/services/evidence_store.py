@@ -5,7 +5,6 @@ from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.orm import Session
 from app.core.processing_config import MAX_REPRESENTATIVE_LINE_BYTES
 from app.models import AnalysisArtifact, Evidence
-
 from .diagnostic_parser import parse_timestamp
 
 
@@ -40,9 +39,6 @@ def persist_evidence_batch(
     grouped_events = defaultdict(list)
 
     for event in events:
-        # Correlation and persisted identity must use the same schema-bounded
-        # values; otherwise two overlong IDs can hash differently but truncate
-        # to the same stored identity.
         trace_id = _bounded_text(event.trace_id, 255) or "__none__"
         request_id = _bounded_text(event.request_id, 255) or "__none__"
         span_id = _bounded_text(event.span_id, 255) or "__none__"
@@ -66,13 +62,6 @@ def persist_evidence_batch(
 
     for key, fingerprint_events in grouped_events.items():
         fingerprint, trace_id, request_id, span_id, artifact_id = key
-
-        # Trace/request identity is fully determined by fields already in
-        # hand here (same precedence identity_persister.py applies), so
-        # resolve it once at insert time instead of in a second full-table
-        # UPDATE pass afterward. The only case that pass still has to handle
-        # is "neither id present", whose resolved_identity string embeds the
-        # DB-assigned row id and so can't be known before the insert.
         if trace_id != "__none__":
             resolved_identity = f"trace:{trace_id}"
             identity_match_type = "trace_id"
@@ -115,17 +104,6 @@ def persist_evidence_batch(
                     _first_present(fingerprint_events, "level"),
                     50,
                 ),
-                # "__none__" is a real value ONLY for the internal grouping
-                # key and correlation_key hash above (both need a stable,
-                # hashable placeholder distinguishing "genuinely missing"
-                # from an id that happens to collide across events). It must
-                # never reach the stored column: a real NULL means
-                # correlation_engine.py's index-building code
-                # (build_correlation_indexes/_shared_value) correctly skips
-                # it, whereas the literal string "__none__" is a non-None
-                # value that looks like a real shared identifier - it
-                # would trace-match/request-match any two otherwise-
-                # unrelated events that both lack an id.
                 "trace_id": _bounded_text(
                     None if trace_id == "__none__" else trace_id,
                     255,
@@ -186,11 +164,6 @@ def persist_evidence_batch(
                     fingerprint_events,
                     "diagnostic_attributes",
                 ),
-                # Only ever non-None for source_format="image" events (see
-                # ParsedEvent.ocr_confidence / _stream_image_events) - every
-                # other format's events never set this attribute value away
-                # from its None default, so _first_present correctly leaves
-                # the column NULL for them instead of fabricating a score.
                 "ocr_confidence": _first_present(
                     fingerprint_events,
                     "ocr_confidence",

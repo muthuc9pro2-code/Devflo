@@ -24,8 +24,6 @@ def normalize_ocr_text(text: str) -> str:
         if line.upper() in _UI_NOISE:
             continue
 
-        # OCR commonly substitutes Unicode punctuation for ASCII
-        # punctuation used in source code and tracebacks.
         line = (
             line.replace("（", "(")
             .replace("）", ")")
@@ -37,11 +35,8 @@ def normalize_ocr_text(text: str) -> str:
             .replace("’", "'")
         )
 
-        # Normalize repeated whitespace without destroying line structure.
         line = re.sub(r"[ \t]+", " ", line)
 
-        # Common OCR mistake in traceback lines:
-        # "1ine 13" -> "line 13"
         line = re.sub(
             r"\b[1lI]ine\s+(\d+)\b",
             r"line \1",

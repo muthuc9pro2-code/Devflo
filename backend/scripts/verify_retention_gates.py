@@ -32,7 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import ArtifactFormat, detect_artifact  # noqa: E402
+from app.services.artifact_detector import detect_artifact  # noqa: E402
 from app.services.event_filter import IMPORTANT_LEVELS  # noqa: E402
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"

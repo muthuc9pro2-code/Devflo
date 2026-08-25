@@ -72,17 +72,6 @@ from app.services.gemini_service import (
 
 logger = logging.getLogger(__name__)
 
-# ParsedEvent.line_number ("global_line_number" below) is internal
-# bookkeeping only - never returned by any schema/API/frontend, and
-# correlation_engine.py orders strictly by evidence.first_seen (a real
-# timestamp), never by line number (confirmed by inspection). It used to be
-# a true running total accumulated sequentially across artifacts in
-# position order, which is meaningless once artifacts run concurrently (an
-# artifact can't know "how many lines came before it" from siblings that
-# haven't finished). Each artifact instead gets a fixed, deterministic band
-# keyed only by its own position, reproducible regardless of completion
-# order. 10**9 leaves generous headroom below any real artifact's line
-# count before the next artifact's band begins.
 _GLOBAL_LINE_NUMBER_STRIDE = 10**9
 
 
@@ -92,28 +81,11 @@ def _safe_rollback(db: Session) -> None:
     except Exception:
         logger.warning("db.rollback() failed after a prior exception", exc_info=True)
 
-
-# --- Cancellation -----------------------------------------------------
-#
-# DB is authoritative for cancellation, exactly like everything else in
-# this pipeline. No Redis flag, no process-global set, no frontend-only
-# state: every checkpoint below is a real read of Analysis.status (either
-# the already-loaded ORM object at a function's entry, or one small fresh
-# query at a later point where meaningful time may have passed).
-#
-# Checkpoints exist only at meaningful stage boundaries - dispatch entry,
-# per-artifact-task entry, before/after the external Gemini call, and
-# immediately before the final result/status commit - never per log line,
-# per parsed record, or per byte. See _is_analysis_cancelled/_bail_if_cancelled
-# below and their call sites.
-
-
 def _is_analysis_cancelled(db: Session, analysis_id: int) -> bool:
     return (
         db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
         == "cancelled"
     )
-
 
 def _bail_if_cancelled(db: Session, analysis_id: int, stage: str) -> bool:
     """Fresh, cheap (single indexed column) re-check at a finalize-stage
@@ -267,12 +239,6 @@ def process_analysis(analysis_id: int):
             logger.warning("Analysis %s not found", analysis_id)
             return
 
-        # Terminal-state guard: cancelled/completed/failed never
-        # transition back into "processing" - a duplicate/redelivered
-        # dispatch message for any of these is always a no-op. Only
-        # pending/processing may proceed (processing is legitimate here
-        # too: this task itself can be redelivered after a crash between
-        # committing "processing" and dispatching its children below).
         if analysis.status in ("cancelled", "completed", "failed"):
             logger.info(
                 "Analysis %s | already %s; not (re)dispatching",
@@ -306,40 +272,17 @@ def process_analysis(analysis_id: int):
         artifact_ids = [
             row.id
             for row in all_artifacts
-            # Unsupported/duplicate/resource_limited/processing_error
-            # artifacts are already terminal (the first two resolved at
-            # upload time; the latter two only ever reached DURING a prior
-            # processing attempt) - never (re)dispatched for ingestion,
-            # never produce a new Evidence set.
+           
             if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
         ]
 
-        # Zombie-recovery case: every artifact already reached SOME terminal
-        # outcome - completed included, not just the 4 statuses excluded
-        # from dispatch above (a "completed" artifact is still present in
-        # artifact_ids, since redispatching it is harmless: _process_
-        # artifact_task's own resumability guard no-ops immediately for it
-        # without reparsing - but it means artifact_ids alone can't tell
-        # "everything is done" apart from "some of this genuinely needs
-        # (re)processing"). This can only happen on a recovered/redelivered
-        # dispatch, never on a fresh upload - upload_file() already rejects
-        # an all-unsupported batch before create_analysis() runs, and
-        # resource_limited/processing_error/completed cannot exist before
-        # any artifact task has ever run. Nothing left to ingest; only
-        # finalization is missing. Invoke the existing finalizer directly
-        # instead of building a chord (empty, or one made only of no-op
-        # redispatches) - it is itself idempotent and re-derives everything
-        # from already-persisted Evidence/checkpoints, never reparsing a
-        # completed artifact.
         finalize_only = all(
             row.status in ("completed", "unsupported", "duplicate", "resource_limited", "processing_error")
             for row in all_artifacts
         )
         needs_source_prep = bool(analysis.source_kind) and not finalize_only
 
-        # Re-check immediately before dispatch: cheap, and closes
-        # the (small) window since the entry check above in case a cancel
-        # request raced in during this synchronous setup.
+      
         if _is_analysis_cancelled(db, analysis_id):
             logger.info(
                 "Analysis %s | cancelled before dispatch; not dispatching",
@@ -408,13 +351,6 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             )
             return 0
 
-        # Cancellation checkpoint: a stale/redelivered
-        # task for an analysis the user has since cancelled must return
-        # cleanly - no source-index prep, no parsing, no Evidence, no
-        # status resurrection. Checked once here, before any expensive
-        # work for this artifact begins (see the per-batch fence in
-        # _persist_artifact_batch for the part of this check that closes
-        # the cancel-vs-Evidence-commit race for work already in flight).
         if analysis.status == "cancelled":
             logger.info(
                 "Analysis %s | cancelled; skipping artifact %s",
@@ -424,32 +360,12 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             return 0
 
         if artifact.status in ("completed", "resource_limited", "processing_error"):
-            # Resumability: process_analysis's dispatch filter excludes
-            # unsupported/duplicate/resource_limited/processing_error -
-            # the first two are decided at upload time, before any artifact
-            # task exists; the latter two only ever become true DURING a
-            # prior processing attempt. Either way, a resumed run (e.g.
-            # after a worker crash or a recovery redispatch) can still
-            # re-dispatch a task for an artifact already reaching one of
-            # these terminal outcomes. That outcome is equally final as
-            # "completed" - never re-run its (deterministically identical)
-            # extraction, evidence cleanup, and status/reason persistence.
             return 0
 
         _bump_processing_heartbeat(db, analysis_id)
 
         source_index = _prepare_source_index(analysis)
 
-        # See _GLOBAL_LINE_NUMBER_STRIDE above: deterministic per-position
-        # band instead of a cross-artifact running total, since concurrent
-        # artifacts have no well-defined "how many lines came before them".
-        # A plain local variable - not analysis.last_processed_line
-        # - so this never dirties the shared Analysis row: concurrent
-        # artifact tasks previously all wrote to that one row on every
-        # batch commit (see _persist_artifact_batch), causing unnecessary
-        # row-lock contention between them. Analysis.processed_bytes/
-        # last_processed_line are recomputed once, from the authoritative
-        # per-artifact rows, at _finalize_analysis_task.
         global_line_number = artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
 
         return _process_artifact(
@@ -491,9 +407,6 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
         )
         return 0
     except Exception:
-        # Unknown/internal failures remain fatal. Do not turn DB errors,
-        # programming bugs, changed-on-disk artifacts, or broken invariants
-        # into fake successful artifact outcomes.
         _safe_rollback(db)
         logger.exception(
             "Analysis %s | artifact %s processing failed",
@@ -519,9 +432,7 @@ def _prepare_source_task(analysis_id: int) -> None:
             logger.warning("Analysis %s not found for source prep", analysis_id)
             return
 
-        # Cancellation checkpoint: a cancelled analysis must
-        # never start source preparation, and its source_status must never
-        # be written by this task at all - not "ready", not "unavailable".
+       
         if analysis.status == "cancelled":
             logger.info(
                 "Analysis %s | cancelled; skipping source preparation",
@@ -542,11 +453,6 @@ def _prepare_source_task(analysis_id: int) -> None:
         source_prep_start = perf_counter()
         _prepare_source_index(analysis)
 
-        # Re-check after preparation, before persisting the "ready" state -
-        # source prep (a real git clone/ZIP extraction) can
-        # take real wall-clock time, during which the analysis may have
-        # been cancelled. A cancelled analysis must never be marked source-
-        # ready; the prepared tree is discarded instead.
         if _is_analysis_cancelled(db, analysis_id):
             logger.info(
                 "Analysis %s | cancelled during source preparation; discarding",
@@ -578,8 +484,7 @@ def _prepare_source_task(analysis_id: int) -> None:
         if analysis is None:
             return
         if analysis.status == "cancelled":
-            # Never converted to source_status="unavailable" for a
-            # cancelled analysis - the acquisition failure is moot.
+           
             logger.info(
                 "Analysis %s | cancelled; ignoring source preparation failure",
                 analysis_id,
@@ -598,9 +503,7 @@ def _prepare_source_task(analysis_id: int) -> None:
         analysis.source_failure_reason = reason[:500]
         db.commit()
 
-        # prepare_source() already removes partial prepared trees on failure.
-        # This second cleanup is idempotent and keeps the optional-source
-        # degradation boundary explicit here.
+      
         try:
             cleanup_prepared_source(analysis_id)
         except OSError:
@@ -619,8 +522,6 @@ def _prepare_source_task(analysis_id: int) -> None:
         )
         return
     except Exception:
-        # Infrastructure/programming failures remain fatal; only controlled
-        # source-input/acquisition/resource failures degrade gracefully.
         _safe_rollback(db)
         logger.exception("Analysis %s | source preparation failed", analysis_id)
         _mark_analysis_failed(db, analysis_id)
@@ -646,11 +547,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             logger.warning("Analysis %s not found at finalize time", analysis_id)
             return
 
-        # Cancellation checkpoint, immediately on entry: a stale/
-        # redelivered/recovery-triggered finalize for an analysis the user
-        # has since cancelled must do nothing - the cancel endpoint already
-        # durably reset/cleared everything for it. "failed" is likewise
-        # already terminal and must not be reprocessed.
         if analysis.status in ("cancelled", "failed"):
             logger.info(
                 "Analysis %s | already %s; skipping finalize",
@@ -663,10 +559,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             db.query(AnalysisArtifact)
             .filter(
                 AnalysisArtifact.analysis_id == analysis_id,
-                # "unsupported"/"duplicate" are terminal, already-resolved
-                # states set at upload time (create_analysis) - they are
-                # never dispatched and so never reach "completed", but they
-                # must not block finalize either.
                 AnalysisArtifact.status.notin_(
                     [
                         "completed",
@@ -690,22 +582,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
         _bump_processing_heartbeat(db, analysis_id)
 
-        # Every artifact task that could ever use the physical
-        # prepared source tree (to correlate stack frames and persist
-        # source_matches into Evidence) has now finished - the tree itself
-        # is no longer needed for anything below, including a later
-        # reconstruction from persisted Evidence/result_snapshot. Removed
-        # once, here, before the remaining correlation/Gemini work, not
-        # earlier (artifact tasks still in flight need the real files) and
-        # not deferred until after this run (this IS the one point every
-        # outcome below - zero-evidence, SIMPLE, CORRELATED - passes
-        # through). Best-effort: a failure to delete temporary files must
-        # never turn an otherwise-successful investigation into a failed
-        # one. Also drops this worker process's own SourceIndex cache
-        # entry (if any) for this now-complete analysis - other worker
-        # processes may still hold a stale entry, but there are no
-        # legitimate future artifact tasks left to reuse it, and the
-        # existing bounded cache naturally evicts it eventually; no IPC.
         if analysis.source_kind:
             _source_index_process_cache.pop(analysis_id, None)
             try:
@@ -721,12 +597,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
         parsed_event_count = sum(results) if results else 0
 
         def _true_total_seconds() -> float:
-            # dispatch_start is a wall-clock timestamp taken in
-            # process_analysis before anything was dispatched, so this
-            # reflects real end-to-end time (source prep + concurrent
-            # artifact processing + this finalize task), not just this
-            # task's own perf_counter span. Falls back to finalize-local
-            # timing only if this task was ever invoked without it.
             if dispatch_start is not None:
                 return wall_time() - dispatch_start
             return perf_counter() - total_start
@@ -737,13 +607,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             .all()
         )
         artifact_count = len(position_and_lines)
-        # AnalysisArtifact.last_processed_line is always the artifact's own
-        # real local line count (ArtifactEvent.artifact_line_number) - never
-        # stride-banded, unlike Analysis.last_processed_line below, which is
-        # an internal, never-externally-exposed aggregate used only to keep
-        # per-artifact global_line_number bands distinct (see
-        # _GLOBAL_LINE_NUMBER_STRIDE). Summing the real per-artifact counts
-        # here is what actually answers "how many lines were processed".
+      
         total_lines = sum(
             last_processed_line for _position, last_processed_line in position_and_lines
         )
@@ -789,20 +653,12 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             or 0
         )
 
-        # Cancellation checkpoint: before any deterministic identity/
-        # timeline/correlation work, and before the zero-evidence/fallback
-        # path below (both are "the remaining finalize work" this guards).
+       
         if _bail_if_cancelled(db, analysis_id, "before correlation"):
             return
 
         if evidence_count == 0:
-            # Every artifact reaching finalize is "completed", and since the
-            # WHOLE analysis retained zero evidence, every one of them is
-            # necessarily a zero-evidence artifact - one bounded query,
-            # reused both for the artifacts[] outcome list and to check for
-            # a captured fallback context (never a second
-            # read/re-OCR - fallback_context was already captured during
-            # each artifact's own ingestion pass in _process_artifact).
+           
             zero_evidence_artifacts = (
                 db.query(AnalysisArtifact)
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
@@ -829,46 +685,26 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                     return
                 try:
                     gemini_result = generate_investigation_explanation(fallback_llm_context)
-                    # The external call may have taken real time -
-                    # a cancellation that landed while it was in flight must
-                    # discard this result rather than persist it.
+                    
                     if _bail_if_cancelled(db, analysis_id, "after Gemini (fallback)"):
                         return
                     fallback_payload["ai_analysis"] = gemini_result.model_dump()
-                    # Persisted only after a valid Gemini schema result (see
-                    # the CORRELATED/SIMPLE branches below) so reconnect can
-                    # reattach it without a second Gemini call.
+                   
                     analysis.ai_analysis = fallback_payload["ai_analysis"]
                 except GeminiUnavailableError:
-                    # Gemini is only the explanation layer - a temporarily
-                    # unavailable explanation must not fail this otherwise
-                    # complete deterministic result (see the CORRELATED
-                    # branch below for the full rationale). fallback_payload
-                    # keeps no "ai_analysis" key, same as the zero-evidence
-                    # payload below when there is nothing to explain.
+                   
                     logger.warning(
                         "Analysis %s | Gemini explanation unavailable; "
                         "completing without an explanation",
                         analysis_id,
                     )
                     analysis.ai_analysis = None
-                # generate_investigation_explanation() has no client-side
-                # timeout (google-genai's own default is unbounded - see
-                # _client's construction above) and can retry up to
-                # _MAX_ATTEMPTS times, so real wall-clock time may have
-                # passed here that the entry-only heartbeat above never
-                # covered. Refreshed once, after the call resolves either
-                # way (success or GeminiUnavailableError) - not a timeout
-                # or retry-count change, just keeping this analysis
-                # visibly alive to recover_stale_analyses while it waits.
+               
                 _bump_processing_heartbeat(db, analysis_id)
                 source_outcome = build_source_outcome_payload(analysis)
                 if source_outcome is not None:
                     fallback_payload["source"] = source_outcome
-                # Persist-before-publish - see the CORRELATED branch below
-                # for the full rationale. Final transactional fence
-                # immediately before persistence: stale finalization must
-                # never do cancelled -> completed.
+               
                 if not _finalize_commit_if_processing(
                     db, analysis, result_snapshot=fallback_payload, stage="fallback"
                 ):
@@ -897,9 +733,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             source_outcome = build_source_outcome_payload(analysis)
             if source_outcome is not None:
                 zero_evidence_payload["source"] = source_outcome
-            # Persist-before-publish - see the CORRELATED branch below for
-            # the full rationale. Final transactional fence immediately
-            # before persistence.
             if not _finalize_commit_if_processing(
                 db, analysis, result_snapshot=zero_evidence_payload, stage="zero-evidence"
             ):
@@ -927,17 +760,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
 
             return
 
-        # Persist identities once, then
-        # select ONE bounded working Evidence set from MySQL - used
-        # identically for routing, correlation (CORRELATED), and the
-        # frontend/Gemini payload (SIMPLE), so route/graph/payload can
-        # never silently disagree about which Evidence this investigation
-        # actually covers. Never a second, unbounded Evidence .all() in
-        # either branch below. Below CORRELATED_MAX_EVIDENCE_RECORDS
-        # (== SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS) this is exactly one
-        # query, identical to before. Evidence itself remains fully
-        # persisted in MySQL either way; this only bounds what one
-        # investigation response has to build and transmit.
         identity_start = perf_counter()
         persist_resolved_identities(db=db, analysis_id=analysis_id)
         logger.info("Analysis %s | evidence identities resolved", analysis_id)
@@ -964,13 +786,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 len(evidence_rows),
             )
 
-        # REAL per-artifact Evidence counts for the WHOLE analysis (Section
-        # 4 hardening) - the bounded working set above may not include
-        # every row from every artifact, so "how much Evidence does this
-        # artifact really have" (and, in each branch below, "does this
-        # artifact have any structured Evidence at all") must never be
-        # decided from that working subset alone. Bounded by
-        # MAX_DIAGNOSTIC_ARTIFACTS, so always safe to materialize.
         evidence_counts_by_artifact = select_evidence_counts_by_artifact(
             db, analysis_id=analysis_id
         )
@@ -1008,12 +823,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 preparation=correlation_preparation,
             )
 
-            # Per-artifact outcome for the frontend (including artifacts that
-            # were fully processed but retained zero evidence, e.g. an
-            # unrelated-looking log with no diagnostic signal) - a single
-            # bounded query over this analysis's own artifacts, not repeated
-            # per artifact/batch. evidence_count per artifact is derived from
-            # evidence_rows already loaded above, not a second evidence query.
             artifact_outcomes = (
                 db.query(
                     AnalysisArtifact.id,
@@ -1028,17 +837,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 .all()
             )
 
-            # An artifact that retained zero structured Evidence
-            # of its own but did capture useful fallback text/OCR content
-            # during its own ingestion pass (never a second read/OCR) must
-            # not silently disappear just because OTHER artifacts in this
-            # same analysis have real structured Evidence - it becomes
-            # bounded, clearly-non-causal supplemental context instead.
-            # Membership comes from the REAL per-
-            # artifact map, not the bounded evidence_rows working set - an
-            # artifact whose Evidence exists in MySQL but did not survive
-            # the bounded selection must never be mislabeled as
-            # zero-structured-evidence supplemental context.
             artifact_ids_with_evidence = set(evidence_counts_by_artifact.keys())
             supplemental_artifacts = [
                 artifact
@@ -1062,13 +860,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 perf_counter() - correlation_start,
             )
 
-            # Small correlation-stage completion signal, published before
-            # the Gemini call below (which can take a few seconds) so a
-            # live client sees "deterministic correlation is done" without
-            # waiting on the explanation layer - and, critically, BEFORE
-            # the authoritative final result, not after it (a progress
-            # event following the real final payload would misleadingly
-            # read as "still working").
             publish_progress(
                 analysis_id,
                 "correlation",
@@ -1076,11 +867,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 progress=99,
             )
 
-            # artifacts= gives Gemini the same "nginx.log produced 8
-            # evidence rows" provenance summary as the frontend payload,
-            # without dumping raw lines - the deterministic engine remains
-            # the sole authority on correlation/root-cause, this context
-            # only adds explanatory provenance around it.
             llm_context = build_llm_context(
                 correlation_run,
                 evidence_rows,
@@ -1094,50 +880,25 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 return
             try:
                 gemini_result = generate_investigation_explanation(llm_context)
-                # The external call may have taken real time -
-                # discard this result rather than persist it if cancelled
-                # while it was in flight.
+                
                 if _bail_if_cancelled(db, analysis_id, "after Gemini (correlated)"):
                     return
                 correlation_payload["ai_analysis"] = gemini_result.model_dump()
-                # Persisted only now that Gemini has returned a valid schema
-                # result - lets a client reconnecting after completion see
-                # the exact same explanation (reconstruct_current_
-                # investigation_result attaches this same field), without a
-                # second Gemini call.
+              
                 analysis.ai_analysis = correlation_payload["ai_analysis"]
             except GeminiUnavailableError:
-                # Gemini is only the explanation layer sitting on top of an
-                # already-complete deterministic investigation (graph,
-                # timeline, roles, artifact outcomes, source matches are all
-                # already computed above). Its temporary unavailability must
-                # not turn a successful deterministic result into a failed
-                # analysis - complete without an explanation instead;
-                # correlation_payload keeps no "ai_analysis" key, exactly
-                # like the zero-evidence payload above when there is
-                # nothing to explain.
                 logger.warning(
                     "Analysis %s | Gemini explanation unavailable; "
                     "completing without an explanation",
                     analysis_id,
                 )
                 analysis.ai_analysis = None
-            # See the fallback branch above: Gemini has no client-side
-            # timeout and may retry, so refresh the heartbeat once the
-            # call resolves either way rather than relying solely on the
-            # entry-only heartbeat above.
+            
             _bump_processing_heartbeat(db, analysis_id)
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 correlation_payload["source"] = source_outcome
-            # Persist-before-publish: the exact same
-            # bounded payload about to be published as investigation_result
-            # is committed to the DB FIRST. If the live SSE event is lost
-            # immediately afterward (client disconnected, process crashed),
-            # History/reconnect must already have the authoritative result
-            # rather than racing a result that only ever went out over the
-            # wire. Final transactional fence immediately before persistence:
-            # stale finalization must never do cancelled -> completed.
+           
             if not _finalize_commit_if_processing(
                 db, analysis, result_snapshot=correlation_payload, stage="correlated"
             ):
@@ -1149,21 +910,13 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 _true_total_seconds(),
             )
 
-            # investigation_result is the single authoritative full final
-            # payload for this analysis, published exactly once. There is
-            # no separate correlation_result event: the previous "publish
-            # both" contract transmitted the entire node/edge/evidence
-            # graph over SSE twice for the same finished computation - it
-            # never ran correlation twice, only sent the result twice. No
-            # frontend code in this repository consumes correlation_result
-            # (verified directly, not assumed).
+           
             publish_investigation_result(
                 analysis_id,
                 correlation_payload,
             )
         else:
-            # Reuses the SAME bounded working set selected above (before
-            # routing) - never a second, unbounded Evidence .all() here.
+           
             simple_artifacts = (
                 db.query(
                     AnalysisArtifact.id,
@@ -1178,10 +931,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 .all()
             )
 
-            # Same low-structure-survives-a-mixed-investigation
-            # treatment as the CORRELATED branch above - membership from the
-            # REAL per-artifact map, not the bounded
-            # evidence_rows working set.
+            
             simple_artifact_ids_with_evidence = set(evidence_counts_by_artifact.keys())
             simple_supplemental_artifacts = [
                 artifact
@@ -1213,37 +963,26 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 return
             try:
                 gemini_result = generate_investigation_explanation(simple_llm_context)
-                # The external call may have taken real time -
-                # discard this result rather than persist it if cancelled
-                # while it was in flight.
+               
                 if _bail_if_cancelled(db, analysis_id, "after Gemini (simple)"):
                     return
                 simple_payload["ai_analysis"] = gemini_result.model_dump()
-                # See the CORRELATED branch above: persisted only after a
-                # valid Gemini schema result, so reconnect can reattach it
-                # without a second Gemini call.
+               
                 analysis.ai_analysis = simple_payload["ai_analysis"]
             except GeminiUnavailableError:
-                # See the CORRELATED branch above: a temporarily unavailable
-                # explanation must not fail this otherwise complete
-                # deterministic result.
+                
                 logger.warning(
                     "Analysis %s | Gemini explanation unavailable; "
                     "completing without an explanation",
                     analysis_id,
                 )
                 analysis.ai_analysis = None
-            # See the fallback branch above: Gemini has no client-side
-            # timeout and may retry, so refresh the heartbeat once the
-            # call resolves either way rather than relying solely on the
-            # entry-only heartbeat above.
+
             _bump_processing_heartbeat(db, analysis_id)
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
-            # Persist-before-publish - see the CORRELATED branch above for
-            # the full rationale. Final transactional fence immediately
-            # before persistence.
+           
             if not _finalize_commit_if_processing(
                 db, analysis, result_snapshot=simple_payload, stage="simple"
             ):
@@ -1255,12 +994,6 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
                 _true_total_seconds(),
             )
 
-            # investigation_result is the single authoritative full final
-            # payload, published exactly once - no progress event follows
-            # it (see the CORRELATED branch above and the SSE contract:
-            # investigation_result must be the final meaningful event, not
-            # followed by a progress message that would misleadingly read
-            # as "still working" after the real result already arrived).
             publish_investigation_result(
                 analysis_id,
                 simple_payload,
@@ -1295,12 +1028,6 @@ def _process_artifact(
     source_index=None,
     global_line_number: int | None = None,
 ) -> int:
-    # An explicit local starting line number rather than reading
-    # analysis.last_processed_line - the caller (_process_artifact_task) no
-    # longer maintains that shared-row attribute at all. Falls back to
-    # reading it only for callers that still seed it directly (e.g. legacy/
-    # test call sites constructing a lightweight `analysis` object), never
-    # itself writes it back.
     if global_line_number is None:
         global_line_number = getattr(analysis, "last_processed_line", 0)
 
@@ -1325,9 +1052,6 @@ def _process_artifact(
             )
         artifact.size_bytes = initial_size
 
-    # Legacy checkpoints were byte/physical-line offsets produced by the generic
-    # parser. Re-detecting one as structured JSON would reinterpret the stored
-    # line count as a record count and make resume skip or replay evidence.
     artifact_format = (
         ArtifactFormat.GENERIC if is_migrated_checkpoint else _artifact_format(artifact)
     )
@@ -1337,18 +1061,10 @@ def _process_artifact(
 
     parsed_count = 0
     last_published_progress = -1
-    # Progress is authoritative only when _publish_ingestion_progress() runs.
-    # Use this artifact's known size solely as a local throttle so we do not
-    # issue a global SUM query after every parser batch.
     progress_query_step = _progress_query_step_bytes(artifact.size_bytes)
     last_progress_query_offset = artifact.processed_bytes
 
     if artifact_format == ArtifactFormat.IMAGE:
-        # OCR still runs exactly once per image: this SAME extraction
-        # feeds both the fallback context (Sections 9-12) and evidence
-        # reconstruction below - stream_image_events_from_text() never
-        # calls RapidOCR itself, unlike stream_artifact_events()'s normal
-        # IMAGE dispatch, which is why this bypasses it here.
         extracted_text, ocr_confidence = extract_text_from_image_with_confidence(
             artifact.saved_file_path
         )
@@ -1388,13 +1104,6 @@ def _process_artifact(
             source_index=source_index,
         )
         if batch_result is None:
-            # Cancellation fence tripped: this batch was
-            # deliberately not persisted, and this analysis is cancelled -
-            # stop consuming the generator and return immediately. Do NOT
-            # fall through to the terminal size-check/status="completed"
-            # write below; this artifact is being abandoned mid-stream, not
-            # finishing normally. The cancel endpoint's own cleanup already
-            # owns resetting this artifact's checkpoint/generated state.
             logger.info(
                 "Analysis %s | artifact %s | cancelled mid-batch; stopping",
                 analysis.id,
@@ -1402,13 +1111,7 @@ def _process_artifact(
             )
             return parsed_count
         parsed_count += batch_result
-        # Best-effort liveness refresh at a coarse persisted-progress
-        # boundary - safe to call once per batch only because _bump_processing_
-        # heartbeat itself throttles to at most one real DB write per
-        # _HEARTBEAT_MIN_INTERVAL_SECONDS per analysis; a single genuinely
-        # long artifact (many batches, well past that interval) would
-        # otherwise never refresh Analysis.processing_heartbeat_at between
-        # this task's own start/entry heartbeat and its terminal commit.
+       
         _bump_processing_heartbeat(db, analysis.id)
         if (
             artifact.processed_bytes - last_progress_query_offset >= progress_query_step
@@ -1421,9 +1124,7 @@ def _process_artifact(
             )
             last_progress_query_offset = artifact.processed_bytes
 
-    # A tiny final batch may not cross the byte threshold. Refresh once at the
-    # terminal checkpoint so the global progress stream never depends on batch
-    # geometry.
+   
     if artifact.processed_bytes > last_progress_query_offset:
         _publish_ingestion_progress(
             db=db,
@@ -1437,11 +1138,6 @@ def _process_artifact(
             f"Artifact {artifact.id} changed during processing; checkpoint not completed"
         )
 
-    # Only this artifact's own row is updated here - the shared
-    # Analysis.processed_bytes/last_processed_line are never mutated during
-    # per-artifact/per-batch processing (see _persist_artifact_batch),
-    # only recomputed once from AnalysisArtifact rows at
-    # _finalize_analysis_task.
     artifact.processed_bytes = artifact.size_bytes
     artifact.status = "completed"
     db.commit()
@@ -1455,12 +1151,6 @@ def _process_artifact(
         perf_counter() - artifact_start,
     )
 
-    # This artifact's own ingestion is now fully done, so its retained
-    # evidence count is deterministically known - one bounded query, once,
-    # scoped to this single artifact (not per-batch). Only the zero-evidence
-    # outcome is published live here; a successful outcome still has to go
-    # through correlation before it means anything to the frontend, so it
-    # is only reported in the final investigation_result.
     evidence_count = (
         db.query(func.count(Evidence.id))
         .filter(Evidence.artifact_id == artifact.id)
@@ -1535,12 +1225,6 @@ def _publish_ingestion_progress(
             )
             .filter(
                 AnalysisArtifact.analysis_id == analysis_id,
-                # Unsupported/duplicate artifacts are never dispatched for
-                # ingestion and their size_bytes would otherwise inflate the
-                # denominator with bytes that will never be processed,
-                # permanently understating progress for the rest of the
-                # analysis (e.g. one skipped 900MB artifact alongside a real
-                # 10MB one would cap visible progress near 1%).
                 AnalysisArtifact.status.notin_(
                     [
                         "unsupported",
@@ -1650,11 +1334,6 @@ def _persist_artifact_batch(
         artifact_id=artifact.id,
     )
 
-    # Only this artifact's own row is dirtied here (never the
-    # shared Analysis row) - concurrent artifact tasks each commit their
-    # own row without contending for a lock on one shared row per batch.
-    # Analysis.processed_bytes/last_processed_line are recomputed once
-    # from AnalysisArtifact rows at _finalize_analysis_task instead.
     last_record = batch[-1]
     previous_offset = artifact.processed_bytes
     new_offset = max(previous_offset, last_record.end_offset)
@@ -1681,16 +1360,6 @@ def _correlate_source_events(events, source_index) -> None:
         event.source_matches = correlate_event(event, source_index)
 
 
-# A small, bounded, process-LOCAL cache of already-built
-# SourceIndex objects, keyed by analysis_id. This is a pure optimization,
-# never the sole correctness mechanism - Celery workers are separate OS
-# processes with no shared memory, so a worker handling several artifacts
-# from the SAME analysis sequentially skips even reading/parsing the
-# persisted manifest (see source_archive.prepare_source) for every
-# artifact after the first, while a DIFFERENT worker process still
-# correctly reconstructs the same index from that manifest. Bounded
-# (simple FIFO eviction) so a long-lived worker that has touched many
-# different analyses cannot grow this unboundedly.
 _source_index_process_cache: dict[int, object] = {}
 
 
@@ -1808,12 +1477,6 @@ def _record_controlled_artifact_failure(
     artifact.fallback_context = None
     db.commit()
 
-    # This artifact's outcome is now durably terminal (status + reason
-    # committed above), and _process_artifact_task's own resume-skip guard
-    # means no retry/redelivery will ever call _process_artifact for it
-    # again - its raw staged bytes are safe to reclaim immediately, unlike
-    # a "completed" artifact's, which waits for the whole analysis's final
-    # result (see _cleanup_completed_diagnostic_files).
     _cleanup_diagnostic_artifact_file(artifact.saved_file_path)
 
     payload = build_artifact_outcome_payload(
@@ -1823,12 +1486,7 @@ def _record_controlled_artifact_failure(
     publish_artifact_outcome(analysis_id, payload)
 
 
-# Matches crud.analysis._UPLOAD_ROOT's own independent Path("uploads")
-# constant (that module intentionally does not import this one, or vice
-# versa, to avoid an api/crud/tasks import cycle) - both resolve the same
-# physical directory and both gate every deletion on the resolved parent
-# actually being this exact directory, never an arbitrary caller-supplied
-# path.
+
 _UPLOAD_ROOT = Path("uploads").resolve()
 
 
@@ -1932,27 +1590,14 @@ def cancel_analysis_and_cleanup(db: Session, analysis_id: int) -> str | None:
 
     previous_status = analysis.status
 
-    # 1/2: the durable tombstone, committed before any destructive cleanup.
     analysis.status = "cancelled"
     db.commit()
 
-    # 3: analysis-scoped generated-data cleanup. Evidence deletion here is
-    # what closes the cancel-vs-Evidence-commit race together with the
-    # per-batch fence in _persist_artifact_batch: any batch that
-    # already committed Evidence before this tombstone won is captured by
-    # this DELETE (it deletes everything present at this moment); any
-    # batch whose own fence observes the now-committed tombstone rolls
-    # itself back instead of committing more. Either way, Evidence count
-    # for this analysis converges to (and stays at) zero.
     db.query(Evidence).filter(Evidence.analysis_id == analysis_id).delete(
         synchronize_session=False
     )
     analysis.ai_analysis = None
     analysis.result_snapshot = None
-    # Only abandoned, still-in-flight artifact state is reset - a terminal
-    # outcome an artifact already reached (completed/resource_limited/
-    # processing_error/unsupported/duplicate) is a truthful historical
-    # record of what happened to THAT artifact and is left exactly as-is.
     db.query(AnalysisArtifact).filter(
         AnalysisArtifact.analysis_id == analysis_id,
         AnalysisArtifact.status.in_(["pending", "processing"]),
@@ -2009,12 +1654,6 @@ def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
         if analysis is None:
             return
-        # Cancelled is terminal and user-authoritative - an
-        # unexpected exception elsewhere in a stale/redelivered task for an
-        # already-cancelled analysis must never resurrect/reinterpret it as
-        # "failed". completed is left the same way for symmetry, though in
-        # practice every caller of this helper already guards against a
-        # completed analysis reaching it.
         if analysis.status in ("cancelled", "completed"):
             return
         analysis.status = "failed"
@@ -2078,12 +1717,6 @@ def reconstruct_current_investigation_result(
             return payload
         return build_zero_evidence_payload(analysis_id, artifacts=artifacts)
 
-    # This read/reconstruction path gets the same
-    # bounded-selection-before-route treatment as the live finalize path -
-    # ONE bounded working Evidence set, used identically for routing,
-    # correlation, and the SIMPLE payload (never a second, unbounded
-    # Evidence .all()). Pure read logic: never persists identities or
-    # mutates the historical analysis merely to reconstruct its view.
     evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
         db,
         analysis_id=analysis_id,
@@ -2149,21 +1782,12 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
         return {"analysis_id": analysis.id, "status": "failed"}
 
     if analysis.status == "cancelled":
-        # Small, terminal, durable - never fake progress=100, never an
-        # investigation_result (there is none: the cancel endpoint already
-        # discarded any generated data). Reconstructing this from
-        # Analysis.status alone means it is correct on reconnect/History
-        # detail lookup even if the live cancellation SSE event was lost.
         return {"analysis_id": analysis.id, "status": "cancelled"}
 
     if analysis.status == "completed":
         return {
             "analysis_id": analysis.id,
             "status": "completed",
-            # Never 100 - matches the live stream's own contract. The
-            # frontend's transition to the final UI is driven by the
-            # investigation_result payload below (or the live event of the
-            # same shape), never by this number reaching some sentinel.
             "progress": 99,
             "investigation_result": reconstruct_current_investigation_result(
                 db,
@@ -2179,33 +1803,14 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
         .all()
     )
 
-    # A resource_limited/processing_error artifact is exactly as terminal
-    # as completed/unsupported/duplicate - it will never become
-    # status="completed" either, so it must count toward "ingestion is
-    # done" too (matches _finalize_analysis_task's own "incomplete" check).
-    # Without this, a still-processing analysis with one already-failed
-    # artifact could never report the 99% post-ingestion state, even after
-    # every other artifact genuinely finished.
     ingestion_done = bool(rows) and all(
         row.status in ("unsupported", "duplicate", "completed", "resource_limited", "processing_error")
         for row in rows
     )
 
     if ingestion_done:
-        # Every artifact that will ever be ingested already has been - this
-        # analysis is between ingestion and the finalize/investigation
-        # stages, exactly the window the live stream reports as 99 for
-        # (identity/timeline/correlation), before Analysis.status flips to
-        # "completed".
         progress = 99
     else:
-        # Same exclusion as the live _publish_ingestion_progress query:
-        # unsupported/duplicate artifacts are never dispatched, and a
-        # resource_limited/processing_error artifact has its
-        # processed_bytes reset to 0 on failure (see
-        # _record_controlled_artifact_failure) - none of their size_bytes
-        # may sit in the denominator alongside real processed_bytes that
-        # will never catch up to it.
         dispatchable = [
             row for row in rows
             if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
@@ -2216,17 +1821,8 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
 
     return {
         "analysis_id": analysis.id,
-        "status": analysis.status,  # "pending" or "processing"
+        "status": analysis.status, 
         "progress": progress,
-        # Redis pub/sub has no replay: a client that connects AFTER an
-        # upload-time (unsupported/duplicate) or per-artifact
-        # (zero-evidence) outcome was already published live would
-        # otherwise never learn about it until the whole analysis
-        # completes. Every artifact whose outcome is ALREADY
-        # deterministically decided - never one still "pending"/
-        # "processing" - is included here so the initial snapshot alone is
-        # authoritative; future live artifact_outcome events for the
-        # remaining artifacts still arrive normally.
         "artifacts": _known_terminal_artifact_outcomes(db, analysis.id, rows),
     }
 
@@ -2248,9 +1844,6 @@ def _known_terminal_artifact_outcomes(
     if not terminal:
         return []
 
-    # One bounded, artifact-count-sized query (never evidence-volume-sized)
-    # for the "completed" rows' real evidence counts - unsupported/
-    # duplicate artifacts never have evidence and don't need it.
     evidence_counts = dict(
         db.query(Evidence.artifact_id, func.count(Evidence.id))
         .filter(Evidence.analysis_id == analysis_id)
@@ -2349,10 +1942,6 @@ def recover_stale_analyses() -> int:
                 update(Analysis)
                 .where(Analysis.id == analysis_id, *stale_filter)
                 .values(processing_heartbeat_at=now)
-                # Only result.rowcount below is ever consulted - this claim
-                # never depends on the ORM's in-memory identity map being
-                # kept in sync, so skip it (same as cancel_analysis_and_
-                # cleanup's bulk Evidence/artifact updates above).
                 .execution_options(synchronize_session=False)
             )
             db.commit()

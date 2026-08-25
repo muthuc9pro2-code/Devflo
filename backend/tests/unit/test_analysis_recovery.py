@@ -290,7 +290,7 @@ def test_recover_stale_analyses_never_touches_a_fresh_heartbeat(monkeypatch):
     mid-Gemini-retry) must never be redispatched."""
     db = _session()
     alice = _user(db)
-    analysis = _stale_analysis(db, alice, age_seconds=5)
+    _stale_analysis(db, alice, age_seconds=5)
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     delayed = []
     monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))

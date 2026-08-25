@@ -18,11 +18,6 @@ from app.services.ocr_normalizer import normalize_ocr_text
 logger = logging.getLogger(__name__)
 
 if ijson.backend != "yajl2_c":
-    # ijson silently falls back to its pure-Python backend (order of
-    # magnitude slower for JSON/OTel/BROWSER artifacts) whenever the yajl2 C
-    # extension wasn't built at install time - e.g. libyajl2 dev headers
-    # missing from the image `pip install` ran in. That failure is otherwise
-    # invisible until someone notices JSON ingestion is unexpectedly slow.
     logger.warning(
         "ijson is using the %r backend instead of the C-accelerated "
         "yajl2_c backend; JSON/OpenTelemetry/BROWSER artifact ingestion "
@@ -56,23 +51,9 @@ class _BoundedStructuredCapture:
     values: dict[str, Any] = field(default_factory=dict)
     priorities: dict[str, int] = field(default_factory=dict)
     captured_bytes: int = 0
-    # Non-canonical scalar fields (e.g. error_code/available_connections on
-    # a real record) captured alongside the canonical ones above, bounded
-    # separately - see _BoundedAttributeBudget. Kept out of `values` so
-    # normalize_structured_event never mistakes one for a canonical field.
     extra: "_BoundedAttributeBudget" = field(
         default_factory=lambda: _BoundedAttributeBudget(DIAGNOSTIC_ATTRIBUTES_MAX_BYTES)
     )
-    # Browser HAR only (see _stream_json_document): a HAR entry's
-    # request.headers is an array of {"name": ..., "value": ...} pairs, not
-    # a flat mapping, so the generic per-leaf canonical-key scan above can
-    # never see "x-request-id" as a key - it only ever sees the array
-    # field's own literal JSON path (request.headers.item.name/.value),
-    # which is not itself a canonical field. This tracks each header pair
-    # as it streams past and promotes the FIRST one whose name is a
-    # recognized request-id alias (reusing _structured_canonical_key - the
-    # exact same case-insensitive, hyphen/underscore-agnostic aliases
-    # already used everywhere else, no new list) into a real request_id.
     harvest_har_headers: bool = False
     _pending_har_header_name: str | None = field(default=None, repr=False)
     _pending_har_header_value: str | None = field(default=None, repr=False)
@@ -119,17 +100,11 @@ class _BoundedStructuredCapture:
             if _structured_canonical_key(self._pending_har_header_name) == 'request_id':
                 self.promoted_request_id = str(self._pending_har_header_value)
 
-        # One header object fully seen (regardless of match) - reset so the
-        # next {"name": ..., "value": ...} pair in the array isn't
-        # accidentally paired with a stale field from this one.
         self._pending_har_header_name = None
         self._pending_har_header_value = None
 
     def result(self) -> dict[str, Any]:
         if self.promoted_request_id is not None:
-            # Never overrides a request_id already found through the
-            # normal canonical-field scan elsewhere in this same entry -
-            # only fills the gap the array-of-pairs shape otherwise leaves.
             self.values.setdefault('request_id', self.promoted_request_id)
         if 'message' not in self.values:
             method = self.values.pop('_method', None)
@@ -151,11 +126,6 @@ class _BoundedStructuredCapture:
         return max(self.captured_bytes, 1)
 
 
-# Keys containing one of these substrings describe something a debugger
-# would actually want when triaging a failure (limits/capacity/counts/
-# error codes/etc.) - not an exhaustive taxonomy, just a cheap deterministic
-# tiebreak so the bounded budget below fills with the most likely-useful
-# fields first when a record has more unknown scalar fields than fit.
 _DIAGNOSTIC_ATTRIBUTE_KEYWORDS = (
     "error", "fail", "exception", "code", "reason", "retry", "attempt",
     "timeout", "limit", "threshold", "available", "capacity", "pool",
@@ -172,12 +142,11 @@ def _diagnostic_attribute_priority(key: str) -> int:
 @dataclass(slots=True)
 class _BoundedAttributeBudget:
     """Bounded (by byte size, not entry count) set of scalar key/value
-    pairs, keeping the most diagnostically useful ones (see
-    _diagnostic_attribute_priority) when more candidates arrive than fit -
-    the same "capacity + priority-based eviction" shape
-    _BoundedStructuredCapture already uses for canonical fields, applied
-    here to the non-canonical ones instead of discarding them."""
-
+        pairs, keeping the most diagnostically useful ones (see
+        _diagnostic_attribute_priority) when more candidates arrive than fit -
+        the same "capacity + priority-based eviction" shape
+        _BoundedStructuredCapture already uses for canonical fields, applied
+        here to the non-canonical ones instead of discarding them."""
     max_bytes: int
     values: dict[str, Any] = field(default_factory=dict)
     priorities: dict[str, int] = field(default_factory=dict)
@@ -190,10 +159,10 @@ class _BoundedAttributeBudget:
 
     def offer(self, key: str, value: Any) -> None:
         if not key or key in self.values:
-            return  # first occurrence of a given path wins, deterministically
+            return 
         size = self._entry_size(key, value)
         if size > self.max_bytes:
-            return  # a single oversized value can never fit, even by evicting everything
+            return 
         priority = _diagnostic_attribute_priority(key)
         if self.used_bytes + size <= self.max_bytes:
             self.values[key] = value
@@ -220,10 +189,7 @@ class _BoundedAttributeBudget:
 def _iter_scalar_leaves(
     data: Mapping[str, Any], prefix: str = "", depth: int = 0, max_depth: int = 4
 ) -> Iterator[tuple[str, Any]]:
-    """Yields (dotted_path, value) for every scalar leaf in a small,
-    already-in-memory mapping - never descends into lists/arrays (could be
-    unbounded) and stops at max_depth (a handful of nested objects is
-    normal for a real log record; anything deeper is not worth chasing)."""
+    
     if depth > max_depth:
         return
     for key, value in data.items():
@@ -232,19 +198,14 @@ def _iter_scalar_leaves(
             yield from _iter_scalar_leaves(value, path, depth + 1, max_depth)
         elif value is None or isinstance(value, (str, int, float, bool)):
             yield path, value
-        # lists/other types: skipped - never recursively copied
+       
 
 
 def _extract_diagnostic_attributes(data: Mapping[str, Any]) -> dict[str, Any] | None:
-    """For an already-fully-parsed structured record (one JSON-lines line,
-    or one container CRI JSON body): every scalar leaf that is NOT one of
-    normalize_structured_event's own canonical fields, bounded to
-    DIAGNOSTIC_ATTRIBUTES_MAX_BYTES and biased toward diagnostically useful
-    names when the budget fills."""
     budget = _BoundedAttributeBudget(DIAGNOSTIC_ATTRIBUTES_MAX_BYTES)
     for relative, value in _iter_scalar_leaves(data):
         if _structured_canonical_key(relative) is not None:
-            continue  # already represented canonically - never duplicated
+            continue  
         budget.offer(relative, value)
     return budget.result()
 
@@ -276,9 +237,6 @@ def _stream_image_events(
     source_file: str,
     global_line_number: int,
 ) -> Iterator[ArtifactEvent]:
-    # OCR runs exactly once per image (single call into RapidOCR via
-    # extract_text_from_image_with_confidence) - everything below only
-    # restructures that one result in memory, no second OCR pass.
     extracted_text, ocr_confidence = extract_text_from_image_with_confidence(file_path)
     yield from stream_image_events_from_text(
         extracted_text=extracted_text,
@@ -295,33 +253,11 @@ def stream_image_events_from_text(
     source_file: str,
     global_line_number: int,
 ) -> Iterator[ArtifactEvent]:
-    """Record reconstruction only, from ALREADY-extracted OCR text - split
-    out of _stream_image_events so a caller that also needs the raw OCR
-    result for something else (the zero-evidence fallback context, see
-    app.tasks.analysis._process_artifact) can call
-    extract_text_from_image_with_confidence() itself exactly once and reuse
-    the same result here, instead of this function extracting it again."""
     normalized_text = normalize_ocr_text(extracted_text)
 
     if not normalized_text.strip():
         return
 
-    # The whole image used to become ONE raw_text blob fed to
-    # normalize_text_event(). That silently loses real diagnostic content:
-    # normalize_text_event()'s level detection is "first level keyword found
-    # anywhere in raw_text wins", so a benign early line (e.g. an "INFO:"
-    # startup message) shadows a genuine ERROR-level traceback appearing
-    # later in the same image, and the whole record gets discarded as
-    # unimportant at retention time - exactly how a real ImportError
-    # traceback screenshot produced evidence_count=0.
-    #
-    # Instead, OCR text is split back into per-record units using the same
-    # multiline-aware grouping (_multiline_kind/_is_multiline_continuation)
-    # ordinary STACK_TRACE-format text artifacts already use, so each
-    # distinct log line/traceback is normalized and gated for importance on
-    # its own - the same common diagnostic parsing/evidence model, not a
-    # second one. STACK_TRACE is used only to select this grouping's
-    # classification rules; source_format stays "image" throughout.
     local_line = 0
     global_line = global_line_number
     pending: _PendingTextRecord | None = None
@@ -385,28 +321,8 @@ def _build_image_text_event(
             defaults=defaults,
         )
         _default_level_for_bare_stack_frame(event, raw_text)
-        # _stack_trace_may_be_important() already established this OCR text
-        # is genuinely diagnostic (a marker like "error"/"exception"/
-        # "failure"/"critical"/"slow query" or a stack frame is present),
-        # but normalize_text_event()'s stricter, structured level detection
-        # (a standalone LOG_LEVEL_PATTERN token, a capitalized
-        # "XxxException:"-style match, or a recognized frame) can still
-        # legitimately come back empty - e.g. OCR prose like "An exception
-        # occurred while saving the file" carries the marker but no
-        # standalone level token. Without this, such text would silently
-        # vanish at the Evidence-persistence gate (_IMPORTANT_LEVELS in
-        # app/tasks/analysis.py checks event.level, never the raw text)
-        # even though it already passed the importance check right above -
-        # exactly the "parser cannot fully structure it" case the bounded
-        # structured fallback exists for. Never overrides a level that was
-        # actually found; scoped to images only, other formats' retention
-        # semantics are unchanged.
         if event.level is None:
             event.level = "ERROR"
-        # Real RapidOCR confidence for the image this record came from,
-        # never fabricated - set here rather than threaded through
-        # normalize_text_event() (shared by every non-image text format,
-        # which has no notion of OCR confidence at all).
         event.ocr_confidence = ocr_confidence
 
     return ArtifactEvent(
@@ -511,20 +427,6 @@ def _stream_text_events(*, file_path: str, artifact_format: ArtifactFormat, sour
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
         pending = _PendingTextRecord(lines=[line], start_global_line=global_line, end_global_line=global_line, artifact_line_number=local_line, end_offset=end_offset, size_bytes=line_size, multiline_kind=_multiline_kind(artifact_format, line))
     if pending is not None:
-        # A trailing CRI 'P' (partial) fragment that never got its
-        # concluding 'F' line has an explicit, unambiguous continuation
-        # signal from the format itself (see the CRI_RE handling above) -
-        # that one case really is incomplete and is correctly never
-        # emitted. Every other final record - regardless of whether the
-        # file ends without a trailing newline, or its last character is
-        # alphanumeric - is a normal, structurally complete record (EOF
-        # after a word does not prove the word was cut in half) and must
-        # be yielded exactly like any other record. Genuine incompleteness
-        # is instead caught at the point that actually has structural
-        # evidence of it - e.g. _parse_stack_frames() already refuses a
-        # Python "File ..., line N, in FUNC" frame with nothing after it in
-        # the record, and a JSON/OTLP parse failure is handled where that
-        # parsing actually happens.
         if pending.multiline_kind != 'cri_partial':
             yield _build_text_artifact_event(pending, artifact_format=artifact_format, source_file=source_file)
 _GENERIC_IMPORTANT_MARKERS = (
@@ -543,24 +445,12 @@ _GENERIC_IMPORTANT_MARKERS = (
     "segmentation fault",
     "slow query",
 )
-# "status" alone used to be in _GENERIC_IMPORTANT_MARKERS, but every HTTP
-# status code contains that word, so ordinary status=200 records paid for a
-# full normalize just to be discarded. level_from_http_status() only treats
-# >=400 as important, so gate on that same threshold cheaply up front instead
-# of on the word "status" itself.
+
 _GENERIC_IMPORTANT_STATUS_RE = re.compile(
     r'(?:http[_-]?)?status(?:[_-]?code)?["\']?[^0-9A-Za-z]{0,3}[45]\d{2}\b',
     re.IGNORECASE,
 )
-# Deliberately more whitespace-tolerant than PYTHON_FRAME_PATTERN/
-# JAVA_FRAME_PATTERN/NODE_FRAME_PATTERN (which stay exact, unchanged, and
-# remain the only patterns _parse_stack_frames extracts real file/line/
-# function fields from). This is gating-only - "does this look like it's
-# probably a stack frame" - never used to extract a field. OCR routinely
-# drops the single space after a comma (`",line 935,in foo`), which the
-# strict patterns correctly refuse to treat as a well-formed frame; that
-# same text is still overwhelmingly diagnostic and must not be invisible to
-# retention just because OCR lost a space character.
+
 _LOOSE_FRAME_MARKER_RE = re.compile(
     r'File\s*"[^"]+"\s*,?\s*line\s+\d+|(?<![A-Za-z0-9_])at\s+\S+\([^()]*:\d+\)',
     re.IGNORECASE,
@@ -568,17 +458,7 @@ _LOOSE_FRAME_MARKER_RE = re.compile(
 
 
 def _default_level_for_bare_stack_frame(event: ParsedEvent | None, raw_text: str) -> None:
-    """Lowest-priority level fallback, applied only after normalize_text_event
-    has already had every normal chance to find a real level (defaults,
-    LOG_LEVEL_PATTERN, exception match, the _FATAL/_SLOW markers) and still
-    came back with none. A bare stack-frame line/block with no accompanying
-    level keyword - e.g. a cropped screenshot that captured "File ..., line
-    N, in func" but not the "Traceback"/"Error" line above it - is still
-    real diagnostic content and must not be silently downgraded to
-    unretained just because the keyword-based signal never fires. Mutates
-    in place (same established pattern as ocr_confidence below), never
-    overrides a level that was actually found.
-    """
+    
     if event is not None and event.level is None and _contains_stack_frame(raw_text):
         event.level = 'ERROR'
 
@@ -613,22 +493,7 @@ def _ci_cd_may_be_important(raw_text: str) -> bool:
         or '##[warning]' in lowered
     )
 
-# Every non-GENERIC text format used to run the full normalize_text_event()
-# classify+extract machinery on 100% of records unconditionally, with no
-# early retention decision at all - GENERIC was the only format that got to
-# skip parsing a record proven unimportant. Phase-1 profiling on
-# representative 10 MiB fixtures per format showed exactly why the other
-# formats were 2-6x slower than GENERIC at equal size even after the
-# tokenizer work: SERVERLESS was ~3% important, CLOUD_GATEWAY ~7%,
-# CONTAINER ~17% (and CONTAINER was the single slowest format measured,
-# ~12.6s), CI_CD ~21%, BROWSER ~22%, WEB_SERVER ~25%, STACK_TRACE ~25%,
-# MESSAGE_BROKER ~29%, JSON ~33%, SYSLOG ~47%. Each gate below reuses the
-# SAME regex/threshold the format's own normalizer already uses to decide
-# level - it does not invent a new notion of "important", it just checks it
-# earlier and cheaper. DATABASE is intentionally excluded: its current
-# semantics mark every "# Time:" slow-query block WARNING unconditionally
-# (see _build_text_artifact_event below), so 100% of its records are already
-# important and a gate would filter nothing.
+
 def _may_be_important(
     artifact_format: ArtifactFormat,
     raw_text: str,
@@ -649,9 +514,7 @@ def _may_be_important(
         fields=cloud_gateway_fields,
     )
     if artifact_format == ArtifactFormat.MESSAGE_BROKER:
-        # defaults only ever sets 'service' (see _normalize_message_broker_event
-        # below) - level is always decided from the raw text, exactly like
-        # GENERIC, so the same gate semantics apply unchanged.
+       
         return _generic_text_may_be_important(raw_text)
     if artifact_format == ArtifactFormat.SERVERLESS:
         return _serverless_may_be_important(raw_text)
@@ -734,16 +597,6 @@ def _stream_json_lines(*, file_path: str, artifact_format: ArtifactFormat, sourc
         try:
             value = json.loads(line)
         except (json.JSONDecodeError, TypeError):
-            # A JSON parse failure is real structural evidence this line is
-            # not valid JSON - it must never be promoted to trustworthy
-            # structured evidence (normalize_structured_event/its fields are
-            # never used here). It does NOT, on its own, prove the line is a
-            # truncated fragment rather than ordinary unstructured text
-            # (e.g. a plain-text line mixed into a JSON-lines file, or a
-            # genuinely final line with no trailing newline) - so it falls
-            # back to the same generic text handling any other unstructured
-            # line already gets, exactly like a non-final malformed line
-            # always has, instead of being silently discarded.
             event = normalize_text_event(line, global_line, source_file=source_file, source_format=artifact_format.value) if _generic_text_may_be_important(line) else None
         else:
             data = value if isinstance(value, Mapping) else {'body': value}
@@ -814,20 +667,8 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
     except ijson.JSONError:
         has_structured_checkpoint = skip_records > 0 and start_offset == 0
         if has_structured_checkpoint:
-            # A checkpoint from a prior structured-JSON pass exists but the
-            # byte offset never advanced (see is_migrated_checkpoint's sibling
-            # check above) - re-raising here is a resumability-safety net,
-            # not something a truncated document should route through.
             raise
         if emitted:
-            # Records before the truncation/corruption point already streamed
-            # through and were persisted by the caller's per-batch commits -
-            # a malformed tail (e.g. an upload cut off mid-document) must not
-            # discard them, nor fail this artifact's *entire analysis* (see
-            # _process_artifact_task: any exception here marks the whole
-            # analysis failed, not just this one artifact). Stop cleanly
-            # instead, the same graceful-degradation behavior JSON-lines
-            # documents already get per malformed line.
             logger.warning(
                 'Malformed/truncated JSON document %s after %s record(s) '
                 'already extracted; stopping here instead of discarding them',
@@ -863,16 +704,6 @@ def _is_json_lines(file_path: str, artifact_format: ArtifactFormat) -> bool:
     try:
         first_value = json.loads(first_nonempty)
     except json.JSONDecodeError:
-        # The bounded reader force-splits at MAX_DIAGNOSTIC_RECORD_BYTES when
-        # no newline shows up in time, so an unparseable "first line" here is
-        # ambiguous: it could be one truncated fragment of a much larger
-        # compact single JSON document (real HAR/CloudWatch exports commonly
-        # have zero newlines), or a genuinely oversized JSON-lines record.
-        # Guessing JSON-lines used to silently shred the former into garbage
-        # text records. Falling through to document mode instead handles
-        # both correctly: a real document parses as intended, and a single
-        # oversized JSON-lines record is still just one top-level object, so
-        # it's captured whole under ijson's '' top-level prefix.
         return False
     if not isinstance(first_value, Mapping):
         return False
@@ -955,13 +786,6 @@ def _multiline_kind(artifact_format: ArtifactFormat, line: str) -> str | None:
     if artifact_format == ArtifactFormat.STACK_TRACE and EXCEPTION_PATTERN.match(line.strip()):
         return 'language_stack'
     if artifact_format == ArtifactFormat.STACK_TRACE and _contains_stack_frame(line):
-        # A bare frame line with no preceding "Traceback (most recent call
-        # last)"/exception-in-thread header - e.g. a cropped screenshot that
-        # only captured the frame chain itself. Grouped with the same
-        # continuation rules as language_stack below so the whole chain
-        # still becomes one coherent record instead of one singleton record
-        # per frame line (see _is_multiline_continuation's 'bare_frame_chain'
-        # case for the one-plain-line-per-frame source-snippet allowance).
         return 'bare_frame_chain'
     if artifact_format == ArtifactFormat.DATABASE and line.lstrip().startswith(('# Time:', 'Time:')):
         return 'database_block'
@@ -977,16 +801,6 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
     if record.multiline_kind == 'crash_report':
         return True
     stripped = line.strip()
-    # Real tracebacks (any language) follow each frame line with exactly
-    # one plain source-code snippet line - normalize_ocr_text() strips ALL
-    # leading whitespace (raw_line.strip()), so that snippet line never
-    # matches an indentation-based continuation check for OCR-derived
-    # text, and previously fell through to none of the rules below either,
-    # splitting the record and orphaning everything after it (including
-    # the final exception/error summary line) into a dead-end record that
-    # could never continue further. bare_frame_chain already had this
-    # exact allowance (see below); every other traceback kind needs it
-    # too, generically - not specific to any one exception type/language.
     previous_line_is_frame = bool(record.lines and _contains_stack_frame(record.lines[-1]))
     if record.multiline_kind == 'python_stack':
         return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith('File ') or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.match(stripped) or previous_line_is_frame)
@@ -1002,14 +816,6 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
             or stripped.startswith(('Caused by:', 'Suppressed:'))
             or stripped == 'During handling of the above exception, another exception occurred:'
             or EXCEPTION_PATTERN.match(stripped)
-            # Real tracebacks follow each "File ..., line N" frame with
-            # exactly one source-code snippet line - OCR routinely loses
-            # that line's leading indentation, so it wouldn't otherwise
-            # match any rule above. Only fold in ONE such plain line
-            # (checked against the record's last already-accepted line,
-            # not this new one), so unrelated OCR noise two lines after a
-            # frame still starts its own record rather than being swallowed
-            # indefinitely.
             or previous_line_is_frame
         )
     return bool(not stripped or line.startswith((' ', '\t')) or stripped.startswith(('at ', 'File ', 'Caused by:', 'Suppressed:')) or (stripped == 'During handling of the above exception, another exception occurred:') or EXCEPTION_PATTERN.search(stripped) or previous_line_is_frame)
@@ -1017,9 +823,6 @@ def _is_multiline_continuation(record: _PendingTextRecord, line: str) -> bool:
 def _stack_trace_may_be_important(raw_text: str) -> bool:
     lowered = raw_text.lower()
     if 'crash report' in lowered or 'core dumped' in lowered:
-        # _multiline_kind() forces level='ERROR' for these blocks
-        # unconditionally, regardless of whether any other marker is
-        # present - the generic marker set alone isn't a safe proxy here.
         return True
     return _generic_text_may_be_important(raw_text)
 
@@ -1077,11 +880,6 @@ def _syslog_level(severity: int) -> str:
 CRI_RE = re.compile('^(?P<time>\\S+)\\s+(?P<stream>stdout|stderr)\\s+(?P<flag>[FP])\\s+(?P<body>.*)$', re.DOTALL)
 
 def _container_may_be_important(raw_text: str) -> bool:
-    # CRI's own stream marker is always literally " stderr " between the
-    # timestamp and flag columns when present. _normalize_container_text_event
-    # only inherits level='ERROR' from the stream when the body doesn't
-    # already carry its own explicit level, so stderr isn't a guaranteed
-    # ERROR outcome by itself - just always worth fully parsing to find out.
     if ' stderr ' in raw_text:
         return True
     return _generic_text_may_be_important(raw_text)

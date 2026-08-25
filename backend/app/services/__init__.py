@@ -22,17 +22,9 @@ _EXPORTS = {
         "app.services.evidence_store",
         "persist_evidence_batch",
     ),
-    "resolve_evidence_identity": (
-        "app.services.persistent_identity_resolver",
-        "resolve_evidence_identity",
-    ),
     "persist_resolved_identities": (
         "app.services.identity_persister",
         "persist_resolved_identities",
-    ),
-    "stream_timeline_evidence": (
-        "app.services.persistent_timeline",
-        "stream_timeline_evidence",
     ),
     "build_component_timeline": (
         "app.services.timeline_processor",

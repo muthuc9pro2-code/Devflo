@@ -21,12 +21,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# SSE proxies/load balancers (and some browsers) can silently drop a
-# connection that stays quiet too long. This is a transport-level
-# keep-alive only - not a Devflo progress event, carries no JSON payload,
-# and must never be interpreted by the frontend as analysis state.
 _SSE_HEARTBEAT_SECONDS = 15.0
-
 
 def _sse_event(event: str, data: dict) -> str:
     return (
@@ -68,25 +63,6 @@ def _analysis_owned_by_user(
         )
 
 async def _analysis_event_stream(analysis_id: int):
-    """No DB Session or Analysis ORM object is passed in - both are only
-    ever held briefly, by this generator itself, never for the stream's
-    full (potentially minutes-long) lifetime.
-
-    Reconnect correctness (no durable event replay needed): subscribe to
-    the live channel BEFORE reading the persisted-state snapshot. Redis
-    pub/sub only delivers a message to clients already subscribed at
-    publish time - it never queues for a not-yet-subscribed client and
-    there is no history to replay. Snapshotting first would leave a window
-    between the DB read and pubsub.subscribe() during which a Celery
-    worker's publish (including the final investigation_result) would be
-    silently and permanently lost, since nothing was listening yet.
-    Subscribing first closes that window: the worst case is now a harmless
-    duplicate (a buffered live message whose value the snapshot, read
-    moments later, already reflects), never a dropped one. Historical
-    intermediate progress ticks (22%, 23%, 24%, ...) that predate the
-    subscription are still deliberately NOT replayed - only the current
-    snapshot plus messages from here on.
-    """
     channel = analysis_event_channel(analysis_id)
     pubsub = async_redis_client.pubsub()
     subscribed = False
@@ -96,10 +72,7 @@ async def _analysis_event_stream(analysis_id: int):
             await pubsub.subscribe(channel)
             subscribed = True
         except RedisError:
-            # Redis subscription itself failed (e.g. Redis is down). The
-            # frontend already performs durable-state checks/reconnects -
-            # this connection just degrades to "one DB snapshot, then
-            # done" instead of hanging or raising into the ASGI server.
+           
             logger.warning(
                 "Redis subscribe failed for analysis_id=%s; serving a "
                 "DB-only snapshot",
@@ -117,9 +90,6 @@ async def _analysis_event_stream(analysis_id: int):
             yield _sse_event("state", initial_state)
             return
 
-        # The DB Session below is scoped to this `with` block only - it is
-        # already closed by the time the generator starts waiting for
-        # future Redis messages further down.
         initial_state = await run_in_threadpool(
             _load_analysis_state,
             analysis_id,
@@ -130,27 +100,9 @@ async def _analysis_event_stream(analysis_id: int):
 
         yield _sse_event("state", initial_state)
 
-        # For a snapshot that is already terminal (completed/failed/
-        # cancelled), there is nothing further this stream can ever
-        # meaningfully deliver: investigation_result (for "completed") is
-        # already inside the snapshot just yielded, and "failed"/
-        # "cancelled" will never publish one. Ending here also means a
-        # stray buffered live investigation_result/cancelled for this same
-        # analysis is never relayed a second time - DB state is the source
-        # of truth.
         if initial_state.get("status") in ("completed", "failed", "cancelled"):
             return
 
-        # Guard against a stale queued progress tick from the
-        # subscribe -> snapshot handoff window: DB state is always
-        # committed before the corresponding live event is published (see
-        # _publish_ingestion_progress / persist-before-publish in
-        # _finalize_analysis_task), so any "progress" tick buffered from
-        # before the snapshot read can only be <= what the snapshot
-        # already reports. Forwarding it verbatim would visually regress
-        # the client backward, so stale ticks below the snapshot's own
-        # progress are dropped - a message that reflects real forward
-        # progress always passes through untouched.
         min_progress = initial_state.get("progress")
 
         last_activity = monotonic()
@@ -162,10 +114,6 @@ async def _analysis_event_stream(analysis_id: int):
                     timeout=1.0,
                 )
             except RedisError:
-                # Redis disconnected/raised mid-stream. This only ends the
-                # SSE connection - it must never mutate Analysis.status or
-                # otherwise touch backend computation state. The browser's
-                # existing reconnect path takes it from here.
                 logger.warning(
                     "Redis error while streaming analysis_id=%s; "
                     "terminating stream",
@@ -187,9 +135,6 @@ async def _analysis_event_stream(analysis_id: int):
                 event_name = data["event"]
                 event_data = data["data"]
             except (KeyError, TypeError, ValueError):
-                # Malformed/unexpected pub/sub payload must not crash the
-                # stream or be silently reinterpreted - skip it and keep
-                # waiting for the next message.
                 logger.warning(
                     "Malformed Redis pub/sub message for analysis_id=%s; "
                     "skipping",
@@ -207,12 +152,6 @@ async def _analysis_event_stream(analysis_id: int):
                     min_progress = progress
 
             if event_name in ("investigation_result", "cancelled"):
-                # The single authoritative final event for this stream -
-                # delivered exactly once, then finished. No heartbeat/
-                # progress follows it. Even if this live event is lost
-                # entirely, DB reconnect reconstructs "cancelled" the same
-                # way (compute_current_analysis_state) - this is a UX
-                # nicety, never the source of truth.
                 yield _sse_event(event_name, event_data)
                 return
 
@@ -246,8 +185,6 @@ async def stream_analysis_events(
     analysis_id: int,
     current_user_id: Annotated[int, Depends(get_current_verified_user_id_for_stream)],
 ) -> StreamingResponse:
-    # Short-lived ownership check only - this Session is closed well
-    # before the (potentially minutes-long) StreamingResponse begins.
     is_owned = await run_in_threadpool(
         _analysis_owned_by_user,
         analysis_id,

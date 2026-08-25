@@ -7,7 +7,6 @@ investigation engine, without a graph, and without re-reading a text
 artifact or re-running RapidOCR merely to build this context.
 """
 from datetime import datetime, timezone
-from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

@@ -81,7 +81,6 @@ def _cleanup_all(db, user_id: int) -> None:
 def _make_mixed_analysis(db, user_id: int, source_kind: str | None, source_reference: str | None) -> int:
     _cleanup_all(db, user_id)
 
-    total_bytes = sum((FIXTURES_DIR / name).stat().st_size for name, _ in ALL_FORMATS)
     analysis = Analysis(
         user_id=user_id,
         original_filename="mixed.zip",

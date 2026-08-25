@@ -53,10 +53,6 @@ async def extract_image_text(
         temp_file.write(content)
         temp_file.flush()
 
-        # Same shared validator every investigation upload path runs
-        # (app/api/analysis.py, and again as defense-in-depth inside
-        # image_text_extractor._run_ocr itself) - no second/parallel image
-        # validation implementation.
         try:
             validate_ocr_image(temp_file.name)
         except OcrImageTooLargeError as error:

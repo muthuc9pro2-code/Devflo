@@ -8,8 +8,6 @@ Endpoint functions are called directly (db/current_user/response passed
 in explicitly), matching this repo's established pattern (see
 test_analysis_history_api.py) rather than a FastAPI TestClient.
 """
-from datetime import datetime, timezone
-
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
@@ -20,7 +18,6 @@ from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.tasks import analysis as analysis_task
 from app.tasks.analysis import (
-    _is_analysis_cancelled,
     _mark_analysis_failed,
     _persist_artifact_batch,
     cancel_analysis_and_cleanup,

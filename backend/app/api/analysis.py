@@ -57,7 +57,6 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 
-
 @router.post(
     "/upload",
     response_model=AnalysisResponse,
@@ -108,19 +107,6 @@ def upload_file(
             try:
                 source_reference = validate_github_url(github_url)
             except SourceInputError:
-                # Optional source enrichment: a malformed repository URL
-                # detected synchronously here must degrade the exact same
-                # way a later async acquisition failure already does (see
-                # _prepare_source_task) - never abort otherwise-valid
-                # diagnostic artifacts over it. source_kind stays "github"
-                # so History/the final result can still say what kind of
-                # source was attempted. Deliberately distinct wording from
-                # _prepare_source_task's "could not be accessed or
-                # prepared": this is a malformed URL Devflo can reliably
-                # detect without ever attempting to reach GitHub - a later
-                # genuine access/clone failure (private repo, network,
-                # nonexistent repo, etc.) is a different, less certain
-                # class of failure and must not be conflated with this one.
                 source_status = "unavailable"
                 source_failure_reason = "Invalid GitHub repository URL."
         elif source_zip:
@@ -138,10 +124,6 @@ def upload_file(
                 validate_source_zip(source_path)
                 source_reference = str(source_path)
             except (UploadTooLarge, SourceInputError) as error:
-                # Same degradation as the github_url branch above. The
-                # invalid/oversized staged ZIP is reclaimed immediately -
-                # it will never be used, and the diagnostic artifacts
-                # staged below are entirely unaffected by it.
                 source_status = "unavailable"
                 source_failure_reason = (
                     f"Uploaded source ZIP could not be prepared: {error}"
@@ -156,14 +138,6 @@ def upload_file(
             storage_filename = _safe_storage_filename(original_filename)
             saved_path = UPLOAD_DIR / (f"{upload_group}_{position}_{storage_filename}")
             staged_paths.append(saved_path)
-
-            # MIME/extension is only an early resource hint here - a normal
-            # 50 MiB PNG should not first be fully written to disk before
-            # being rejected. The artifact detector below remains the
-            # authoritative format decision, and a disguised image that
-            # slips past this hint is still caught by the real
-            # size/pixel validation (validate_ocr_image) once
-            # detect_artifact_sample() confirms IMAGE.
             looks_like_image = (
                 Path(original_filename).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
                 or (upload.content_type or "").split(";", 1)[0].strip().lower()
@@ -191,12 +165,6 @@ def upload_file(
                 filename=original_filename,
                 mime_type=upload.content_type,
             ):
-                # Unsupported artifacts are recorded (not silently dropped
-                # and not aborting a batch that has other, valid artifacts)
-                # so the frontend can report which file/why via the same
-                # investigation_result.artifacts[] contract as every other
-                # outcome - never dispatched for ingestion, so the bytes
-                # are removed immediately like before.
                 saved_path.unlink(missing_ok=True)
 
                 artifact_rows.append(
@@ -229,13 +197,6 @@ def upload_file(
                         ),
                     )
 
-                # Real size/pixel validation against the file actually
-                # staged on disk - the same shared validator every OCR call
-                # runs (image_text_extractor._run_ocr), so even a disguised
-                # image that escaped the early filename/MIME hint above
-                # cannot reach OCR unvalidated. A resource-invalid image is
-                # an invalid investigation input, not zero-evidence
-                # "unsupported" evidence - the whole request is rejected.
                 try:
                     validate_ocr_image(saved_path)
                 except OcrImageTooLargeError as error:
@@ -255,8 +216,6 @@ def upload_file(
             )
 
         if not any(row["detected_format"] is not None for row in artifact_rows):
-            # Every uploaded file was unsupported - nothing to analyze at
-            # all, same outcome as today's single-unsupported-file case.
             _remove_staged_uploads(staged_paths)
             unsupported_names = ", ".join(
                 row["original_filename"] for row in artifact_rows
@@ -290,15 +249,6 @@ def upload_file(
         _remove_staged_uploads(staged_paths)
         raise
 
-    # unsupported/duplicate are already deterministically resolved at this
-    # point (staging classified unsupported; create_analysis's within-
-    # analysis content-hash grouping established the canonical artifact for
-    # any duplicate) - publish those outcomes now rather than making the
-    # frontend wait for final correlation. Reuses the exact same
-    # build_artifact_outcome_payload() the final investigation_result.
-    # artifacts[] uses, so there is only ever one status/message
-    # representation. Evidence-bearing artifacts are NOT published here -
-    # only once their ingestion actually completes (_process_artifact).
     created_artifacts = list(analysis.artifacts)
     filename_by_artifact_id = {
         artifact.id: artifact.original_filename for artifact in created_artifacts
@@ -491,14 +441,6 @@ def cancel_analysis(
         raise HTTPException(
             status_code=409, detail="Failed analyses cannot be cancelled"
         )
-
-    # analysis.status in ("pending", "processing") at the read above -
-    # cancellable as far as this request knows. cancel_analysis_and_cleanup
-    # re-checks under its own transaction and may still lose the race (a
-    # finalizer's completed/failed commit can land between the read above
-    # and here) - it returns None in that case rather than cancelling
-    # anything, so the response below must reflect what it actually
-    # observed, not the stale read above.
     previous_status = cancel_analysis_and_cleanup(db, analysis_id)
 
     if previous_status is None:
@@ -515,14 +457,8 @@ def cancel_analysis(
             raise HTTPException(
                 status_code=409, detail="Failed analyses cannot be cancelled"
             )
-        # Analysis vanished or is in an unexpected state - ownership was
-        # already confirmed above, so this only means the row is gone.
         raise HTTPException(status_code=404, detail="Analysis not found")
-
-    # Best-effort live notification only - DB is already
-    # authoritative regardless of whether this is ever delivered; a lost
-    # event is fully reconstructed by the next durable GET/reconnect via
-    # compute_current_analysis_state's "cancelled" branch.
+    
     publish_analysis_event(analysis_id, "cancelled", {"analysis_id": analysis_id})
 
     return {"analysis_id": analysis_id, "status": "cancelled"}

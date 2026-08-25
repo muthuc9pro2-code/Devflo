@@ -12,7 +12,6 @@ generate_investigation_explanation (the actual Gemini SDK boundary) is
 mocked.
 """
 from datetime import datetime, timezone
-from unittest.mock import Mock
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

@@ -96,7 +96,7 @@ def _drive(cls, data: bytes, max_scalar_bytes: int, chunk_sizes: list[int]):
         return consumed, True, offset
 
 
-def _random_chunk_plan(total_hint: int, rng: random.Random) -> list[int]:
+def _random_chunk_plan(rng: random.Random) -> list[int]:
     sizes = []
     remaining_reads = rng.randint(20, 60)
     for _ in range(remaining_reads):
@@ -142,7 +142,7 @@ def main() -> int:
     for case in ADVERSARIAL_CASES:
         for max_scalar_bytes in (1, 4, 8, 16, 32, 64, 100, 1000, 10_000_000):
             for _ in range(6):
-                chunk_sizes = _random_chunk_plan(len(case), rng)
+                chunk_sizes = _random_chunk_plan(rng)
                 check(case, max_scalar_bytes, chunk_sizes, "adversarial")
 
     # Purely random byte soup, biased toward the structurally interesting bytes.
@@ -151,7 +151,7 @@ def main() -> int:
         length = rng.randint(0, 400)
         data = bytes(rng.choice(alphabet) for _ in range(length))
         max_scalar_bytes = rng.choice([1, 2, 5, 10, 50, 200, 100_000])
-        chunk_sizes = _random_chunk_plan(length, rng)
+        chunk_sizes = _random_chunk_plan(rng)
         check(data, max_scalar_bytes, chunk_sizes, "random")
 
     print(f"\ntrials={trials} mismatches={mismatches}")

@@ -90,16 +90,9 @@ def _validate_cloned_source_tree(root: Path) -> None:
     file_count = 0
     total_bytes = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        # A symlinked directory is still listed in dirnames even though
-        # os.walk (with followlinks=False) will not descend into it - it
-        # must be rejected here, not silently skipped, exactly like a ZIP
-        # symlink entry is rejected rather than ignored.
         for name in dirnames:
             entry = Path(dirpath) / name
             if stat.S_ISLNK(entry.lstat().st_mode):
-                # Report the path relative to the repository root, never the
-                # full server-side path (which would leak SOURCE_STORAGE_ROOT's
-                # internal on-disk layout into a user-facing failure reason).
                 raise SourceInputError(
                     f"Symlink entries are not supported: {entry.relative_to(root)}"
                 )
@@ -130,12 +123,6 @@ def _clone_github(url: str, dest: Path) -> None:
     env = {
         **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
-        # A repository containing Git LFS pointer files must not cause the
-        # clone itself to download arbitrarily large LFS objects before
-        # Devflo's own source limits ever get a chance to inspect the
-        # working tree. Devflo does not support LFS content - this only
-        # prevents an unbounded download, it never fetches LFS objects
-        # some other way.
         "GIT_LFS_SKIP_SMUDGE": "1",
     }
     try:
@@ -148,11 +135,7 @@ def _clone_github(url: str, dest: Path) -> None:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         raise SourceInputError(f"Could not clone repository: {url}") from error
-
-    # The 500 MiB / 20,000-file source limits apply to the checked-out
-    # working tree, not Git's own .git metadata (packfiles, refs, etc.) -
-    # removed immediately, before validation, so it can never inflate
-    # either count.
+    
     git_dir = dest / ".git"
     if git_dir.exists():
         shutil.rmtree(git_dir)
@@ -234,7 +217,7 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
         return index
 
     if dest.exists():
-        shutil.rmtree(dest)  # stale/partial remnant of a crashed prior attempt
+        shutil.rmtree(dest) 
 
     try:
         if source_kind == "github":
@@ -249,16 +232,6 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
         index = build_index(dest)
         save_index_manifest(index, manifest_path)
     except Exception:
-        # Acquisition, validation, index-building, or manifest-writing
-        # failed before this analysis's source ever became "ready" (the
-        # marker.exists() reuse branch above only ever returns for source
-        # that WAS already fully, successfully prepared) - leave no
-        # partial prepared tree behind for a later call to stumble over.
-        # The staged ZIP upload itself (source_reference for
-        # source_kind == "zip") is deliberately left untouched here: it
-        # remains useful for a legitimate retry/resume, and is only ever
-        # removed by the caller after a successful prepare_source() (see
-        # _remove_staged_source_archive in tasks/analysis.py).
         cleanup_prepared_source(analysis_id)
         raise
     return index

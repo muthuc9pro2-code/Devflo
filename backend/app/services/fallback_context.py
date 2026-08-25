@@ -24,9 +24,6 @@ def _looks_like_binary_or_control_garbage(text: str) -> bool:
     if not text:
         return True
     control_chars = len(_CONTROL_CHAR_PATTERN.findall(text))
-    # A handful of stray control characters (odd OCR noise, mixed line
-    # endings) is normal; a text dominated by them is not real diagnostic
-    # prose.
     return control_chars > max(4, len(text) // 20)
 
 
@@ -90,8 +87,5 @@ def capture_ocr_fallback_context(text: str, ocr_confidence: float | None) -> dic
     return {
         "kind": "ocr",
         "text": _bounded_text(stripped, SIMPLE_FALLBACK_MAX_TEXT_BYTES),
-        # Real RapidOCR confidence, never fabricated - the key is always
-        # present (None when unavailable), matching the convention every
-        # other OCR-derived payload in this codebase already follows.
         "ocr_confidence": ocr_confidence,
     }

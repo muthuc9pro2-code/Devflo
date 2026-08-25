@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import ArtifactFormat, detect_artifact  # noqa: E402
+from app.services.artifact_detector import detect_artifact  # noqa: E402
 from app.services.diagnostic_parser import normalize_structured_event, structured_event_may_be_important  # noqa: E402
 from app.services.event_filter import IMPORTANT_LEVELS  # noqa: E402
 

@@ -127,13 +127,7 @@ def is_supported_diagnostic_sample(
         or normalized_mime in SUPPORTED_TEXT_MIME_TYPES
     ):
         return _sample_is_text_like(sample)
-
-    # Unfamiliar suffix/MIME (e.g. cloudfront.tsv, service.out with an
-    # unrecognized content-type): content still wins over extension, but
-    # only when detection is CONFIDENT about a specific, non-generic
-    # diagnostic family - an unfamiliar suffix alone must not fall back to
-    # "accept as GENERIC text", and arbitrary binary content is still
-    # rejected by the same text-like check every other branch uses.
+    
     if not _sample_is_text_like(sample):
         return False
 

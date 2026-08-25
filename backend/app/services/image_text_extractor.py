@@ -56,15 +56,6 @@ def validate_ocr_image(file_path: str | Path) -> None:
             f"Image exceeds the {MAX_OCR_IMAGE_BYTES // MEBIBYTE} MiB image size limit"
         )
 
-    # Pillow's own PIL.Image.MAX_IMAGE_PIXELS is a process-global mutable
-    # default - deliberately never read or reassigned here (that would
-    # affect every other concurrent Pillow use in this process). Image.open
-    # still performs Pillow's OWN decompression-bomb check internally
-    # against that unmodified global default while parsing the header, so
-    # an extreme (multi-hundred-megapixel) image can still raise
-    # DecompressionBombError before width/height are even available below;
-    # everything under that default is instead enforced by Devflo's own,
-    # much stricter MAX_OCR_IMAGE_PIXELS comparison after open() returns.
     try:
         with Image.open(path) as probe:
             width, height = probe.size
@@ -108,10 +99,6 @@ def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
     try:
         results, _ = _ocr(str(path))
     except Exception as error:
-        # The image has already passed Devflo's size/integrity validation.
-        # Convert only the external OCR-engine call into a domain failure so
-        # the artifact task can isolate this image without hiding bugs in the
-        # surrounding Devflo parsing/persistence code.
         raise OcrProcessingError("Image OCR could not be completed") from error
 
     if not results:

@@ -30,7 +30,6 @@ __all__ = [  # noqa: F822 - legacy names are resolved by module __getattr__.
     "TRACE_ID_PATTERN",
     "ParsedEvent",
     "StackFrame",
-    "estimate_parsed_event_size_bytes",
     "parse_log_line",
 ]
 
@@ -67,67 +66,13 @@ class ParsedEvent:
     source_format: str | None = None
     artifact_id: int | None = None
     source_matches: list[dict[str, Any]] = field(default_factory=list)
-    # Real per-image RapidOCR confidence (0..1) - set only by
-    # diagnostic_adapters._stream_image_events for source_format="image"
-    # events; left at its default (None) everywhere else, never fabricated.
     ocr_confidence: float | None = None
-    # Bounded (DIAGNOSTIC_ATTRIBUTES_MAX_BYTES), scalar-only structured
-    # fields that are diagnostically useful but not one of the canonical
-    # fields above - e.g. {"error_code": "POOL_EXHAUSTED",
-    # "available_connections": 0} from a real JSON record. Never a
-    # correlation signal on its own (only canonical fields are); never the
-    # whole raw event. None whenever nothing qualified or the source was
-    # not structured JSON.
     diagnostic_attributes: dict[str, Any] | None = None
-
-
-def estimate_parsed_event_size_bytes(event: ParsedEvent) -> int:
-    """Conservatively estimate canonical data retained until a batch flushes."""
-
-    values = (
-        event.raw_line,
-        event.level,
-        event.trace_id,
-        event.request_id,
-        event.service,
-        event.module,
-        event.exception_type,
-        event.exception_message,
-        event.fingerprint,
-        event.endpoint,
-        event.source_file,
-        event.span_id,
-        event.parent_span_id,
-        event.host,
-        event.container,
-        event.pod,
-        event.source_format,
-    )
-    size = sum(
-        len(value.encode("utf-8", errors="replace"))
-        for value in values
-        if value is not None
-    )
-    size += sum(
-        len(value.encode("utf-8", errors="replace"))
-        for frame in event.stack_frames
-        for value in (frame.file, frame.function)
-        if value is not None
-    )
-    if event.diagnostic_attributes:
-        size += sum(
-            len(str(key).encode("utf-8", errors="replace"))
-            + len(str(value).encode("utf-8", errors="replace"))
-            for key, value in event.diagnostic_attributes.items()
-        )
-    return max(size, 1)
 
 
 def parse_log_line(line: str, line_number: int) -> ParsedEvent:
     """Parse an ordinary diagnostic line into the canonical event shape."""
 
-    # Imported lazily so this compatibility module remains the owner of the
-    # canonical dataclasses without creating a module import cycle.
     from .diagnostic_parser import TIMESTAMP_PATTERN, normalize_text_event
 
     event = normalize_text_event(

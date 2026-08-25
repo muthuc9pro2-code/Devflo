@@ -30,16 +30,6 @@ class SourceIndex:
     by_path: dict[str, SourceFile] = field(default_factory=dict)
     by_suffix: dict[str, list[str]] = field(default_factory=dict)
     by_stem: dict[str, list[str]] = field(default_factory=dict)
-    # Many stack frames across many events routinely point at the same hot
-    # file; without this, each one re-reads and re-splits it from disk.
-    # Bounded by total cached bytes (not entry count) so a handful of large
-    # files can't blow memory even though there's no eviction.
-    # Keyed by relative_path (str), not an absolute Path object: every
-    # correlate_event() call reconstructs `root / relative_path` fresh, and
-    # hashing a brand-new Path is surprisingly costly (re-parses and
-    # re-normcases the whole string) - a plain string key lets repeat
-    # lookups for the same file skip that entirely and skip constructing
-    # the Path at all on a cache hit.
     _context_cache: dict[str, list[str] | None] = field(
         default_factory=dict, repr=False
     )
@@ -79,14 +69,6 @@ def build_index(root: Path) -> SourceIndex:
         dirnames[:] = [name for name in dirnames if name not in IGNORED_DIRS]
         if not filenames:
             continue
-        # full_path.relative_to(root) was being recomputed via pathlib for
-        # every single file, even though every file in this same dirpath
-        # shares the identical relative directory prefix - on a directory
-        # with many files that was the dominant cost in build_index().
-        # Hoisting it to once per directory and joining the (unchanged)
-        # per-file components onto it is provably identical - verified
-        # directly against the old per-file computation for every path in
-        # this repo before relying on it.
         relative_dir = os.path.relpath(dirpath, root_str)
         relative_dir_posix = "" if relative_dir == "." else relative_dir.replace(os.sep, "/")
         for filename in filenames:

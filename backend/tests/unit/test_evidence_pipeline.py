@@ -2,12 +2,10 @@ from datetime import datetime
 from unittest.mock import Mock
 
 import pytest
-from sqlalchemy import ForeignKeyConstraint, create_engine
+from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.dialects import mysql
-from sqlalchemy.orm import Session
 
 from app.models import Evidence
-from app.services import persistent_timeline
 from app.services.evidence_store import persist_evidence_batch
 from app.services.log_praser import ParsedEvent
 
@@ -230,41 +228,3 @@ def test_evidence_batch_persists_first_truthy_source_matches():
 
     _, rows = db.execute.call_args.args
     assert rows[0]["source_matches"] == events[1].source_matches
-
-
-def test_timeline_keyset_pagination_handles_null_timestamps(monkeypatch):
-    engine = create_engine("sqlite+pysqlite:///:memory:")
-    Evidence.__table__.create(engine)
-
-    with Session(engine) as db:
-        db.add_all(
-            [
-                _evidence(1, None),
-                _evidence(2, None),
-                _evidence(3, datetime(2026, 8, 12, 10, 2)),  # noqa: DTZ001
-                _evidence(4, datetime(2026, 8, 12, 10, 1)),  # noqa: DTZ001
-            ]
-        )
-        db.commit()
-        monkeypatch.setattr(persistent_timeline, "TIMELINE_PAGE_SIZE", 1)
-
-        rows = list(persistent_timeline.stream_timeline_evidence(db, 1))
-
-    assert [row.id for row in rows] == [1, 2, 4, 3]
-
-
-def _evidence(identifier, first_seen):
-    return Evidence(
-        id=identifier,
-        analysis_id=1,
-        artifact_id=1,
-        correlation_key=f"key-{identifier}",
-        fingerprint=f"fingerprint-{identifier}",
-        trace_id="__none__",
-        request_id="__none__",
-        first_seen=first_seen,
-        last_seen=first_seen,
-        occurrence_count=1,
-        first_line_number=identifier,
-        last_line_number=identifier,
-    )

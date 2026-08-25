@@ -13,7 +13,6 @@ test - a one-off correctness gate, run manually:
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import random
 import sys
 from pathlib import Path
@@ -27,13 +26,13 @@ new_normalize_text_event = dp.normalize_text_event
 
 def old_normalize_text_event(raw_text, line_number, *, source_file=None, source_format=None, defaults=None):
     defaults = defaults or {}
-    lower_text, features = dp._classify_text(raw_text)
+    _, features = dp._classify_text(raw_text)
     text_defaults = {key: dp._as_text(defaults.get(key)) for key in dp._TEXT_FIELDS} if defaults else {}
     status = dp._safe_int(defaults.get('http_status'))
     missing = {key for key, value in text_defaults.items() if value is None} if defaults else None
     if missing is not None and status is None:
         missing.add('http_status')
-    fields = dp._extract_diagnostic_fields(raw_text, lower_text, missing, features)
+    fields = dp._extract_diagnostic_fields(raw_text, missing, features)
     timestamp_match = dp.TIMESTAMP_PATTERN.search(raw_text) if not defaults.get('timestamp') and features & dp._TIMESTAMP else None
     level_match = dp.LOG_LEVEL_PATTERN.search(raw_text) if not defaults.get('level') and features & dp._LEVEL else None
     exception_type = dp._as_text(defaults.get('exception_type'))

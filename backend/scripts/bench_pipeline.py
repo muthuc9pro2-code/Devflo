@@ -215,7 +215,7 @@ def run_cpu_only(iterations: int) -> None:
     database call, broken into the phases the task asked to see separately.
     """
 
-    from app.services.artifact_detector import ArtifactFormat, detect_artifact
+    from app.services.artifact_detector import detect_artifact
     from app.services.diagnostic_adapters import stream_artifact_events
     from app.services.exception_fingerprint import build_exception_fingerprint
     from app.services.batch_processor import create_batches

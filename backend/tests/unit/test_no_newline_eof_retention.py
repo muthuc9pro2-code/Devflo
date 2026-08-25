@@ -19,7 +19,6 @@ follows a real frame with a source-snippet line), or CRI's own explicit 'P'
 """
 from app.services.artifact_detector import ArtifactFormat
 from app.services.diagnostic_adapters import stream_artifact_events
-from app.services.diagnostic_parser import _parse_stack_frames
 
 
 def _events(tmp_path, name: str, content: str, artifact_format: ArtifactFormat):

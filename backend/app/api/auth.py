@@ -103,7 +103,7 @@ def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=False,
+        secure=Settings.COOKIE_SECURE,
         samesite="lax",
         max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
@@ -128,18 +128,18 @@ def login(
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=False,
+        secure=Settings.COOKIE_SECURE,
         samesite="lax",
-        max_age=30 * 60,
+        max_age=Settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
     response.set_cookie(
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=False,
+        secure=Settings.COOKIE_SECURE,
         samesite="lax",
-        max_age=7 * 24 * 60 * 60,
+        max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
 
     return {"message": "Login successful"}
@@ -186,18 +186,18 @@ def refresh_token(request: Request, response: Response, db: Session = Depends(ge
         key="access_token",
         value=new_access_token,
         httponly=True,
-        secure=False,
+        secure=Settings.COOKIE_SECURE,
         samesite="lax",
-        max_age=30 * 60,
+        max_age=Settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
     response.set_cookie(
         key="refresh_token",
         value=new_refresh_token,
         httponly=True,
-        secure=False,
+        secure=Settings.COOKIE_SECURE,
         samesite="lax",
-        max_age=7 * 24 * 60 * 60,
+        max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
 
     return {

@@ -21,12 +21,7 @@ def create_analysis(
     source_status: str | None = None,
     source_failure_reason: str | None = None,
 ) -> Analysis:
-    # source_status/source_failure_reason let the caller record a source
-    # failure that was already known SYNCHRONOUSLY at upload time (e.g. a
-    # malformed GitHub URL or an invalid source ZIP) directly on creation,
-    # rather than a second post-commit UPDATE - the asynchronous
-    # _prepare_source_task path still sets these itself when source
-    # acquisition instead fails later, during processing.
+    
     analysis = Analysis(
         user_id=user_id,
         original_filename=filename,
@@ -66,12 +61,6 @@ def create_analysis(
         ]
         db.add_all(artifact_models)
 
-        # Content-identity duplicate detection: within THIS analysis only,
-        # the first artifact (upload order) carrying a given content_sha256
-        # stays canonical/pending; any later one with the exact same digest
-        # becomes a duplicate of it instead of an independent artifact.
-        # Unsupported rows carry no meaningful content_sha256 relationship
-        # here (they are never processed either way) and are excluded.
         canonical_by_digest: dict[str, AnalysisArtifact] = {}
         duplicates: list[tuple[AnalysisArtifact, AnalysisArtifact]] = []
 
@@ -87,21 +76,13 @@ def create_analysis(
                 duplicates.append((model, canonical))
 
         if duplicates:
-            # Need real, DB-assigned artifact ids before duplicate rows can
-            # reference their canonical sibling - one flush, still inside
-            # the same transaction as the eventual commit below.
+           
             db.flush()
 
             for duplicate, canonical in duplicates:
                 duplicate.status = "duplicate"
                 duplicate.duplicate_of_artifact_id = canonical.id
-                # Never dispatched for ingestion, so there are no bytes
-                # actually pending for it - without this it would sit
-                # forever in the ingestion-progress denominator
-                # (_publish_ingestion_progress sums size_bytes across every
-                # artifact) without ever contributing to the numerator,
-                # permanently understating progress. Existing progress
-                # math/query itself is untouched.
+                
                 duplicate.processed_bytes = duplicate.size_bytes
 
         for model in artifact_models:
@@ -114,15 +95,6 @@ def create_analysis(
         db.rollback()
         raise
 
-    # Best-effort, post-commit only: the DB has already durably established
-    # canonical vs duplicate (including duplicate_of_artifact_id), so it is
-    # now safe to reclaim the duplicate's redundant staged bytes. Metadata
-    # (original_filename, duplicate_of_artifact_id, status) stays in the DB
-    # either way - only the physical file is removed, and only the
-    # duplicate's, never the canonical artifact's. A deletion failure is
-    # logged and otherwise ignored: the investigation is already durably
-    # correct without it, and redundant bytes left on disk are not worth
-    # failing the upload over.
     for duplicate, _canonical in duplicates:
         _delete_staged_upload(duplicate.saved_file_path)
 

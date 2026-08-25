@@ -8,16 +8,10 @@ from .log_praser import ParsedEvent, StackFrame
 TIMESTAMP_PATTERN = re.compile('\\b\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:?\\d{2})?\\b')
 LOG_LEVEL_PATTERN = re.compile('(?<![A-Za-z])(TRACE|DEBUG|INFO|NOTICE|WARNING|WARN|ERROR|ERR|SEVERE|FATAL|CRITICAL|ALERT|EMERG(?:ENCY)?)(?![A-Za-z])', re.IGNORECASE)
 TRACE_ID_PATTERN = re.compile('\\b(?:trace[_-]?id|traceid)[\\s=:' + '"\'' + ']+([A-Za-z0-9_-]+)', re.IGNORECASE)
-SPAN_ID_PATTERN = re.compile('\\b(?:span[_-]?id|spanid)[\\s=:' + '"\'' + ']+([A-Za-z0-9_-]+)', re.IGNORECASE)
-PARENT_SPAN_ID_PATTERN = re.compile('\\b(?:parent[_-]?span[_-]?id|parentspanid)[\\s=:' + '"\'' + ']+([A-Za-z0-9_-]+)', re.IGNORECASE)
 REQUEST_ID_PATTERN = re.compile('\\b(?:request[_-]?id|requestid|correlation[_-]?id|x-request-id)[\\s=:' + '"\'' + ']+([A-Za-z0-9_.:/-]+)', re.IGNORECASE)
 SERVICE_PATTERN = re.compile('\\b(?:service(?:[_-]?name)?|app|component)[\\s=:' + '"\'' + ']+([A-Za-z0-9_.-]+)', re.IGNORECASE)
 MODULE_PATTERN = re.compile('\\b(?:module|logger)[\\s=:' + '"\'' + ']+([A-Za-z0-9_.:/-]+)', re.IGNORECASE)
-HOST_PATTERN = re.compile('\\b(?:host(?:name)?|node)[\\s=:' + '"\'' + ']+([A-Za-z0-9_.:-]+)', re.IGNORECASE)
-CONTAINER_PATTERN = re.compile('\\b(?:container(?:[_-]?(?:id|name))?)[\\s=:' + '"\'' + ']+([A-Za-z0-9_.:/-]+)', re.IGNORECASE)
-POD_PATTERN = re.compile('\\b(?:pod(?:[_-]?name)?)[\\s=:' + '"\'' + ']+([A-Za-z0-9_.-]+)', re.IGNORECASE)
 HTTP_STATUS_PATTERN = re.compile('\\b(?:status|status_code|http_status)[\\s=:' + '"\'' + ']+(\\d{3})\\b', re.IGNORECASE)
-ENDPOINT_PATTERN = re.compile('(?:\\b(?:endpoint|route|path|url)[\\s=:' + '"\'' + ']+)(https?://[^\\s\\"\']+|/[^\\s\\"\']*)', re.IGNORECASE)
 HTTP_REQUEST_PATTERN = re.compile('\\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\\s+(\\S+)', re.IGNORECASE)
 DIAGNOSTIC_FIELD_PATTERN = re.compile('\\b(?P<key>[A-Za-z][A-Za-z0-9_-]*)\\b[\\"\']?\\s*(?:=|:)\\s*[\\"\']?(?P<value>[A-Za-z0-9_./:@?&={}-]+)')
 SPACE_DIAGNOSTIC_FIELD_PATTERN = re.compile('\\b(?P<key>parent[_-]?span[_-]?id|trace[_-]?id|span[_-]?id|request[_-]?id|correlation[_-]?id|x-request-id|service(?:[_-]?name)?|app|component|module|logger|host(?:name)?|node|container(?:[_-]?(?:id|name))?|pod(?:[_-]?name)?|status(?:[_-]?code)?|http[_-]?status|endpoint|route|path|url)\\s+(?P<value>[A-Za-z0-9_./:@?&={}-]+)', re.IGNORECASE)
@@ -163,18 +157,6 @@ def _parse_stack_frames(raw_text: str) -> list[StackFrame]:
     frames = []
     if 'File "' in raw_text:
         for match in PYTHON_FRAME_PATTERN.finditer(raw_text):
-            # A well-formed Python traceback frame line ("File ..., line N,
-            # in FUNC") is always immediately followed by its source-code
-            # snippet line - that is how every real traceback (Python's own
-            # formatter, always) writes one. A frame with nothing at all
-            # after it in the record only happens when the record itself
-            # was cut short before that snippet line ever arrived (e.g. the
-            # underlying artifact's content ends mid-traceback) - the
-            # function name captured at that point cannot be trusted as
-            # complete, so it is dropped rather than persisted truncated.
-            # NODE_FRAME_PATTERN/JAVA_FRAME_PATTERN frames below are exempt:
-            # their one-line-per-frame convention has no such "next line"
-            # requirement, so being the record's last line is normal there.
             if not raw_text[match.end():].strip():
                 continue
             file, line, function = match.group(1), match.group(2), match.group(3)
@@ -184,11 +166,6 @@ def _parse_stack_frames(raw_text: str) -> list[StackFrame]:
             for function, file, line in pattern.findall(raw_text):
                 frames.append(StackFrame(file=file, line=int(line), function=function or None))
     if not frames:
-        # Explicit Python/JVM/Node parsers above take precedence; only
-        # fall back to the generic path:line[:column] shape when none of
-        # them found anything. function is always None here - a bare
-        # path:line carries no function name, and inventing one would be
-        # exactly the fabrication this must not do.
         for match in GENERIC_SOURCE_LOCATION_PATTERN.finditer(raw_text):
             frames.append(
                 StackFrame(
@@ -217,11 +194,6 @@ def _classify_text(raw_text: str) -> tuple[str, int]:
     if (
         '\n' in raw_text
         or raw_text.lstrip().startswith(('at ', 'File '))
-        # Cheap pre-check for a single-line generic "file.ext:N" shape
-        # (Go/Rust/Ruby/.NET/C/C++ etc.) - only a fast substring-scale
-        # regex, not the full named-group GENERIC_SOURCE_LOCATION_PATTERN,
-        # so records with no ".x:digit" shape at all skip stack-frame
-        # parsing exactly as cheaply as before.
         or _LOOSE_SOURCE_LOCATION_HINT.search(raw_text)
     ):
         features |= _STACK
@@ -275,11 +247,6 @@ def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: st
         return None
 
     if _SPACED_OPERATOR_RE.search(rest) is not None:
-        # A '='/':' with whitespace on either side could let a field match
-        # span what we're about to treat as a token boundary (e.g.
-        # "key: value" or "key =value") - the per-token scan below can't see
-        # across that boundary, so hand the whole record to the full parser
-        # instead of risking a field that's there but goes unfound.
         return None
 
     tokens = rest.split()
@@ -288,14 +255,6 @@ def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: st
     endpoint_from_http = None
     has_exception_marker = False
     consumed_as_value = -1
-    # _SPACE_FIELD_MARKERS (the real parser's gate for even attempting
-    # SPACE_DIAGNOSTIC_FIELD_PATTERN) doesn't cover every alias
-    # SPACE_DIAGNOSTIC_FIELD_PATTERN's own alternation supports - e.g. bare
-    # "route"/"path"/"url"/"app"/"component"/"node", or "servicename"/
-    # "containerid"-style compounds, never satisfy it on their own. Folding
-    # a token to a FIELD_ALIASES hit is a superset of that gate, so it's
-    # only a safe pre-filter once also checked against the real gate -
-    # computed at most once per record, only if a candidate token shows up.
     space_fields_enabled: bool | None = None
 
     for i, token in enumerate(tokens):
@@ -312,18 +271,9 @@ def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: st
                 _store_diagnostic_field(fields, match, None)
             continue
 
-        # Bare "key value" form (no '='/':'): only worth an actual regex
-        # attempt when this token could plausibly BE one of the recognized
-        # field names at all - folding is a strict superset of what
-        # SPACE_DIAGNOSTIC_FIELD_PATTERN's alternation accepts, so this
-        # never skips an attempt the real pattern would have wanted.
         normalized_key = token.translate(_KEY_FOLD_TABLE)
         if normalized_key in FIELD_ALIASES and i + 1 < n_tokens:
             if space_fields_enabled is None:
-                # level_token itself can coincidentally contain a marker
-                # (e.g. level "TRACE" contains the bare 'trace' marker) even
-                # though ts_token structurally never can, so it has to be
-                # included in what gets scanned here too.
                 lowered_scan = f'{level_token} {rest}'.lower()
                 space_fields_enabled = any(
                     marker in lowered_scan for marker in _SPACE_FIELD_MARKERS
@@ -429,17 +379,6 @@ def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | 
         resolved_level = normalize_level(defaults.get('level')) if defaults.get('level') else None
         default_timestamp = defaults.get('timestamp')
         if resolved_level is not None and default_timestamp:
-            # Every _TEXT_FIELDS/http_status value defaults already supplies,
-            # plus a settled timestamp and level: nothing
-            # _extract_diagnostic_fields() could still find is wanted, the
-            # timestamp/level searches are moot (defaults already won them),
-            # and the exception-match guard below is exactly
-            # `exception_type is None or exception_message is None` (its
-            # third clause, `not defaults.get('level')`, is already false) -
-            # so classify_text()'s full lower()+6-marker-group scan and both
-            # DIAGNOSTIC_FIELD_PATTERN passes are all guaranteed no-ops here.
-            # Only stack-frame detection doesn't depend on defaults at all,
-            # and is cheap to check directly without classify_text().
             return _normalize_fully_defaulted_event(
                 raw_text,
                 line_number,
@@ -453,8 +392,8 @@ def normalize_text_event(raw_text: str, line_number: int, *, source_file: str | 
                 exception_message=_as_text(defaults.get('exception_message')),
             )
 
-    lower_text, features = _classify_text(raw_text)
-    fields = _extract_diagnostic_fields(raw_text, lower_text, missing, features)
+    _, features = _classify_text(raw_text)
+    fields = _extract_diagnostic_fields(raw_text, missing, features)
     timestamp_match = TIMESTAMP_PATTERN.search(raw_text) if not defaults.get('timestamp') and features & _TIMESTAMP else None
     level_match = LOG_LEVEL_PATTERN.search(raw_text) if not defaults.get('level') and features & _LEVEL else None
     exception_type = _as_text(defaults.get('exception_type'))
@@ -567,12 +506,10 @@ def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Map
         return True
 
     if level_value is not None:
-        # A real, explicit level that is not itself important, and none of
-        # the real signals above fired either - trust the producer's level.
         return False
 
     if status is None:
-        return True  # nothing resolved at all - uncertain, fully parse
+        return True  
 
     message_value = first(('message',), ('msg',), ('log',), ('@message',), ('body',), ('event', 'message'), ('error', 'message'), ('exception', 'message'))
     message_text = (_value_text(message_value) or '').lower()
@@ -605,7 +542,7 @@ def _first_value(data: Mapping[str, Any], paths: tuple[tuple[str, ...], ...], ke
             return current
     return None
 
-def _extract_diagnostic_fields(raw_text: str, lowered: str | None=None, wanted: set[str] | None=None, features: int | None=None) -> dict[str, str]:
+def _extract_diagnostic_fields(raw_text: str, wanted: set[str] | None=None, features: int | None=None) -> dict[str, str]:
     fields: dict[str, str] = {}
     if features is None:
         _, features = _classify_text(raw_text)
@@ -614,10 +551,6 @@ def _extract_diagnostic_fields(raw_text: str, lowered: str | None=None, wanted: 
     if ('=' in raw_text or ':' in raw_text) and features & _FIELDS:
         for match in DIAGNOSTIC_FIELD_PATTERN.finditer(raw_text):
             _store_diagnostic_field(fields, match, wanted)
-    # SPACE_DIAGNOSTIC_FIELD_PATTERN only ever contributes canonical keys the
-    # '='/':' pass above didn't already find (_store_diagnostic_field never
-    # overwrites an existing key), so once every key we could still want is
-    # already present there is nothing left for the second regex pass to add.
     if features & _SPACE_FIELDS:
         still_wanted = _ALL_CANONICAL_FIELD_KEYS if wanted is None else wanted
         if not still_wanted <= fields.keys():
@@ -633,13 +566,6 @@ def _store_diagnostic_field(fields: dict[str, str], match: re.Match[str], wanted
 
 @lru_cache(maxsize=2048)
 def _normalized_key(value: str) -> str:
-    # A pure string function, called for the same small, repeated set of
-    # alias path components (e.g. 'level', 'exception_type', 'status')
-    # tens of times per structured record - memoized so the regex
-    # substitution runs once per distinct key ever seen, not once per
-    # lookup. Bounded (not @cache) so an adversarial record with many
-    # distinct field names cannot grow this unboundedly across a whole
-    # ingestion run.
     return _NON_ALNUM_PATTERN.sub('', value.lower())
 
 def _value_text(value: Any) -> str | None:

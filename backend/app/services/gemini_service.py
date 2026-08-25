@@ -10,21 +10,9 @@ from app.schemas.gemini import GeminiInvestigationResponse
 
 logger = logging.getLogger(__name__)
 
-# Bounded retry for transient Gemini/provider failures: 5xx (ServerError),
-# 429 (ClientError, rate limiting), and unexpected transport/SDK exceptions
-# raised by the external generate_content(...) call itself. An ordinary
-# non-429 4xx ClientError (bad request, auth, quota) is never retried since
-# retrying it cannot succeed - it is converted to GeminiUnavailableError
-# immediately instead. 3 total attempts with a short linear backoff is
-# enough to ride out a brief outage without materially delaying finalize on
-# a real one.
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 1.5
 
-# Per-attempt network timeout: without this, generate_content() can block
-# indefinitely on a stalled connection and never reach the retry logic
-# above - with Celery concurrency ~2, two such hangs would occupy every
-# worker. HttpOptions.timeout is milliseconds (google-genai SDK).
 _REQUEST_TIMEOUT_SECONDS = 60
 
 _RETRYABLE_CLIENT_ERROR_STATUS_CODES = {429}
@@ -198,16 +186,6 @@ def generate_investigation_explanation(
         response_schema=GeminiInvestigationResponse,
         temperature=0.2,
         http_options=types.HttpOptions(timeout=_REQUEST_TIMEOUT_SECONDS * 1000),
-        # Devflo never registers callable tools/functions on this
-        # request (no `tools=` above), so the model can never emit a
-        # function call for the SDK to automatically dispatch -
-        # Automatic Function Calling has nothing to do here. Left
-        # enabled (the SDK's default), it still runs its AFC bookkeeping
-        # on every call and logs "AFC is enabled with max remote calls"
-        # + a recommendation to use Chat.send_message instead, neither
-        # of which apply to this tool-less, single-shot request.
-        # Disabling it is a config-only change; generate_content() and
-        # the response schema/prompt above are unchanged.
         automatic_function_calling=types.AutomaticFunctionCallingConfig(
             disable=True,
         ),
@@ -226,10 +204,6 @@ def generate_investigation_explanation(
         except genai_errors.ClientError as exc:
             status_code = _client_error_status_code(exc)
             if status_code not in _RETRYABLE_CLIENT_ERROR_STATUS_CODES:
-                # An ordinary non-429 4xx (bad request, auth, quota) is not
-                # transient - retrying it cannot succeed. Converted
-                # immediately so it can never escape into the finalizer as
-                # a raw SDK exception.
                 logger.warning(
                     "Gemini request failed with a non-retryable client "
                     "error (status=%s): %s",
@@ -251,11 +225,6 @@ def generate_investigation_explanation(
                 raise GeminiUnavailableError(str(exc)) from exc
             _log_retry_attempt(attempt, exc)
         except Exception as exc:
-            # Any other exception raised specifically by this external
-            # generate_content(...) call (network/timeout/SDK-internal) is
-            # contained here too: bounded retry, then GeminiUnavailableError
-            # if it still fails. Deliberately not BaseException -
-            # KeyboardInterrupt/SystemExit must still propagate normally.
             if attempt >= _MAX_ATTEMPTS:
                 logger.warning(
                     "Gemini request unavailable after %s attempt(s): %s", attempt, exc
@@ -268,11 +237,6 @@ def generate_investigation_explanation(
     try:
         result = GeminiInvestigationResponse.model_validate_json(response.text)
     except ValidationError as exc:
-        # Malformed JSON and schema-invalid JSON both raise pydantic's
-        # ValidationError here (pydantic v2 wraps JSON decode failures into
-        # it too) - never retried in this V1, and never loosened into a
-        # partial/best-effort result: malformed AI output must not fail an
-        # otherwise-complete deterministic investigation.
         logger.warning("Gemini response failed schema validation: %s", exc)
         raise GeminiUnavailableError(str(exc)) from exc
     processing_seconds = perf_counter() - processing_start

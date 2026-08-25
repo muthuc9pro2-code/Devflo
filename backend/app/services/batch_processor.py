@@ -1,5 +1,4 @@
 from collections.abc import Iterable, Iterator
-
 from app.core.processing_config import (
     INGESTION_RAW_BATCH_BYTES,
     INGESTION_RAW_BATCH_ITEMS,

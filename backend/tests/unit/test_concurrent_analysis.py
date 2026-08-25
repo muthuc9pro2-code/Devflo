@@ -25,7 +25,7 @@ from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, User
 from app.services.log_praser import ParsedEvent
 from app.tasks import analysis as analysis_task
-from app.tasks.analysis import _process_artifact, _process_artifact_task
+from app.tasks.analysis import _process_artifact
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
 

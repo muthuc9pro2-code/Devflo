@@ -149,17 +149,7 @@ def stream_otlp_events(*, file_path: str, source_file: str, skip_records: int=0,
                         span_scope = str(value)
     except ijson.JSONError:
         if not emitted:
-            # Nothing was ever successfully extracted - preserve the
-            # existing behavior of surfacing the error (same as before this
-            # fix; no established generic-text fallback exists for OTLP).
             raise
-        # Records before the truncation/corruption point already streamed
-        # through and were persisted by the caller's per-batch commits - a
-        # malformed tail (e.g. an upload cut off mid-document) must not
-        # discard them, nor fail this artifact's *entire analysis* (any
-        # exception here propagates out of _process_artifact_task and marks
-        # the whole analysis failed, not just this one artifact). Stop
-        # cleanly instead, mirroring _stream_json_document's same fix.
         logger.warning(
             'Malformed/truncated OTLP document %s after %s record(s) '
             'already extracted; stopping here instead of discarding them',

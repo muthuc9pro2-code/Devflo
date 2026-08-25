@@ -7,8 +7,6 @@ happen to exercise: irregular whitespace, different field order, unknown
 extra fields mixed in with real ones, and mixed good/bad records in one
 artifact.
 """
-from datetime import datetime, timezone
-
 from app.services.artifact_detector import ArtifactFormat
 from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.diagnostic_parser import normalize_structured_event, normalize_text_event

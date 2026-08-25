@@ -1,6 +1,5 @@
 import re
 from hashlib import sha256
-
 from app.core.processing_config import MAX_FINGERPRINT_LENGTH
 from app.services.log_praser import ParsedEvent
 
