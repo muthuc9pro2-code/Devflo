@@ -5,6 +5,12 @@ class Settings(BaseSettings):
     APP_VERSION: str 
     DATABASE_URL: str
 
+    REDIS_BROKER_URL: str
+    REDIS_RESULT_BACKEND_URL: str
+    REDIS_EVENTS_URL: str
+
+    COOKIE_SECURE: bool = False
+
     AWS_REGION: str
     SES_FROM_EMAIL: str
     AWS_ACCESS_KEY_ID: str
@@ -19,7 +25,7 @@ class Settings(BaseSettings):
     FRONTEND_URL: str
 
     GEMINI_API_KEY: str
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
     model_config = SettingsConfigDict(
         env_file=".env",

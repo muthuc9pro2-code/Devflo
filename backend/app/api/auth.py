@@ -14,6 +14,7 @@ from fastapi import Response, Request
 import jwt
 from app.core.security import ALGORITHM, SECRET_KEY, create_password_reset_token, hash_password, decode_password_reset_token
 from app.models.user import User
+from app.core.config import Settings
 from app.api.dependencies import get_current_verified_user
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -86,10 +87,6 @@ def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
     if not user.is_verified:
         user.is_verified = True
         db.commit()
-
-    # Same cookie/token mechanism as /auth/login, so a successful
-    # verification leaves the user in the same authenticated state a normal
-    # login would - no separate auth system, no token in the redirect URL.
     access_token = create_access_token(user.email)
     refresh_token = create_refresh_token(user.email)
 
@@ -97,9 +94,9 @@ def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=False,
+        secure=Settings.COOKIE_SECURE,
         samesite="lax",
-        max_age=30 * 60,
+        max_age=Settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
 
     response.set_cookie(
@@ -108,7 +105,7 @@ def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
         httponly=True,
         secure=False,
         samesite="lax",
-        max_age=7 * 24 * 60 * 60,
+        max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
 
     return {"message": "Email verified successfully"}
