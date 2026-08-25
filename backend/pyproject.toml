@@ -1,7 +1,7 @@
 [project]
 name = "devflo"
 version = "0.1.0"
-description = "aah random project poped in my mind, which is built with FastAPI."
+description = "Developer incident analysis platform for bounded diagnostic ingestion, deterministic correlation, and LLM-assisted explanation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -85,6 +85,14 @@ logger = logging.getLogger(__name__)
 # count before the next artifact's band begins.
 _GLOBAL_LINE_NUMBER_STRIDE = 10**9
 
+
+def _safe_rollback(db: Session) -> None:
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning("db.rollback() failed after a prior exception", exc_info=True)
+
+
 # --- Cancellation -----------------------------------------------------
 #
 # DB is authoritative for cancellation, exactly like everything else in
@@ -222,7 +230,7 @@ def _bump_processing_heartbeat(db: Session, analysis_id: int) -> None:
         )
         db.commit()
     except Exception:
-        db.rollback()
+        _safe_rollback(db)
         logger.debug(
             "Analysis %s | heartbeat write failed", analysis_id, exc_info=True
         )
@@ -339,7 +347,7 @@ def process_analysis(analysis_id: int):
             )
             return
     except Exception:
-        db.rollback()
+        _safe_rollback(db)
         logger.exception("Analysis %s processing failed", analysis_id)
         _mark_analysis_failed(db, analysis_id)
         raise
@@ -486,7 +494,7 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
         # Unknown/internal failures remain fatal. Do not turn DB errors,
         # programming bugs, changed-on-disk artifacts, or broken invariants
         # into fake successful artifact outcomes.
-        db.rollback()
+        _safe_rollback(db)
         logger.exception(
             "Analysis %s | artifact %s processing failed",
             analysis_id,
@@ -613,7 +621,7 @@ def _prepare_source_task(analysis_id: int) -> None:
     except Exception:
         # Infrastructure/programming failures remain fatal; only controlled
         # source-input/acquisition/resource failures degrade gracefully.
-        db.rollback()
+        _safe_rollback(db)
         logger.exception("Analysis %s | source preparation failed", analysis_id)
         _mark_analysis_failed(db, analysis_id)
         raise
@@ -1259,7 +1267,7 @@ def _finalize_analysis_task(results, analysis_id: int, dispatch_start: float | N
             )
 
     except Exception:
-        db.rollback()
+        _safe_rollback(db)
         logger.exception("Analysis %s finalize processing failed", analysis_id)
         _mark_analysis_failed(db, analysis_id)
         raise
@@ -2012,7 +2020,7 @@ def _mark_analysis_failed(db: Session, analysis_id: int) -> None:
         analysis.status = "failed"
         db.commit()
     except Exception:
-        db.rollback()
+        _safe_rollback(db)
         logger.exception("Could not mark analysis %s as failed", analysis_id)
 
 
@@ -2351,7 +2359,7 @@ def recover_stale_analyses() -> int:
             if result.rowcount == 1:
                 claimed_ids.append(analysis_id)
     except Exception:
-        db.rollback()
+        _safe_rollback(db)
         logger.exception("Stale analysis recovery scan failed")
         raise
     finally:

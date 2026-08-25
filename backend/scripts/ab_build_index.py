@@ -6,6 +6,7 @@ _extract_zip regression - do not trust cProfile alone here either).
 import os
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from app.services.source_index import (  # noqa: E402
     SourceIndex,
 )
 
-SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ROOT = SCRATCH / "synthetic_extracted"
 
 

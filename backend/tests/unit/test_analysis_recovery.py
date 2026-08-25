@@ -636,6 +636,76 @@ def test_artifact_left_processing_after_a_db_outage_is_recoverable_with_checkpoi
     assert delayed == [analysis_id]
 
 
+def test_safe_rollback_swallows_a_failing_rollback():
+    db = Mock()
+    db.rollback.side_effect = OperationalError(
+        "ROLLBACK", {}, Exception("(2003, \"Can't connect to MySQL server\")")
+    )
+
+    analysis_task._safe_rollback(db)  # must not raise
+
+    db.rollback.assert_called_once()
+
+
+def test_a_failing_rollback_does_not_mask_the_original_db_failure(monkeypatch):
+    """Same shape as test_artifact_left_processing_after_a_db_outage_is_
+    recoverable_with_checkpoint_intact above, but the connection is dead
+    enough that db.rollback() itself also raises - the ORIGINAL
+    OperationalError (from _process_artifact) must still be what
+    propagates out of _process_artifact_task, not a rollback-originated
+    exception, and durable state must be left exactly as untouched."""
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    artifact = _artifact(
+        db, analysis, status="processing", processed_bytes=500, last_processed_line=10,
+    )
+    db.add(Evidence(
+        analysis_id=analysis.id, artifact_id=artifact.id, correlation_key="k1",
+        fingerprint="fp1", first_line_number=1, last_line_number=1,
+        severity="ERROR", event_type="exception",
+    ))
+    db.commit()
+    analysis_id = analysis.id
+    artifact_id = artifact.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+
+    original_error = OperationalError(
+        "SELECT ...", {}, Exception("(2003, \"Can't connect to MySQL server on 'db:3306'\")"),
+    )
+
+    def raise_original_error(**kwargs):
+        raise original_error
+
+    monkeypatch.setattr(analysis_task, "_process_artifact", raise_original_error)
+    monkeypatch.setattr(
+        db, "rollback",
+        Mock(side_effect=OperationalError("ROLLBACK", {}, Exception("connection gone"))),
+    )
+    monkeypatch.setattr(analysis_task, "_mark_analysis_failed", lambda db_arg, aid: None)
+
+    with pytest.raises(OperationalError) as exc_info:
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+
+    assert exc_info.value is original_error  # not the rollback's own exception
+    db.rollback.assert_called_once()
+
+    # Durable state is untouched - no fake completed/failed/resource_limited
+    # outcome, no destroyed checkpoint/Evidence.
+    engine = db.get_bind()
+    verify_db = sessionmaker(bind=engine)()
+    reloaded = verify_db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.status == "processing"
+    reloaded_artifact = (
+        verify_db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
+    )
+    assert reloaded_artifact.status == "processing"
+    assert reloaded_artifact.processed_bytes == 500
+    assert reloaded_artifact.last_processed_line == 10
+    assert verify_db.query(Evidence).filter(Evidence.analysis_id == analysis_id).count() == 1
+    verify_db.close()
+
+
 # --- Gemini/finalize heartbeat coverage (no client-side timeout on --------
 # generate_investigation_explanation) ---------------------------------------
 

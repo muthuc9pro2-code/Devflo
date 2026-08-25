@@ -1,0 +1,83 @@
+import { useState } from 'react'
+import { forgotPassword } from '../api/auth'
+import { useRouter } from '../router/useRouter'
+import { ApiError } from '../api/client'
+
+const DEFAULT_MESSAGE = 'If an account exists for this email, a password reset link has been sent.'
+
+export default function ForgotPasswordPage() {
+  const { navigate } = useRouter()
+  const [email, setEmail] = useState('')
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [message, setMessage] = useState('')
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    setError('')
+    setSubmitting(true)
+    try {
+      const result = await forgotPassword({ email })
+      setMessage(result?.message || DEFAULT_MESSAGE)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (message) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <h1 className="brand">Devflo</h1>
+          <p className="status-ok" role="status">Check your email</p>
+          <p className="tagline">{message}</p>
+          <button className="btn-primary" type="button" onClick={() => navigate('/login')}>
+            Back to login
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="auth-shell">
+      <form className="auth-card" onSubmit={handleSubmit}>
+        <h1 className="brand">Devflo</h1>
+        <p className="tagline">Enter your email and we&apos;ll send you a password reset link.</p>
+
+        {error && <div className="alert-error" role="alert">{error}</div>}
+
+        <label className="field">
+          <span>Email</span>
+          <input
+            name="email"
+            type="email"
+            required
+            autoComplete="email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+          />
+        </label>
+
+        <button className="btn-primary" type="submit" disabled={submitting}>
+          {submitting ? 'Sending…' : 'Send reset link'}
+        </button>
+
+        <p className="switch-link">
+          Remembered your password?{' '}
+          <a
+            href="/login"
+            onClick={(event) => {
+              event.preventDefault()
+              navigate('/login')
+            }}
+          >
+            Sign in
+          </a>
+        </p>
+      </form>
+    </div>
+  )
+}

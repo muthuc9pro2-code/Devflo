@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from app.models import Analysis, AnalysisArtifact, Evidence, User  # noqa: E402
 import app.tasks.analysis as analysis_task  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
-SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ZIP_SOURCE = SCRATCH / "synthetic_source.zip"
 GITHUB_URL = "https://github.com/pallets/flask.git"
 

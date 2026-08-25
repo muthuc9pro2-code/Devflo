@@ -5,10 +5,16 @@ import { ApiError } from '../api/client'
 
 export default function LoginPage() {
   const { login } = useAuth()
-  const { navigate } = useRouter()
+  const { search, navigate } = useRouter()
   const [form, setForm] = useState({ email: '', password: '' })
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  // Set by ResetPasswordPage's navigate('/login?reset=success') - the same
+  // search-param convention VerifyEmailPage's ?token= already uses to pass
+  // page-local state through the URL, rather than a new global mechanism.
+  const [resetSuccess, setResetSuccess] = useState(
+    () => new URLSearchParams(search).get('reset') === 'success',
+  )
 
   const handleChange = (event) => {
     const { name, value } = event.target
@@ -18,6 +24,7 @@ export default function LoginPage() {
   const handleSubmit = async (event) => {
     event.preventDefault()
     setError('')
+    setResetSuccess(false)
     setSubmitting(true)
     try {
       await login(form)
@@ -35,6 +42,11 @@ export default function LoginPage() {
         <h1 className="brand">Devflo</h1>
         <p className="tagline">Sign in to start an investigation</p>
 
+        {resetSuccess && !error && (
+          <div className="alert-success" role="status">
+            Password reset successfully. Sign in with your new password.
+          </div>
+        )}
         {error && <div className="alert-error" role="alert">{error}</div>}
 
         <label className="field">
@@ -60,6 +72,18 @@ export default function LoginPage() {
             onChange={handleChange}
           />
         </label>
+
+        <p className="forgot-password-link">
+          <a
+            href="/forgot-password"
+            onClick={(event) => {
+              event.preventDefault()
+              navigate('/forgot-password')
+            }}
+          >
+            Forgot password?
+          </a>
+        </p>
 
         <button className="btn-primary" type="submit" disabled={submitting}>
           {submitting ? 'Signing in…' : 'Sign in'}

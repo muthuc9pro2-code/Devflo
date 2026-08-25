@@ -10,6 +10,7 @@ from __future__ import annotations
 import shutil
 import statistics
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -20,7 +21,7 @@ from app.services.log_praser import ParsedEvent, StackFrame  # noqa: E402
 from app.services.source_archive import _extract_zip, validate_source_zip  # noqa: E402
 from app.services.source_index import build_index, correlate_event  # noqa: E402
 
-SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 REPO_DIR = SCRATCH / "synthetic_repo"
 ZIP_PATH = SCRATCH / "synthetic_source.zip"
 EXTRACT_DIR = SCRATCH / "synthetic_extracted"

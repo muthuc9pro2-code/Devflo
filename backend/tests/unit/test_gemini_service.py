@@ -2,7 +2,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from google.genai import errors as genai_errors
 from app.schemas.gemini import GeminiInvestigationResponse
-from app.services.gemini_service import GeminiUnavailableError, generate_investigation_explanation
+from app.services.gemini_service import (
+    GeminiUnavailableError,
+    _REQUEST_TIMEOUT_SECONDS,
+    generate_investigation_explanation,
+)
 
 _MINIMAL_GEMINI_JSON = (
     '{"title": "t", "summary": "s", "probable_root_causes": [], '
@@ -113,6 +117,32 @@ def test_generate_investigation_explanation_disables_automatic_function_calling(
 
     _, kwargs = generate_content.call_args
     assert kwargs["config"].automatic_function_calling.disable is True
+
+
+def test_generate_investigation_explanation_sets_a_finite_request_timeout():
+    """Without a per-request timeout, a stalled connection can block a
+    Celery worker indefinitely and never reach the retry logic below."""
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation({"analysis_id": 1})
+
+    _, kwargs = generate_content.call_args
+    assert kwargs["config"].http_options.timeout == _REQUEST_TIMEOUT_SECONDS * 1000
+
+
+def test_request_timeout_still_set_after_a_retry(monkeypatch):
+    monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        side_effect=[_server_error(), _mock_response()],
+    ) as generate_content:
+        generate_investigation_explanation({"analysis_id": 1})
+
+    _, kwargs = generate_content.call_args
+    assert kwargs["config"].http_options.timeout == _REQUEST_TIMEOUT_SECONDS * 1000
 
 
 # --- 1/2: 5xx (ServerError) retry policy --------------------------------

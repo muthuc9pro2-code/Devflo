@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -18,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.source_archive import _clone_github  # noqa: E402
 from app.services.source_index import build_index  # noqa: E402
 
-SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 DEST = SCRATCH / "github_bench_clone"
 
 

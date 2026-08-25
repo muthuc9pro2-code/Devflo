@@ -6,6 +6,7 @@ import os
 import shutil
 import statistics
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.source_archive import SourceInputError, _safe_members  # noqa: E402
 
-SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ZIP_PATH = SCRATCH / "synthetic_source.zip"
 
 

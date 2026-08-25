@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 1.5
 
+# Per-attempt network timeout: without this, generate_content() can block
+# indefinitely on a stalled connection and never reach the retry logic
+# above - with Celery concurrency ~2, two such hangs would occupy every
+# worker. HttpOptions.timeout is milliseconds (google-genai SDK).
+_REQUEST_TIMEOUT_SECONDS = 60
+
 _RETRYABLE_CLIENT_ERROR_STATUS_CODES = {429}
 
 
@@ -191,6 +197,7 @@ def generate_investigation_explanation(
         response_mime_type="application/json",
         response_schema=GeminiInvestigationResponse,
         temperature=0.2,
+        http_options=types.HttpOptions(timeout=_REQUEST_TIMEOUT_SECONDS * 1000),
         # Devflo never registers callable tools/functions on this
         # request (no `tools=` above), so the model can never emit a
         # function call for the SDK to automatically dispatch -

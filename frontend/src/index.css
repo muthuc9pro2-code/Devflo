@@ -165,6 +165,16 @@ pre { margin: 0; }
   line-height: 1.5;
 }
 
+.alert-success {
+  border: 1px solid rgba(114, 213, 155, 0.28);
+  border-radius: 9px;
+  padding: 0.75rem 0.9rem;
+  background: var(--success-bg);
+  color: var(--success);
+  font-size: 0.83rem;
+  line-height: 1.5;
+}
+
 .spinner {
   width: 15px;
   height: 15px;
@@ -283,12 +293,20 @@ pre { margin: 0; }
   text-align: center;
 }
 
-.switch-link a {
+.switch-link a,
+.forgot-password-link a {
   color: var(--accent);
   text-decoration: none;
 }
 
-.switch-link a:hover { text-decoration: underline; }
+.switch-link a:hover,
+.forgot-password-link a:hover { text-decoration: underline; }
+
+.forgot-password-link {
+  margin: -0.35rem 0 0;
+  font-size: 0.78rem;
+  text-align: right;
+}
 
 .status-ok,
 .status-error {

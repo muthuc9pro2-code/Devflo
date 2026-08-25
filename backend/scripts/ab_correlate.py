@@ -4,6 +4,7 @@ process so system load drift cancels out.
 """
 import statistics
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from app.services.log_praser import ParsedEvent, StackFrame  # noqa: E402
 from app.services.source_index import build_index  # noqa: E402
 import app.services.source_index as si  # noqa: E402
 
-SCRATCH = Path("/tmp/claude-1000/-home-muthu-code-Devflo/3abd434c-c866-4d80-9ffe-ce320c8e1ffa/scratchpad")
+SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ROOT = SCRATCH / "synthetic_extracted"
 
 N_DIRS = 40
