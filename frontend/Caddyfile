@@ -1,5 +1,19 @@
 :80 {
-    root * /srv
-    try_files {path} /index.html
-    file_server
+    handle /auth/* {
+        reverse_proxy api:8000
+    }
+
+    handle /analysis/* {
+        reverse_proxy api:8000
+    }
+
+    handle /analyses/* {
+        reverse_proxy api:8000
+    }
+
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
 }

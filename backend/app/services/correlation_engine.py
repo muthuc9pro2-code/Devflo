@@ -285,13 +285,6 @@ def match_correlation_signals(
             right_value,
         )
 
-    # RESOLVED_IDENTITY is a FALLBACK correlation signal only. resolved_
-    # identity is itself DERIVED from trace_id first, then request_id (see
-    # persist_resolved_identities/persistent_identity_resolver.py) - so a
-    # pair that already shares a real trace_id or request_id would
-    # otherwise receive credit for the SAME underlying identity fact twice
-    # under noisy-OR (once as TRACE_ID/REQUEST_ID above, again here). Only
-    # emit it when neither raw identifier already represents the match.
     if not _shared_value(left.trace_id, right.trace_id) and not _shared_value(
         left.request_id, right.request_id
     ):
