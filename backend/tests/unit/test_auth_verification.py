@@ -13,9 +13,12 @@ from app.core.config import Settings
 from app.core.security import (
     ALGORITHM,
     SECRET_KEY,
+    create_access_token,
+    create_email_verification_token,
     create_password_reset_token,
     create_verification_handoff_token,
     decode_verification_handoff_token,
+    hash_password,
 )
 from app.schemas.user import ForgotPasswordRequest, ResetPasswordRequest, UserRegister
 from app.services.email import send_verification_email
@@ -85,7 +88,12 @@ def test_registration_sets_secure_scoped_http_only_handoff_cookie(
 
 
 def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeypatch):
-    existing_user = SimpleNamespace(email="existing@example.com", is_verified=False)
+    existing_password = "existing-password"
+    existing_user = SimpleNamespace(
+        email="existing@example.com",
+        is_verified=False,
+        hashed_password=hash_password(existing_password),
+    )
     send_mock = Mock()
     monkeypatch.setattr(
         auth_api, "get_user_by_email", Mock(return_value=existing_user)
@@ -97,7 +105,7 @@ def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeyp
         user=UserRegister(
             username="ignored_user",
             email=existing_user.email,
-            password="password",
+            password=existing_password,
         ),
         response=response,
         db=Mock(),
@@ -114,6 +122,78 @@ def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeyp
         .split("=", 1)[1]
     )
     assert payload["sub"] == existing_user.email
+
+
+def test_existing_unverified_registration_wrong_password_cannot_get_handoff(
+    monkeypatch,
+):
+    existing_user = SimpleNamespace(
+        email="existing@example.com",
+        is_verified=False,
+        hashed_password=hash_password("existing-password"),
+    )
+    original_account = vars(existing_user).copy()
+    send_mock = Mock()
+    create_user_mock = Mock()
+    db = Mock()
+    monkeypatch.setattr(
+        auth_api, "get_user_by_email", Mock(return_value=existing_user)
+    )
+    monkeypatch.setattr(auth_api, "send_verification_email", send_mock)
+    monkeypatch.setattr(auth_api, "create_user", create_user_mock)
+    response = Response()
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.register(
+            user=UserRegister(
+                username="ignored_user",
+                email=existing_user.email,
+                password="attacker-password",
+            ),
+            response=response,
+            db=db,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "Email already registered"
+    send_mock.assert_not_called()
+    create_user_mock.assert_not_called()
+    assert _cookie_names(response) == set()
+    assert vars(existing_user) == original_account
+    db.commit.assert_not_called()
+
+
+def test_existing_verified_registration_behavior_remains_unchanged(monkeypatch):
+    existing_user = SimpleNamespace(
+        email="verified@example.com",
+        is_verified=True,
+        hashed_password="unused-password-hash",
+    )
+    send_mock = Mock()
+    verify_mock = Mock()
+    monkeypatch.setattr(
+        auth_api, "get_user_by_email", Mock(return_value=existing_user)
+    )
+    monkeypatch.setattr(auth_api, "send_verification_email", send_mock)
+    monkeypatch.setattr(auth_api, "verify_password", verify_mock)
+    response = Response()
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.register(
+            user=UserRegister(
+                username="ignored_user",
+                email=existing_user.email,
+                password="password",
+            ),
+            response=response,
+            db=Mock(),
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "Email already registered"
+    verify_mock.assert_not_called()
+    send_mock.assert_not_called()
+    assert _cookie_names(response) == set()
 
 
 def test_successful_verification_marks_user_verified_without_authenticating(monkeypatch):
@@ -452,6 +532,42 @@ def test_password_reset_backend_behavior_remains_unchanged(monkeypatch):
     hash_mock.assert_called_once_with("new-password")
     assert user.hashed_password == "new-password-hash"
     db.commit.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "token_factory",
+    [
+        create_access_token,
+        create_email_verification_token,
+        create_verification_handoff_token,
+    ],
+)
+def test_wrong_jwt_type_cannot_reset_password(token_factory, monkeypatch):
+    user = SimpleNamespace(
+        email="verified@example.com",
+        hashed_password="unchanged-password-hash",
+    )
+    get_user_mock = Mock(return_value=user)
+    hash_mock = Mock(return_value="unexpected-password-hash")
+    db = Mock()
+    monkeypatch.setattr(auth_api, "get_user_by_email", get_user_mock)
+    monkeypatch.setattr(auth_api, "hash_password", hash_mock)
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.reset_password(
+            request=ResetPasswordRequest(
+                token=token_factory(user.email),
+                new_password="new-password",
+            ),
+            db=db,
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "Invalid or expired password reset token"
+    assert user.hashed_password == "unchanged-password-hash"
+    get_user_mock.assert_not_called()
+    hash_mock.assert_not_called()
+    db.commit.assert_not_called()
 
 
 def test_password_reset_email_links_to_frontend_reset_page_not_localhost(monkeypatch):

@@ -15,7 +15,7 @@ from app.core.security import (
 from app.services.email import send_verification_email, send_password_reset_email
 from fastapi import Response, Request
 import jwt
-from app.core.security import ALGORITHM, SECRET_KEY, create_password_reset_token, hash_password, decode_password_reset_token
+from app.core.security import ALGORITHM, SECRET_KEY, create_password_reset_token, hash_password, decode_password_reset_token, verify_password
 from app.models.user import User
 from app.core.config import Settings
 from app.api.dependencies import get_current_verified_user
@@ -50,6 +50,12 @@ def register(
             status_code=409,
             detail="Email already registered"
         )
+
+        if not verify_password(user.password, existing_email.hashed_password):
+            raise HTTPException(
+                status_code=409,
+                detail="Email already registered"
+            )
 
         verification_token = create_email_verification_token(
             existing_email.email
@@ -305,7 +311,7 @@ def reset_password(
 ):
     try:
         payload = decode_password_reset_token(request.token)
-    except jwt.PyJWTError:
+    except (jwt.PyJWTError, ValueError):
         raise HTTPException(
             status_code=400,
             detail="Invalid or expired password reset token",
