@@ -9,6 +9,36 @@ ALGORITHM = "HS256"
 SECRET_KEY = Settings.SECRET_KEY
 ACCESS_TOKEN_EXPIRE_MINUTES = Settings.ACCESS_TOKEN_EXPIRE_MINUTES
 REFRESH_TOKEN_EXPIRE_DAYS = Settings.REFRESH_TOKEN_EXPIRE_DAYS
+VERIFICATION_HANDOFF_EXPIRE_MINUTES = 30
+
+
+def create_verification_handoff_token(email: str) -> str:
+    payload = {
+        "sub": email,
+        "type": "verification_handoff",
+        "exp": datetime.now(UTC)
+        + timedelta(minutes=VERIFICATION_HANDOFF_EXPIRE_MINUTES),
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def decode_verification_handoff_token(token: str) -> dict:
+    payload = jwt.decode(
+        token,
+        SECRET_KEY,
+        algorithms=[ALGORITHM],
+        options={"require": ["sub", "type", "exp"]},
+    )
+
+    if payload.get("type") != "verification_handoff":
+        raise ValueError("Invalid token type")
+
+    return payload
 
 def create_password_reset_token(email: str) -> str:
     payload = {
@@ -95,4 +125,3 @@ def decode_password_reset_token(token: str) -> dict:
 
 def hash_password(plain_password: str) -> str:
     return password_hash.hash(plain_password)
-

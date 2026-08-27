@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { resetPassword } from '../api/auth'
 import { useRouter } from '../router/useRouter'
 import { ApiError } from '../api/client'
@@ -9,6 +9,17 @@ export default function ResetPasswordPage() {
   const [form, setForm] = useState({ newPassword: '', confirmPassword: '' })
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [success, setSuccess] = useState(false)
+
+  useEffect(() => {
+    if (!success) return undefined
+
+    const timeoutId = window.setTimeout(() => {
+      navigate('/login?reset=success', { replace: true })
+    }, 2500)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [navigate, success])
 
   const handleChange = (event) => {
     const { name, value } = event.target
@@ -31,16 +42,33 @@ export default function ResetPasswordPage() {
     setSubmitting(true)
     try {
       await resetPassword({ token, newPassword: form.newPassword })
-      // Reset-password never authenticates the caller (no cookies are set) -
-      // send the user back to the existing login form to sign in normally,
-      // reusing the same search-param convention VerifyEmailPage's ?token=
-      // already establishes for passing page-local state through the URL.
-      navigate('/login?reset=success', { replace: true })
+      setForm({ newPassword: '', confirmPassword: '' })
+      setSuccess(true)
+      navigate('/reset-password', { replace: true })
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (success) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <h1 className="brand">Devflo</h1>
+          <p className="status-ok" role="status">Password reset successfully.</p>
+          <p className="tagline">You can now sign in with your new password.</p>
+          <button
+            className="btn-primary"
+            type="button"
+            onClick={() => navigate('/login?reset=success', { replace: true })}
+          >
+            Continue to sign in
+          </button>
+        </div>
+      </div>
+    )
   }
 
   if (!token) {

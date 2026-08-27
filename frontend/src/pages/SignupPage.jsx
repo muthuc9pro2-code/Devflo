@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { completeVerificationSession } from '../api/auth'
 import { useAuth } from '../context/useAuth'
 import { useRouter } from '../router/useRouter'
 import { ApiError } from '../api/client'
@@ -42,7 +43,7 @@ function validateSignup(form) {
 }
 
 export default function SignupPage() {
-  const { register } = useAuth()
+  const { register, refreshSession } = useAuth()
   const { navigate } = useRouter()
   const [form, setForm] = useState({
     username: '',
@@ -55,7 +56,83 @@ export default function SignupPage() {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [registeredEmail, setRegisteredEmail] = useState(null)
+  const [waitingForVerification, setWaitingForVerification] = useState(false)
+  const [handoffUnavailable, setHandoffUnavailable] = useState(false)
+  const handoffRequestRef = useRef(null)
   const validation = validateSignup(form)
+
+  const checkVerificationSession = useCallback(() => {
+    if (handoffRequestRef.current) return handoffRequestRef.current
+
+    const pending = completeVerificationSession()
+    const tracked = pending.finally(() => {
+      if (handoffRequestRef.current === tracked) handoffRequestRef.current = null
+    })
+    handoffRequestRef.current = tracked
+    return tracked
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    checkVerificationSession()
+      .then(async (result) => {
+        if (cancelled) return
+        if (result.status === 'pending') {
+          setWaitingForVerification(true)
+          return
+        }
+        if (result.status === 'authenticated') {
+          await refreshSession({ throwOnFailure: true })
+          if (!cancelled) navigate('/new', { replace: true })
+        }
+      })
+      .catch((err) => {
+        if (cancelled || (err instanceof ApiError && err.status === 401)) return
+        setError(err instanceof ApiError ? err.message : 'Unable to resume email verification.')
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [checkVerificationSession, navigate, refreshSession])
+
+  useEffect(() => {
+    if (!waitingForVerification) return undefined
+
+    let cancelled = false
+    let timeoutId
+
+    const poll = async () => {
+      try {
+        const result = await checkVerificationSession()
+        if (cancelled) return
+
+        if (result.status === 'authenticated') {
+          await refreshSession({ throwOnFailure: true })
+          if (!cancelled) navigate('/new', { replace: true })
+          return
+        }
+
+        timeoutId = window.setTimeout(poll, 2000)
+      } catch (err) {
+        if (cancelled) return
+        setWaitingForVerification(false)
+        if (err instanceof ApiError && err.status === 401) {
+          setHandoffUnavailable(true)
+          return
+        }
+        setError(err instanceof ApiError ? err.message : 'Unable to check verification status.')
+      }
+    }
+
+    timeoutId = window.setTimeout(poll, 2000)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeoutId)
+    }
+  }, [checkVerificationSession, navigate, refreshSession, waitingForVerification])
 
   const handleChange = (event) => {
     const { name, value } = event.target
@@ -86,7 +163,18 @@ export default function SignupPage() {
         email: form.email,
         password: form.password,
       })
+      const existingHandoffCheck = handoffRequestRef.current
+      if (existingHandoffCheck) {
+        try {
+          await existingHandoffCheck
+        } catch {
+          // A pre-registration "no handoff" result is expected here.
+        }
+      }
+      setError('')
       setRegisteredEmail(result.email)
+      setHandoffUnavailable(false)
+      setWaitingForVerification(true)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
@@ -94,18 +182,25 @@ export default function SignupPage() {
     }
   }
 
-  if (registeredEmail) {
+  if (registeredEmail || waitingForVerification || handoffUnavailable) {
     return (
       <div className="auth-shell">
         <div className="auth-card">
           <h1 className="brand">Devflo</h1>
           <p className="status-ok" role="status">Check your email</p>
           <p className="tagline">
-            We sent a verification link to <strong>{registeredEmail}</strong>. Open it to activate
-            your account and sign in to Devflo automatically.
+            We sent a verification link to{' '}
+            {registeredEmail ? <strong>{registeredEmail}</strong> : 'your email address'}.
+            {' '}Verify your email on any device. This page will continue automatically once
+            verification is complete.
           </p>
+          {handoffUnavailable && (
+            <p className="status-error" role="alert">
+              Automatic continuation has expired. After verifying, sign in manually.
+            </p>
+          )}
           <button className="btn-primary" type="button" onClick={() => navigate('/login')}>
-            Back to login
+            Sign in manually
           </button>
         </div>
       </div>

@@ -34,9 +34,13 @@ export function getMe() {
   return request('/auth/me')
 }
 
-export async function verifyEmail(token) {
-  const result = await request(`/auth/verify-email?token=${encodeURIComponent(token)}`)
-  markSessionEstablished()
+export function verifyEmail(token) {
+  return request(`/auth/verify-email?token=${encodeURIComponent(token)}`)
+}
+
+export async function completeVerificationSession() {
+  const result = await request('/auth/verification-session', { method: 'POST' })
+  if (result.status === 'authenticated') markSessionEstablished()
   return result
 }
 

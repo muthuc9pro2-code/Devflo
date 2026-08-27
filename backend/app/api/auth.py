@@ -8,6 +8,9 @@ from app.core.security import (
     decode_email_verification_token,
     create_access_token,
     create_refresh_token,
+    create_verification_handoff_token,
+    decode_verification_handoff_token,
+    VERIFICATION_HANDOFF_EXPIRE_MINUTES,
 )
 from app.services.email import send_verification_email, send_password_reset_email
 from fastapi import Response, Request
@@ -18,11 +21,25 @@ from app.core.config import Settings
 from app.api.dependencies import get_current_verified_user
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+VERIFICATION_HANDOFF_COOKIE_PATH = "/auth/verification-session"
+
+
+def _set_verification_handoff_cookie(response: Response, email: str) -> None:
+    response.set_cookie(
+        key="verification_handoff",
+        value=create_verification_handoff_token(email),
+        httponly=True,
+        secure=Settings.COOKIE_SECURE,
+        samesite="lax",
+        max_age=VERIFICATION_HANDOFF_EXPIRE_MINUTES * 60,
+        path=VERIFICATION_HANDOFF_COOKIE_PATH,
+    )
 
 
 @router.post("/register", response_model=RegisterResponse)
 def register(
     user: UserRegister,
+    response: Response,
     db: Session = Depends(get_db),
 ):
     existing_email = get_user_by_email(db, user.email)
@@ -41,6 +58,7 @@ def register(
             email=existing_email.email,
             token=verification_token
             )
+        _set_verification_handoff_cookie(response, existing_email.email)
         
         return {
             "message": "Verification email resent. Please verify email.",
@@ -60,6 +78,7 @@ def register(
     send_verification_email(email=user.email, token=verification_token)
 
     created_user = create_user(db, user)
+    _set_verification_handoff_cookie(response, created_user.email)
 
     return {
         "message": "Registration successful. Please verify email.",
@@ -87,6 +106,51 @@ def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
     if not user.is_verified:
         user.is_verified = True
         db.commit()
+
+    return {"message": "Email verified successfully"}
+
+
+@router.post("/verification-session")
+def complete_verification_session(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    handoff_token = request.cookies.get("verification_handoff")
+
+    if not handoff_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Verification handoff unavailable or expired",
+        )
+
+    try:
+        payload = decode_verification_handoff_token(handoff_token)
+    except (jwt.PyJWTError, ValueError):
+        raise HTTPException(
+            status_code=401,
+            detail="Verification handoff unavailable or expired",
+        )
+
+    email = payload.get("sub")
+
+    if not email:
+        raise HTTPException(
+            status_code=401,
+            detail="Verification handoff unavailable or expired",
+        )
+
+    user = get_user_by_email(db, email)
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Verification handoff unavailable or expired",
+        )
+
+    if not user.is_verified:
+        return {"status": "pending"}
+
     access_token = create_access_token(user.email)
     refresh_token = create_refresh_token(user.email)
 
@@ -108,7 +172,15 @@ def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
         max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
 
-    return {"message": "Email verified successfully"}
+    response.delete_cookie(
+        key="verification_handoff",
+        path=VERIFICATION_HANDOFF_COOKIE_PATH,
+        secure=Settings.COOKIE_SECURE,
+        httponly=True,
+        samesite="lax",
+    )
+
+    return {"status": "authenticated"}
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -277,4 +349,3 @@ def get_me(
     current_user: User = Depends(get_current_verified_user)
 ):
     return current_user
-

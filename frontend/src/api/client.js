@@ -40,7 +40,13 @@ async function rawRequest(path, options) {
 
 // Not-authenticated paths where a 401 means "bad credentials", not "expired
 // session" — retrying them via /auth/refresh would be meaningless.
-const NO_REFRESH_RETRY = new Set(['/auth/login', '/auth/logout', '/auth/refresh', '/auth/register'])
+const NO_REFRESH_RETRY = new Set([
+  '/auth/login',
+  '/auth/logout',
+  '/auth/refresh',
+  '/auth/register',
+  '/auth/verification-session',
+])
 
 let refreshPromise = null
 let sessionEpoch = 0
