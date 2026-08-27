@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
     APP_NAME: str 
     APP_VERSION: str 
@@ -11,10 +12,8 @@ class Settings(BaseSettings):
 
     COOKIE_SECURE: bool = False
 
-    AWS_REGION: str
-    SES_FROM_EMAIL: str
-    AWS_ACCESS_KEY_ID: str
-    AWS_SECRET_ACCESS_KEY: str
+    RESEND_API_KEY: str
+    EMAIL_FROM: str
 
     SECRET_KEY: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int
@@ -33,5 +32,3 @@ class Settings(BaseSettings):
     )
 
 Settings = Settings()
-
-

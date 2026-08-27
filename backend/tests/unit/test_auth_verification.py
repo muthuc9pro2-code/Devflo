@@ -103,7 +103,7 @@ def test_verification_email_links_to_the_frontend_verify_page(monkeypatch):
     host, and not directly at the backend API."""
     sent = {}
     monkeypatch.setattr(
-        "app.services.email.send_ses_email",
+        "app.services.email.send_verification_email_message",
         lambda to_email, verification_url: sent.update(url=verification_url),
     )
 
@@ -121,15 +121,15 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
     send_password_reset_email(...) without it being imported/defined
     anywhere, so a real request would fail at runtime with a NameError.
     This exercises the REAL call chain (auth.py -> app.services.email ->
-    app.services.email_service) down to the SES boundary - only
-    ses_client.send_email itself is mocked, proving every name in between
+    app.services.email_service) down to the Resend boundary - only
+    resend.Emails.send itself is mocked, proving every name in between
     actually resolves."""
     user = SimpleNamespace(email="verified@example.com", is_verified=True)
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     sent = {}
     monkeypatch.setattr(
-        "app.services.email_service.ses_client.send_email",
-        lambda **kwargs: sent.update(kwargs) or {"MessageId": "fake"},
+        "app.services.email_service.resend.Emails.send",
+        lambda params: sent.update(params) or {"id": "fake"},
     )
 
     result = auth_api.forgot_password(
@@ -142,9 +142,10 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
             "a password reset link has been sent."
         )
     }
-    assert sent["Destination"] == {"ToAddresses": [user.email]}
-    assert sent["Message"]["Subject"]["Data"] != "Verify your Devflo account"
-    reset_body = sent["Message"]["Body"]["Text"]["Data"]
+    assert sent["to"] == [user.email]
+    assert sent["subject"] == "Reset your Devflo password"
+    assert sent["subject"] != "Verify your Devflo account"
+    reset_body = sent["text"]
     assert f"{Settings.FRONTEND_URL}/reset-password?token=" in reset_body
     assert "localhost:3000" not in reset_body
 
@@ -215,7 +216,7 @@ def test_password_reset_email_links_to_frontend_reset_page_not_localhost(monkeyp
 
     sent = {}
     monkeypatch.setattr(
-        "app.services.email.send_ses_password_reset_email",
+        "app.services.email.send_password_reset_email_message",
         lambda to_email, reset_url: sent.update(url=reset_url),
     )
 
