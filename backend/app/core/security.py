@@ -40,10 +40,11 @@ def decode_verification_handoff_token(token: str) -> dict:
 
     return payload
 
-def create_password_reset_token(email: str) -> str:
+def create_password_reset_token(email: str, token_version: int) -> str:
     payload = {
         "sub": email,
         "type": "password_reset",
+        "ver": token_version,
         "exp": datetime.now(UTC)
         + timedelta(minutes=Settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES),
     }
@@ -84,10 +85,11 @@ def verify_password(
         hashed_password
     )
 
-def create_access_token(email: str) -> str:
+def create_access_token(email: str, token_version: int) -> str:
     payload = {
         "sub": email,
         "type": "access",
+        "ver": token_version,
         "exp": datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     }
 
@@ -97,10 +99,11 @@ def create_access_token(email: str) -> str:
         algorithm=ALGORITHM
     )
 
-def create_refresh_token(email: str) -> str:
+def create_refresh_token(email: str, token_version: int) -> str:
     payload = {
         "sub": email,
         "type": "refresh",
+        "ver": token_version,
         "exp": datetime.now(UTC) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     }
 

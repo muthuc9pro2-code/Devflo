@@ -53,6 +53,14 @@ def get_current_user(
             detail="User not found"
         )
 
+    token_version = payload.get("ver")
+
+    if type(token_version) is not int or token_version != user.token_version:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid access token"
+        )
+
     return user
 
 def get_current_verified_user(

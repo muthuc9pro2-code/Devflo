@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { forgotPassword } from '../api/auth'
 import { useRouter } from '../router/useRouter'
 import { ApiError } from '../api/client'
 
 const DEFAULT_MESSAGE = 'If an account exists for this email, a password reset link has been sent.'
+const AUTH_EVENTS_CHANNEL = 'devflo-auth-events'
 
 export default function ForgotPasswordPage() {
   const { navigate } = useRouter()
@@ -11,6 +12,29 @@ export default function ForgotPasswordPage() {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [message, setMessage] = useState('')
+  const [passwordChanged, setPasswordChanged] = useState(false)
+  const awaitingReset = useRef(false)
+
+  useEffect(() => {
+    if (typeof window.BroadcastChannel !== 'function') return undefined
+
+    let channel
+    try {
+      channel = new window.BroadcastChannel(AUTH_EVENTS_CHANNEL)
+      channel.onmessage = (event) => {
+        if (awaitingReset.current && event.data?.type === 'password-reset-success') {
+          setPasswordChanged(true)
+        }
+      }
+    } catch {
+      return undefined
+    }
+
+    return () => {
+      channel.onmessage = null
+      channel.close()
+    }
+  }, [])
 
   const handleSubmit = async (event) => {
     event.preventDefault()
@@ -18,6 +42,7 @@ export default function ForgotPasswordPage() {
     setSubmitting(true)
     try {
       const result = await forgotPassword({ email })
+      awaitingReset.current = true
       setMessage(result?.message || DEFAULT_MESSAGE)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
@@ -31,8 +56,10 @@ export default function ForgotPasswordPage() {
       <div className="auth-shell">
         <div className="auth-card">
           <h1 className="brand">Devflo</h1>
-          <p className="status-ok" role="status">Check your email</p>
-          <p className="tagline">{message}</p>
+          <p className="status-ok" role="status">
+            {passwordChanged ? 'Password successfully changed.' : 'Check your email'}
+          </p>
+          {!passwordChanged && <p className="tagline">{message}</p>}
           <button className="btn-primary" type="button" onClick={() => navigate('/login')}>
             Back to login
           </button>

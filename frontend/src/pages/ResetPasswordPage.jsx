@@ -1,7 +1,24 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { resetPassword } from '../api/auth'
 import { useRouter } from '../router/useRouter'
 import { ApiError } from '../api/client'
+
+const AUTH_EVENTS_CHANNEL = 'devflo-auth-events'
+
+function publishPasswordResetSuccess() {
+  if (typeof window.BroadcastChannel !== 'function') return
+
+  try {
+    const channel = new window.BroadcastChannel(AUTH_EVENTS_CHANNEL)
+    try {
+      channel.postMessage({ type: 'password-reset-success' })
+    } finally {
+      channel.close()
+    }
+  } catch {
+    // Same-browser notification is optional UX; reset success still stands.
+  }
+}
 
 export default function ResetPasswordPage() {
   const { search, navigate } = useRouter()
@@ -10,16 +27,6 @@ export default function ResetPasswordPage() {
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [success, setSuccess] = useState(false)
-
-  useEffect(() => {
-    if (!success) return undefined
-
-    const timeoutId = window.setTimeout(() => {
-      navigate('/login?reset=success', { replace: true })
-    }, 2500)
-
-    return () => window.clearTimeout(timeoutId)
-  }, [navigate, success])
 
   const handleChange = (event) => {
     const { name, value } = event.target
@@ -45,6 +52,7 @@ export default function ResetPasswordPage() {
       setForm({ newPassword: '', confirmPassword: '' })
       setSuccess(true)
       navigate('/reset-password', { replace: true })
+      publishPasswordResetSuccess()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
@@ -58,14 +66,6 @@ export default function ResetPasswordPage() {
         <div className="auth-card">
           <h1 className="brand">Devflo</h1>
           <p className="status-ok" role="status">Password reset successfully.</p>
-          <p className="tagline">You can now sign in with your new password.</p>
-          <button
-            className="btn-primary"
-            type="button"
-            onClick={() => navigate('/login?reset=success', { replace: true })}
-          >
-            Continue to sign in
-          </button>
         </div>
       </div>
     )

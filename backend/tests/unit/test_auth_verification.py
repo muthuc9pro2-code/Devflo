@@ -244,7 +244,11 @@ def test_verification_session_pending_does_not_set_authentication_cookies(monkey
 def test_verified_handoff_authenticates_original_browser_and_deletes_cookie(
     monkeypatch,
 ):
-    user = SimpleNamespace(email="verified@example.com", is_verified=True)
+    user = SimpleNamespace(
+        email="verified@example.com",
+        is_verified=True,
+        token_version=7,
+    )
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     response = Response()
 
@@ -266,8 +270,12 @@ def test_verified_handoff_authenticates_original_browser_and_deletes_cookie(
     }
     access_token = _cookie_header(response, "access_token").split(";", 1)[0].split("=", 1)[1]
     refresh_token = _cookie_header(response, "refresh_token").split(";", 1)[0].split("=", 1)[1]
-    assert jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])["type"] == "access"
-    assert jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])["type"] == "refresh"
+    access_payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM])
+    refresh_payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+    assert access_payload["type"] == "access"
+    assert access_payload["ver"] == user.token_version
+    assert refresh_payload["type"] == "refresh"
+    assert refresh_payload["ver"] == user.token_version
 
     deleted_handoff = _cookie_header(response, "verification_handoff").lower()
     assert "max-age=0" in deleted_handoff
@@ -426,7 +434,11 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
     app.services.email_service) down to the Resend boundary - only
     resend.Emails.send itself is mocked, proving every name in between
     actually resolves."""
-    user = SimpleNamespace(email="verified@example.com", is_verified=True)
+    user = SimpleNamespace(
+        email="verified@example.com",
+        is_verified=True,
+        token_version=3,
+    )
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     sent = {}
     monkeypatch.setattr(
@@ -453,7 +465,11 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
 
 
 def test_forgot_password_reset_token_is_a_real_password_reset_token(monkeypatch):
-    user = SimpleNamespace(email="verified@example.com", is_verified=True)
+    user = SimpleNamespace(
+        email="verified@example.com",
+        is_verified=True,
+        token_version=3,
+    )
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     captured = {}
     monkeypatch.setattr(
@@ -467,6 +483,7 @@ def test_forgot_password_reset_token_is_a_real_password_reset_token(monkeypatch)
     payload = jwt.decode(captured["token"], SECRET_KEY, algorithms=[ALGORITHM])
     assert payload["sub"] == user.email
     assert payload["type"] == "password_reset"
+    assert payload["ver"] == user.token_version
 
 
 def test_forgot_password_unknown_email_sends_nothing_but_same_message(monkeypatch):
@@ -510,19 +527,25 @@ def test_forgot_password_unverified_user_sends_nothing_but_same_message(monkeypa
     send_mock.assert_not_called()
 
 
-def test_password_reset_backend_behavior_remains_unchanged(monkeypatch):
+def test_password_reset_replaces_hash_and_increments_version_atomically(monkeypatch):
     user = SimpleNamespace(
         email="verified@example.com",
         hashed_password="old-password-hash",
+        token_version=4,
     )
     hash_mock = Mock(return_value="new-password-hash")
     db = Mock()
-    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    db.commit.side_effect = lambda: (
+        user.hashed_password == "new-password-hash"
+        and user.token_version == 5
+    ) or pytest.fail("password hash and token version were not updated before commit")
     monkeypatch.setattr(auth_api, "hash_password", hash_mock)
+    locked_query = db.query.return_value.filter.return_value.with_for_update.return_value
+    locked_query.first.return_value = user
 
     result = auth_api.reset_password(
         request=ResetPasswordRequest(
-            token=create_password_reset_token(user.email),
+            token=create_password_reset_token(user.email, user.token_version),
             new_password="new-password",
         ),
         db=db,
@@ -531,13 +554,15 @@ def test_password_reset_backend_behavior_remains_unchanged(monkeypatch):
     assert result == {"message": "Password reset successfully"}
     hash_mock.assert_called_once_with("new-password")
     assert user.hashed_password == "new-password-hash"
+    assert user.token_version == 5
+    db.query.return_value.filter.return_value.with_for_update.assert_called_once_with()
     db.commit.assert_called_once()
 
 
 @pytest.mark.parametrize(
     "token_factory",
     [
-        create_access_token,
+        pytest.param(lambda email: create_access_token(email, 0), id="access"),
         create_email_verification_token,
         create_verification_handoff_token,
     ],

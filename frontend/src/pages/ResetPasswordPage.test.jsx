@@ -13,6 +13,17 @@ vi.mock('../router/useRouter', () => ({
 
 import ResetPasswordPage from './ResetPasswordPage'
 
+class FakeBroadcastChannel {
+  static instances = []
+
+  constructor(name) {
+    this.name = name
+    this.postMessage = vi.fn()
+    this.close = vi.fn()
+    FakeBroadcastChannel.instances.push(this)
+  }
+}
+
 async function submitPasswordReset() {
   fireEvent.change(screen.getByLabelText(/^New password/), {
     target: { value: 'new-password' },
@@ -28,59 +39,55 @@ describe('ResetPasswordPage success state', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.clearAllMocks()
+    FakeBroadcastChannel.instances = []
+    window.BroadcastChannel = FakeBroadcastChannel
     mocks.resetPassword.mockResolvedValue({ message: 'Password reset successfully' })
   })
 
   afterEach(() => {
     vi.useRealTimers()
+    delete window.BroadcastChannel
   })
 
-  it('shows success, removes the token URL, and redirects after 2.5 seconds', async () => {
+  it('shows only stable success content, removes the token URL, and never redirects', async () => {
+    render(<ResetPasswordPage />)
+    await submitPasswordReset()
+
+    expect(screen.getByRole('heading', { name: 'Devflo' })).toBeTruthy()
+    expect(screen.getByText('Password reset successfully.')).toBeTruthy()
+    expect(screen.queryByRole('button')).toBeNull()
+    expect(screen.queryByText(/sign in/i)).toBeNull()
+    expect(mocks.navigate).toHaveBeenCalledTimes(1)
+    expect(mocks.navigate).toHaveBeenCalledWith('/reset-password', { replace: true })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+    expect(mocks.navigate).toHaveBeenCalledTimes(1)
+  })
+
+  it('emits only the non-sensitive reset-success event and closes the channel', async () => {
+    render(<ResetPasswordPage />)
+    await submitPasswordReset()
+
+    expect(FakeBroadcastChannel.instances).toHaveLength(1)
+    const channel = FakeBroadcastChannel.instances[0]
+    expect(channel.name).toBe('devflo-auth-events')
+    expect(channel.postMessage).toHaveBeenCalledWith({ type: 'password-reset-success' })
+    const event = channel.postMessage.mock.calls[0][0]
+    expect(Object.keys(event)).toEqual(['type'])
+    expect(JSON.stringify(event)).not.toMatch(/email|token|jwt|user|cookie/i)
+    expect(event).not.toHaveProperty('password')
+    expect(channel.close).toHaveBeenCalledOnce()
+  })
+
+  it('still completes normally when BroadcastChannel is unavailable', async () => {
+    delete window.BroadcastChannel
+
     render(<ResetPasswordPage />)
     await submitPasswordReset()
 
     expect(screen.getByText('Password reset successfully.')).toBeTruthy()
-    expect(screen.getByText('You can now sign in with your new password.')).toBeTruthy()
     expect(mocks.navigate).toHaveBeenCalledWith('/reset-password', { replace: true })
-    expect(mocks.navigate).not.toHaveBeenCalledWith('/login?reset=success', {
-      replace: true,
-    })
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(2499)
-    })
-    expect(mocks.navigate).not.toHaveBeenCalledWith('/login?reset=success', {
-      replace: true,
-    })
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1)
-    })
-    expect(mocks.navigate).toHaveBeenCalledWith('/login?reset=success', {
-      replace: true,
-    })
-  })
-
-  it('clears the redirect timer on unmount', async () => {
-    const { unmount } = render(<ResetPasswordPage />)
-    await submitPasswordReset()
-    unmount()
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(2500)
-    })
-    expect(mocks.navigate).not.toHaveBeenCalledWith('/login?reset=success', {
-      replace: true,
-    })
-  })
-
-  it('allows an immediate manual continuation to sign in', async () => {
-    render(<ResetPasswordPage />)
-    await submitPasswordReset()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Continue to sign in' }))
-    expect(mocks.navigate).toHaveBeenCalledWith('/login?reset=success', {
-      replace: true,
-    })
   })
 })

@@ -157,8 +157,8 @@ def complete_verification_session(
     if not user.is_verified:
         return {"status": "pending"}
 
-    access_token = create_access_token(user.email)
-    refresh_token = create_refresh_token(user.email)
+    access_token = create_access_token(user.email, user.token_version)
+    refresh_token = create_refresh_token(user.email, user.token_version)
 
     response.set_cookie(
         key="access_token",
@@ -199,8 +199,14 @@ def login(
         db=db, email=user.email, password=user.password
     )
 
-    access_token = create_access_token(authenticated_user.email)
-    refresh_token = create_refresh_token(authenticated_user.email)
+    access_token = create_access_token(
+        authenticated_user.email,
+        authenticated_user.token_version,
+    )
+    refresh_token = create_refresh_token(
+        authenticated_user.email,
+        authenticated_user.token_version,
+    )
 
     response.set_cookie(
         key="access_token",
@@ -257,8 +263,16 @@ def refresh_token(request: Request, response: Response, db: Session = Depends(ge
             detail="User not found"
         )
 
-    new_access_token = create_access_token(email)
-    new_refresh_token = create_refresh_token(email)
+    token_version = payload.get("ver")
+
+    if type(token_version) is not int or token_version != user.token_version:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid refresh token",
+        )
+
+    new_access_token = create_access_token(user.email, user.token_version)
+    new_refresh_token = create_refresh_token(user.email, user.token_version)
 
     response.set_cookie(
         key="access_token",
@@ -290,7 +304,7 @@ def forgot_password(
     user = get_user_by_email(db, request.email)
 
     if user and user.is_verified:
-        reset_token = create_password_reset_token(user.email)
+        reset_token = create_password_reset_token(user.email, user.token_version)
 
         send_password_reset_email(
             email=user.email,
@@ -318,14 +332,20 @@ def reset_password(
         )
 
     email = payload.get("sub")
+    token_version = payload.get("ver")
 
-    if not email:
+    if not email or type(token_version) is not int:
         raise HTTPException(
             status_code=400,
-            detail="Invalid password reset token",
+            detail="Invalid or expired password reset token",
         )
 
-    user = get_user_by_email(db, email)
+    user = (
+        db.query(User)
+        .filter(User.email == email)
+        .with_for_update()
+        .first()
+    )
 
     if not user:
         raise HTTPException(
@@ -333,7 +353,14 @@ def reset_password(
             detail="Invalid password reset token",
         )
 
+    if token_version != user.token_version:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired password reset token",
+        )
+
     user.hashed_password = hash_password(request.new_password)
+    user.token_version += 1
 
     db.commit()
 
