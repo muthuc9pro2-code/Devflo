@@ -87,8 +87,27 @@ def test_registration_preserves_existing_email_validation():
         )
 
 
-@pytest.mark.parametrize("legacy_password", ["1", "x" * 129])
-def test_login_password_validation_remains_permissive(legacy_password):
-    request = UserLogin(email=VALID_EMAIL, password=legacy_password)
+@pytest.mark.parametrize("password", ["1", "x" * 128])
+def test_login_password_accepts_bounded_values(password):
+    request = UserLogin(email=VALID_EMAIL, password=password)
 
-    assert request.password == legacy_password
+    assert request.password == password
+
+
+@pytest.mark.parametrize("password", ["", "x" * 129])
+def test_login_password_rejects_values_outside_bounds(password):
+    with pytest.raises(ValidationError):
+        UserLogin(email=VALID_EMAIL, password=password)
+
+
+@pytest.mark.parametrize("token", ["x", "x" * 4096])
+def test_password_reset_token_accepts_reasonable_jwt_bounds(token):
+    request = ResetPasswordRequest(token=token, new_password="new-password")
+
+    assert request.token == token
+
+
+@pytest.mark.parametrize("token", ["", "x" * 4097])
+def test_password_reset_token_rejects_values_outside_bounds(token):
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest(token=token, new_password="new-password")

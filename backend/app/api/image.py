@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from app.api.dependencies import get_current_verified_user
 from app.core.processing_config import MAX_OCR_IMAGE_BYTES, MEBIBYTE
 from app.schemas.image import ImageInvestigationResponse
 from app.services.image_text_extractor import (
@@ -26,6 +27,7 @@ _ALLOWED_CONTENT_TYPES = {
 @router.post(
     "/extract-text",
     response_model=ImageInvestigationResponse,
+    dependencies=[Depends(get_current_verified_user)],
 )
 async def extract_image_text(
     image: UploadFile = File(...),

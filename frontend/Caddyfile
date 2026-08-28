@@ -1,5 +1,8 @@
 :80 {
     handle /auth/* {
+        request_body {
+            max_size 16KB
+        }
         reverse_proxy api:8000
     }
 

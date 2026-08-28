@@ -23,7 +23,8 @@ def get_current_user(
         payload = jwt.decode(
             access_token,
             SECRET_KEY,
-            algorithms=[ALGORITHM]
+            algorithms=[ALGORITHM],
+            options={"require": ["sub", "type", "ver", "exp"]},
         )
     except jwt.InvalidTokenError:
         raise HTTPException(

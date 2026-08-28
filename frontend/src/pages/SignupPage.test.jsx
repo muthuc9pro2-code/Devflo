@@ -94,6 +94,7 @@ describe('SignupPage verification handoff polling', () => {
       password: 'new-password',
     })
     expect(screen.getByText('new@example.com')).toBeTruthy()
+    expect(screen.queryByDisplayValue('new-password')).toBeNull()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2000)

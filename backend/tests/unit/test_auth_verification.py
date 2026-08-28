@@ -60,7 +60,7 @@ def test_registration_sets_secure_scoped_http_only_handoff_cookie(
         email="new@example.com",
         password="password",
     )
-    created_user = SimpleNamespace(email=str(request.email))
+    created_user = SimpleNamespace(email=str(request.email), token_version=0)
     monkeypatch.setattr(Settings, "COOKIE_SECURE", cookie_secure)
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
     monkeypatch.setattr(auth_api, "get_user_by_username", Mock(return_value=None))
@@ -83,6 +83,7 @@ def test_registration_sets_secure_scoped_http_only_handoff_cookie(
     payload = decode_verification_handoff_token(encoded_token)
     assert payload["sub"] == created_user.email
     assert payload["type"] == "verification_handoff"
+    assert payload["ver"] == created_user.token_version
     remaining_lifetime = payload["exp"] - datetime.now(UTC).timestamp()
     assert 29 * 60 <= remaining_lifetime <= 30 * 60
 
@@ -93,6 +94,7 @@ def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeyp
         email="existing@example.com",
         is_verified=False,
         hashed_password=hash_password(existing_password),
+        token_version=2,
     )
     send_mock = Mock()
     monkeypatch.setattr(
@@ -122,6 +124,7 @@ def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeyp
         .split("=", 1)[1]
     )
     assert payload["sub"] == existing_user.email
+    assert payload["ver"] == existing_user.token_version
 
 
 def test_existing_unverified_registration_wrong_password_cannot_get_handoff(
@@ -131,6 +134,7 @@ def test_existing_unverified_registration_wrong_password_cannot_get_handoff(
         email="existing@example.com",
         is_verified=False,
         hashed_password=hash_password("existing-password"),
+        token_version=0,
     )
     original_account = vars(existing_user).copy()
     send_mock = Mock()
@@ -168,6 +172,7 @@ def test_existing_verified_registration_behavior_remains_unchanged(monkeypatch):
         email="verified@example.com",
         is_verified=True,
         hashed_password="unused-password-hash",
+        token_version=0,
     )
     send_mock = Mock()
     verify_mock = Mock()
@@ -223,14 +228,21 @@ def test_already_verified_user_revisiting_valid_link_is_idempotent(monkeypatch):
 
 
 def test_verification_session_pending_does_not_set_authentication_cookies(monkeypatch):
-    user = SimpleNamespace(email="pending@example.com", is_verified=False)
+    user = SimpleNamespace(
+        email="pending@example.com",
+        is_verified=False,
+        token_version=0,
+    )
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     response = Response()
 
     result = auth_api.complete_verification_session(
         request=SimpleNamespace(
             cookies={
-                "verification_handoff": create_verification_handoff_token(user.email)
+                "verification_handoff": create_verification_handoff_token(
+                    user.email,
+                    user.token_version,
+                )
             }
         ),
         response=response,
@@ -255,7 +267,10 @@ def test_verified_handoff_authenticates_original_browser_and_deletes_cookie(
     result = auth_api.complete_verification_session(
         request=SimpleNamespace(
             cookies={
-                "verification_handoff": create_verification_handoff_token(user.email)
+                "verification_handoff": create_verification_handoff_token(
+                    user.email,
+                    user.token_version,
+                )
             }
         ),
         response=response,
@@ -282,12 +297,76 @@ def test_verified_handoff_authenticates_original_browser_and_deletes_cookie(
     assert "path=/auth/verification-session" in deleted_handoff
 
 
+def test_stale_verification_handoff_cannot_create_a_session(monkeypatch):
+    user = SimpleNamespace(
+        email="verified@example.com",
+        is_verified=True,
+        token_version=3,
+    )
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    response = Response()
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.complete_verification_session(
+            request=SimpleNamespace(
+                cookies={
+                    "verification_handoff": create_verification_handoff_token(
+                        user.email,
+                        2,
+                    )
+                }
+            ),
+            response=response,
+            db=Mock(),
+        )
+
+    assert error.value.status_code == 401
+    assert error.value.detail == "Verification handoff unavailable or expired"
+    assert _cookie_names(response) == set()
+
+
+@pytest.mark.parametrize("handoff_version", [None, "0"], ids=["missing", "malformed"])
+def test_missing_or_malformed_handoff_version_is_rejected(
+    handoff_version,
+    monkeypatch,
+):
+    payload = {
+        "sub": "verified@example.com",
+        "type": "verification_handoff",
+        "exp": datetime.now(UTC) + timedelta(minutes=5),
+    }
+    if handoff_version is not None:
+        payload["ver"] = handoff_version
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    get_user_mock = Mock()
+    monkeypatch.setattr(auth_api, "get_user_by_email", get_user_mock)
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.complete_verification_session(
+            request=SimpleNamespace(cookies={"verification_handoff": token}),
+            response=Response(),
+            db=Mock(),
+        )
+
+    assert error.value.status_code == 401
+    get_user_mock.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "handoff_token",
     [
         None,
         "not-a-real-token",
-        _token("expired@example.com", "verification_handoff", timedelta(seconds=-1)),
+        jwt.encode(
+            {
+                "sub": "expired@example.com",
+                "type": "verification_handoff",
+                "ver": 0,
+                "exp": datetime.now(UTC) - timedelta(seconds=1),
+            },
+            SECRET_KEY,
+            algorithm=ALGORITHM,
+        ),
         _token("wrong-type@example.com", "email_verification"),
         jwt.encode(
             {
@@ -334,7 +413,8 @@ def test_handoff_token_cannot_be_used_as_an_access_token(monkeypatch):
             request=SimpleNamespace(
                 cookies={
                     "access_token": create_verification_handoff_token(
-                        "handoff@example.com"
+                        "handoff@example.com",
+                        0,
                     )
                 }
             ),
@@ -355,7 +435,8 @@ def test_handoff_for_unknown_user_cannot_authenticate(monkeypatch):
             request=SimpleNamespace(
                 cookies={
                     "verification_handoff": create_verification_handoff_token(
-                        "ghost@example.com"
+                        "ghost@example.com",
+                        0,
                     )
                 }
             ),
@@ -564,7 +645,10 @@ def test_password_reset_replaces_hash_and_increments_version_atomically(monkeypa
     [
         pytest.param(lambda email: create_access_token(email, 0), id="access"),
         create_email_verification_token,
-        create_verification_handoff_token,
+        pytest.param(
+            lambda email: create_verification_handoff_token(email, 0),
+            id="verification-handoff",
+        ),
     ],
 )
 def test_wrong_jwt_type_cannot_reset_password(token_factory, monkeypatch):

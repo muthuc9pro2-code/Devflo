@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { forgotPassword } from '../api/auth'
+import { useAuth } from '../context/useAuth'
 import { useRouter } from '../router/useRouter'
 import { ApiError } from '../api/client'
 
@@ -8,6 +9,7 @@ const AUTH_EVENTS_CHANNEL = 'devflo-auth-events'
 
 export default function ForgotPasswordPage() {
   const { navigate } = useRouter()
+  const { logout } = useAuth()
   const [email, setEmail] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -51,17 +53,31 @@ export default function ForgotPasswordPage() {
     }
   }
 
+  const handleBackToSignIn = async () => {
+    try {
+      await logout()
+    } catch {
+      // AuthContext still clears in-memory auth; stale cookies are version-invalid.
+    } finally {
+      navigate('/login?reset=success', { replace: true })
+    }
+  }
+
   if (message) {
     return (
       <div className="auth-shell">
         <div className="auth-card">
           <h1 className="brand">Devflo</h1>
           <p className="status-ok" role="status">
-            {passwordChanged ? 'Password successfully changed.' : 'Check your email'}
+            {passwordChanged ? 'Password reset successfully.' : 'Check your email'}
           </p>
           {!passwordChanged && <p className="tagline">{message}</p>}
-          <button className="btn-primary" type="button" onClick={() => navigate('/login')}>
-            Back to login
+          <button
+            className="btn-primary"
+            type="button"
+            onClick={passwordChanged ? handleBackToSignIn : () => navigate('/login')}
+          >
+            {passwordChanged ? 'Back to sign in' : 'Back to login'}
           </button>
         </div>
       </div>

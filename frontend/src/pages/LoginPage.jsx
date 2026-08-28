@@ -67,6 +67,7 @@ export default function LoginPage() {
             name="password"
             type="password"
             required
+            maxLength={128}
             autoComplete="current-password"
             value={form.password}
             onChange={handleChange}

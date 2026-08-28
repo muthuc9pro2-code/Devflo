@@ -3,10 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   forgotPassword: vi.fn(),
+  logout: vi.fn(),
   navigate: vi.fn(),
 }))
 
 vi.mock('../api/auth', () => ({ forgotPassword: mocks.forgotPassword }))
+vi.mock('../context/useAuth', () => ({
+  useAuth: () => ({ logout: mocks.logout }),
+}))
 vi.mock('../router/useRouter', () => ({
   useRouter: () => ({ navigate: mocks.navigate }),
 }))
@@ -40,6 +44,7 @@ describe('ForgotPasswordPage reset notification', () => {
     mocks.forgotPassword.mockResolvedValue({
       message: 'If an account exists for this email, a password reset link has been sent.',
     })
+    mocks.logout.mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -59,13 +64,17 @@ describe('ForgotPasswordPage reset notification', () => {
       channel.onmessage({ data: { type: 'password-reset-success' } })
     })
 
-    expect(screen.getByText('Password successfully changed.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Back to login' })).toBeTruthy()
+    expect(screen.getByText('Password reset successfully.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Back to sign in' })).toBeTruthy()
     expect(mocks.forgotPassword).toHaveBeenCalledTimes(1)
     expect(mocks.navigate).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Back to login' }))
-    expect(mocks.navigate).toHaveBeenCalledWith('/login')
+    fireEvent.click(screen.getByRole('button', { name: 'Back to sign in' }))
+    await act(async () => {})
+    expect(mocks.logout).toHaveBeenCalledOnce()
+    expect(mocks.navigate).toHaveBeenCalledWith('/login?reset=success', {
+      replace: true,
+    })
   })
 
   it('ignores the event before the Check your email state', async () => {
@@ -76,7 +85,7 @@ describe('ForgotPasswordPage reset notification', () => {
       channel.onmessage({ data: { type: 'password-reset-success' } })
     })
 
-    expect(screen.queryByText('Password successfully changed.')).toBeNull()
+    expect(screen.queryByText('Password reset successfully.')).toBeNull()
     expect(screen.getByRole('button', { name: 'Send reset link' })).toBeTruthy()
   })
 

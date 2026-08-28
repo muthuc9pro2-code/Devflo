@@ -29,4 +29,54 @@ describe('verification handoff API retry behavior', () => {
       headers: { 'Content-Type': 'application/json' },
     })
   })
+
+  it('reports a definitive refresh rejection as an expired session', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        status: 401,
+        ok: false,
+        statusText: 'Unauthorized',
+        json: vi.fn().mockResolvedValue({ detail: 'Invalid access token' }),
+      })
+      .mockResolvedValueOnce({
+        status: 401,
+        ok: false,
+        statusText: 'Unauthorized',
+        json: vi.fn().mockResolvedValue({ detail: 'Invalid refresh token' }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+    const expired = vi.fn()
+    window.addEventListener('devflo:session-expired', expired)
+    const { request } = await import('./client')
+
+    await expect(request('/analysis/history')).rejects.toMatchObject({ status: 401 })
+
+    expect(expired).toHaveBeenCalledOnce()
+    window.removeEventListener('devflo:session-expired', expired)
+  })
+
+  it('does not expire the frontend session for a temporary refresh 503', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        status: 401,
+        ok: false,
+        statusText: 'Unauthorized',
+        json: vi.fn().mockResolvedValue({ detail: 'Invalid access token' }),
+      })
+      .mockResolvedValueOnce({
+        status: 503,
+        ok: false,
+        statusText: 'Service Unavailable',
+        json: vi.fn().mockResolvedValue({ detail: 'Temporarily unavailable' }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+    const expired = vi.fn()
+    window.addEventListener('devflo:session-expired', expired)
+    const { request } = await import('./client')
+
+    await expect(request('/analysis/history')).rejects.toMatchObject({ status: 503 })
+
+    expect(expired).not.toHaveBeenCalled()
+    window.removeEventListener('devflo:session-expired', expired)
+  })
 })

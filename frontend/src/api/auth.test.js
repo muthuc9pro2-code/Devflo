@@ -23,6 +23,7 @@ describe('verification auth API', () => {
 
     expect(client.request).toHaveBeenCalledWith(
       '/auth/verify-email?token=verification%20token',
+      { method: 'POST' },
     )
     expect(client.markSessionEstablished).not.toHaveBeenCalled()
   })

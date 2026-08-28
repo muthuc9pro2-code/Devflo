@@ -163,6 +163,7 @@ export default function SignupPage() {
         email: form.email,
         password: form.password,
       })
+      setForm((prev) => ({ ...prev, password: '', confirmPassword: '' }))
       const existingHandoffCheck = handoffRequestRef.current
       if (existingHandoffCheck) {
         try {

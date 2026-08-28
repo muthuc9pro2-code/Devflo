@@ -19,5 +19,6 @@ class User(Base):
         default=0,
         server_default="0",
     )
+    unverified_activity_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     analyses = relationship("Analysis", back_populates="user", cascade="all, delete-orphan")

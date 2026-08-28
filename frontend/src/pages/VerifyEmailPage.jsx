@@ -19,6 +19,7 @@ export default function VerifyEmailPage() {
         if (cancelled) return
         setState('success')
         setMessage('Email verified successfully.')
+        navigate('/verify-email', { replace: true })
       })
       .catch((err) => {
         if (cancelled) return
@@ -33,7 +34,7 @@ export default function VerifyEmailPage() {
     return () => {
       cancelled = true
     }
-  }, [token])
+  }, [navigate, token])
 
   return (
     <div className="auth-shell">

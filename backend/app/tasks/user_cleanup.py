@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from app.core.celery_app import celery_app
 from app.db.database import sessionLocal
 from app.models.user import User
+from sqlalchemy import func
 
 @celery_app.task
 def delete_stale_unverified_users() -> int:
@@ -14,7 +15,7 @@ def delete_stale_unverified_users() -> int:
             db.query(User)
             .filter(
                 User.is_verified.is_(False),
-                User.created_at < cutoff,
+                func.coalesce(User.unverified_activity_at, User.created_at) < cutoff,
             )
             .delete(synchronize_session=False)
         )

@@ -1,4 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends
+from datetime import UTC, datetime
+import logging
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from app.crud.user import create_user, get_user_by_email, authenticate_user, get_user_by_username
 from app.db.database import get_db
@@ -19,21 +23,59 @@ from app.core.security import ALGORITHM, SECRET_KEY, create_password_reset_token
 from app.models.user import User
 from app.core.config import Settings
 from app.api.dependencies import get_current_verified_user
+from resend.exceptions import ResendError
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 VERIFICATION_HANDOFF_COOKIE_PATH = "/auth/verification-session"
+logger = logging.getLogger(__name__)
 
 
-def _set_verification_handoff_cookie(response: Response, email: str) -> None:
+def _set_verification_handoff_cookie(
+    response: Response,
+    email: str,
+    token_version: int,
+) -> None:
     response.set_cookie(
         key="verification_handoff",
-        value=create_verification_handoff_token(email),
+        value=create_verification_handoff_token(email, token_version),
         httponly=True,
         secure=Settings.COOKIE_SECURE,
         samesite="lax",
         max_age=VERIFICATION_HANDOFF_EXPIRE_MINUTES * 60,
         path=VERIFICATION_HANDOFF_COOKIE_PATH,
     )
+
+
+def _delete_verification_handoff_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key="verification_handoff",
+        path=VERIFICATION_HANDOFF_COOKIE_PATH,
+        secure=Settings.COOKIE_SECURE,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _delete_auth_cookies(response: Response) -> None:
+    response.delete_cookie(key="access_token", path="/")
+    response.delete_cookie(key="refresh_token", path="/")
+
+
+def _refresh_rejection(detail: str) -> JSONResponse:
+    response = JSONResponse(status_code=401, content={"detail": detail})
+    _delete_auth_cookies(response)
+    return response
+
+
+def _send_verification_email_or_503(email: str, token: str) -> None:
+    try:
+        send_verification_email(email=email, token=token)
+    except ResendError:
+        logger.error("Verification email delivery failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to send verification email. Please try again.",
+        ) from None
 
 
 @router.post("/register", response_model=RegisterResponse)
@@ -57,14 +99,15 @@ def register(
                 detail="Email already registered"
             )
 
-        verification_token = create_email_verification_token(
-            existing_email.email
-            )
-        send_verification_email(
-            email=existing_email.email,
-            token=verification_token
-            )
-        _set_verification_handoff_cookie(response, existing_email.email)
+        existing_email.unverified_activity_at = datetime.now(UTC)
+        db.commit()
+        verification_token = create_email_verification_token(existing_email.email)
+        _send_verification_email_or_503(existing_email.email, verification_token)
+        _set_verification_handoff_cookie(
+            response,
+            existing_email.email,
+            existing_email.token_version,
+        )
         
         return {
             "message": "Verification email resent. Please verify email.",
@@ -79,12 +122,14 @@ def register(
             detail="Username already taken"
         )
 
-    verification_token = create_email_verification_token(user.email)
-
-    send_verification_email(email=user.email, token=verification_token)
-
     created_user = create_user(db, user)
-    _set_verification_handoff_cookie(response, created_user.email)
+    verification_token = create_email_verification_token(created_user.email)
+    _send_verification_email_or_503(created_user.email, verification_token)
+    _set_verification_handoff_cookie(
+        response,
+        created_user.email,
+        created_user.token_version,
+    )
 
     return {
         "message": "Registration successful. Please verify email.",
@@ -92,8 +137,12 @@ def register(
     }
 
 
-@router.get("/verify-email")
-def verify_email(token: str, response: Response, db: Session = Depends(get_db)):
+@router.post("/verify-email")
+def verify_email(
+    response: Response,
+    token: str = Query(min_length=1, max_length=4096),
+    db: Session = Depends(get_db),
+):
     try:
         payload = decode_email_verification_token(token)
     except (jwt.PyJWTError, ValueError):
@@ -139,6 +188,7 @@ def complete_verification_session(
         )
 
     email = payload.get("sub")
+    handoff_version = payload.get("ver")
 
     if not email:
         raise HTTPException(
@@ -149,6 +199,12 @@ def complete_verification_session(
     user = get_user_by_email(db, email)
 
     if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Verification handoff unavailable or expired",
+        )
+
+    if handoff_version != user.token_version:
         raise HTTPException(
             status_code=401,
             detail="Verification handoff unavailable or expired",
@@ -178,13 +234,7 @@ def complete_verification_session(
         max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
 
-    response.delete_cookie(
-        key="verification_handoff",
-        path=VERIFICATION_HANDOFF_COOKIE_PATH,
-        secure=Settings.COOKIE_SECURE,
-        httponly=True,
-        samesite="lax",
-    )
+    _delete_verification_handoff_cookie(response)
 
     return {"status": "authenticated"}
 
@@ -226,6 +276,8 @@ def login(
         max_age=Settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
     )
 
+    _delete_verification_handoff_cookie(response)
+
     return {"message": "Login successful"}
 
 
@@ -234,42 +286,38 @@ def refresh_token(request: Request, response: Response, db: Session = Depends(ge
     refresh_token = request.cookies.get("refresh_token")
 
     if not refresh_token:
-        raise HTTPException(status_code=401, detail="Refresh token missing")
+        return _refresh_rejection("Refresh token missing")
 
     try:
-       payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+       payload = jwt.decode(
+           refresh_token,
+           SECRET_KEY,
+           algorithms=[ALGORITHM],
+           options={"require": ["sub", "type", "ver", "exp"]},
+       )
     except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid refresh token",
-        )
+        return _refresh_rejection("Invalid refresh token")
     
     if payload.get("type") != "refresh":
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+        return _refresh_rejection("Invalid refresh token")
 
     email = payload.get("sub")
 
     if not email:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid refresh token",
-        )
+        return _refresh_rejection("Invalid refresh token")
 
     user = get_user_by_email(db, email)
 
     if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="User not found"
-        )
+        return _refresh_rejection("Invalid refresh token")
 
     token_version = payload.get("ver")
 
     if type(token_version) is not int or token_version != user.token_version:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid refresh token",
-        )
+        return _refresh_rejection("Invalid refresh token")
+
+    if not user.is_verified:
+        return _refresh_rejection("Invalid refresh token")
 
     new_access_token = create_access_token(user.email, user.token_version)
     new_refresh_token = create_refresh_token(user.email, user.token_version)
@@ -306,10 +354,13 @@ def forgot_password(
     if user and user.is_verified:
         reset_token = create_password_reset_token(user.email, user.token_version)
 
-        send_password_reset_email(
-            email=user.email,
-            token=reset_token,
-        )
+        try:
+            send_password_reset_email(
+                email=user.email,
+                token=reset_token,
+            )
+        except ResendError:
+            logger.error("Password reset email delivery failed")
 
     return {
         "message": (
@@ -369,12 +420,12 @@ def reset_password(
     }
 
 @router.post("/logout")
-def logout (response: Response):
-    response.delete_cookie("access_token")
-    response.delete_cookie("refresh_token")
+def logout(response: Response):
+    _delete_auth_cookies(response)
+    _delete_verification_handoff_cookie(response)
 
     return {
-        "messsage": "Logged out successfully"
+        "message": "Logged out successfully"
     }
 
 @router.get("/me", response_model=UserResponse)

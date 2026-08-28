@@ -24,7 +24,7 @@ describe('VerifyEmailPage', () => {
 
     expect(await screen.findByText('Email verified successfully.')).toBeTruthy()
     expect(screen.getByText('You can return to the device where you signed up.')).toBeTruthy()
-    expect(mocks.navigate).not.toHaveBeenCalled()
+    expect(mocks.navigate).toHaveBeenCalledWith('/verify-email', { replace: true })
 
     fireEvent.click(screen.getByRole('button', { name: 'Sign in on this device' }))
     expect(mocks.navigate).toHaveBeenCalledWith('/login')

@@ -1,14 +1,22 @@
+from datetime import UTC, datetime
+
 from sqlalchemy.orm import Session
 from app.core.security import password_hash, verify_password
 from app.models.user import User
 from app.schemas.user import UserRegister
 from fastapi import HTTPException
 
+_DUMMY_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$z3wunkUjnwwhVBPB3kF/RQ$"
+    "pDFSbjnTzo2R8XyjhvHB/FOCe5PC80NyWC9qk8d6f8k"
+)
+
 def create_user(db: Session, user: UserRegister) -> User:
     db_user = User(
         username=user.username,
         email=user.email,
         hashed_password=password_hash.hash(user.password),
+        unverified_activity_at=datetime.now(UTC),
     )
 
     db.add(db_user)
@@ -31,6 +39,7 @@ def authenticate_user(
     user = get_user_by_email(db, email)
 
     if not user:
+        verify_password(password, _DUMMY_PASSWORD_HASH)
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password"

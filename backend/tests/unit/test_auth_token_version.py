@@ -1,5 +1,6 @@
 """Per-user token-version invalidation and single-use password resets."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -16,6 +17,7 @@ from app.core.security import (
     create_access_token,
     create_password_reset_token,
     create_refresh_token,
+    create_verification_handoff_token,
     hash_password,
     verify_password,
 )
@@ -132,8 +134,43 @@ def test_access_token_with_old_or_missing_version_is_rejected(
     assert error.value.detail == "Invalid access token"
 
 
+@pytest.mark.parametrize(
+    "access_token",
+    [
+        "not-a-jwt",
+        jwt.encode(
+            {
+                "sub": "user@example.com",
+                "type": "access",
+                "ver": 4,
+                "exp": datetime.now(UTC) - timedelta(seconds=1),
+            },
+            SECRET_KEY,
+            algorithm=ALGORITHM,
+        ),
+    ],
+    ids=["malformed", "expired"],
+)
+def test_malformed_or_expired_access_token_is_rejected_before_user_lookup(
+    access_token,
+    monkeypatch,
+):
+    get_user_mock = Mock()
+    monkeypatch.setattr(auth_dependencies, "get_user_by_email", get_user_mock)
+
+    with pytest.raises(HTTPException) as error:
+        auth_dependencies.get_current_user(
+            request=SimpleNamespace(cookies={"access_token": access_token}),
+            db=Mock(),
+        )
+
+    assert error.value.status_code == 401
+    get_user_mock.assert_not_called()
+
+
 def test_refresh_token_with_current_version_rotates_versioned_tokens(monkeypatch):
     user = SimpleNamespace(email="user@example.com", token_version=6)
+    user.is_verified = True
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     response = Response()
 
@@ -163,19 +200,55 @@ def test_refresh_token_with_old_or_missing_version_is_rejected_without_rotation(
     refresh_token, monkeypatch
 ):
     user = SimpleNamespace(email="user@example.com", token_version=6)
+    user.is_verified = True
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     response = Response()
 
-    with pytest.raises(HTTPException) as error:
-        auth_api.refresh_token(
-            request=SimpleNamespace(cookies={"refresh_token": refresh_token}),
-            response=response,
-            db=Mock(),
-        )
+    rejection = auth_api.refresh_token(
+        request=SimpleNamespace(cookies={"refresh_token": refresh_token}),
+        response=response,
+        db=Mock(),
+    )
 
-    assert error.value.status_code == 401
-    assert error.value.detail == "Invalid refresh token"
-    assert _cookie_names(response) == set()
+    assert rejection.status_code == 401
+    assert json.loads(rejection.body) == {"detail": "Invalid refresh token"}
+    assert _cookie_names(rejection) == {"access_token", "refresh_token"}
+
+
+@pytest.mark.parametrize(
+    "refresh_token",
+    [
+        "not-a-jwt",
+        jwt.encode(
+            {
+                "sub": "user@example.com",
+                "type": "refresh",
+                "ver": 6,
+                "exp": datetime.now(UTC) - timedelta(seconds=1),
+            },
+            SECRET_KEY,
+            algorithm=ALGORITHM,
+        ),
+    ],
+    ids=["malformed", "expired"],
+)
+def test_malformed_or_expired_refresh_token_is_rejected_and_cookies_expire(
+    refresh_token,
+    monkeypatch,
+):
+    get_user_mock = Mock()
+    monkeypatch.setattr(auth_api, "get_user_by_email", get_user_mock)
+    response = Response()
+
+    rejection = auth_api.refresh_token(
+        request=SimpleNamespace(cookies={"refresh_token": refresh_token}),
+        response=response,
+        db=Mock(),
+    )
+
+    assert rejection.status_code == 401
+    assert _cookie_names(rejection) == {"access_token", "refresh_token"}
+    get_user_mock.assert_not_called()
 
 
 def test_login_uses_authenticated_users_current_token_version(monkeypatch):
@@ -338,15 +411,13 @@ def test_reset_invalidates_old_sessions_and_new_login_uses_incremented_version(
     assert access_error.value.status_code == 401
 
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
-    refresh_response = Response()
-    with pytest.raises(HTTPException) as refresh_error:
-        auth_api.refresh_token(
-            request=SimpleNamespace(cookies={"refresh_token": old_refresh}),
-            response=refresh_response,
-            db=Mock(),
-        )
-    assert refresh_error.value.status_code == 401
-    assert _cookie_names(refresh_response) == set()
+    refresh_rejection = auth_api.refresh_token(
+        request=SimpleNamespace(cookies={"refresh_token": old_refresh}),
+        response=Response(),
+        db=Mock(),
+    )
+    assert refresh_rejection.status_code == 401
+    assert _cookie_names(refresh_rejection) == {"access_token", "refresh_token"}
 
     monkeypatch.setattr(auth_api, "authenticate_user", Mock(return_value=user))
     login_response = Response()
@@ -357,6 +428,63 @@ def test_reset_invalidates_old_sessions_and_new_login_uses_incremented_version(
     )
     assert _decode(_cookie_value(login_response, "access_token"))["ver"] == 3
     assert _decode(_cookie_value(login_response, "refresh_token"))["ver"] == 3
+
+
+def test_password_reset_invalidates_previously_issued_verification_handoff(
+    monkeypatch,
+):
+    user = SimpleNamespace(
+        email="user@example.com",
+        is_verified=True,
+        hashed_password=hash_password("old-password"),
+        token_version=4,
+    )
+    old_handoff = create_verification_handoff_token(
+        user.email,
+        user.token_version,
+    )
+    reset_token = create_password_reset_token(user.email, user.token_version)
+    db = Mock()
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = user
+
+    auth_api.reset_password(
+        request=ResetPasswordRequest(token=reset_token, new_password="new-password"),
+        db=db,
+    )
+
+    assert user.token_version == 5
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    response = Response()
+    with pytest.raises(HTTPException) as error:
+        auth_api.complete_verification_session(
+            request=SimpleNamespace(cookies={"verification_handoff": old_handoff}),
+            response=response,
+            db=Mock(),
+        )
+
+    assert error.value.status_code == 401
+    assert _cookie_names(response) == set()
+
+
+def test_unverified_user_cannot_refresh_even_with_current_version(monkeypatch):
+    user = SimpleNamespace(
+        email="user@example.com",
+        is_verified=False,
+        token_version=3,
+    )
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    response = Response()
+
+    rejection = auth_api.refresh_token(
+        request=SimpleNamespace(
+            cookies={"refresh_token": create_refresh_token(user.email, 3)}
+        ),
+        response=response,
+        db=Mock(),
+    )
+
+    assert rejection.status_code == 401
+    assert _cookie_names(rejection) == {"access_token", "refresh_token"}
 
 
 def test_user_token_version_column_has_safe_zero_defaults():

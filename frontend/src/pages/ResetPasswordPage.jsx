@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { resetPassword } from '../api/auth'
+import { useAuth } from '../context/useAuth'
 import { useRouter } from '../router/useRouter'
 import { ApiError } from '../api/client'
 
@@ -22,6 +23,7 @@ function publishPasswordResetSuccess() {
 
 export default function ResetPasswordPage() {
   const { search, navigate } = useRouter()
+  const { logout } = useAuth()
   const token = new URLSearchParams(search).get('token')
   const [form, setForm] = useState({ newPassword: '', confirmPassword: '' })
   const [error, setError] = useState('')
@@ -60,12 +62,25 @@ export default function ResetPasswordPage() {
     }
   }
 
+  const handleBackToSignIn = async () => {
+    try {
+      await logout()
+    } catch {
+      // AuthContext still clears in-memory auth; stale cookies are version-invalid.
+    } finally {
+      navigate('/login?reset=success', { replace: true })
+    }
+  }
+
   if (success) {
     return (
       <div className="auth-shell">
         <div className="auth-card">
           <h1 className="brand">Devflo</h1>
           <p className="status-ok" role="status">Password reset successfully.</p>
+          <button className="btn-primary" type="button" onClick={handleBackToSignIn}>
+            Back to sign in
+          </button>
         </div>
       </div>
     )

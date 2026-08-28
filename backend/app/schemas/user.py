@@ -11,11 +11,14 @@ RegistrationUsername = Annotated[
     ),
 ]
 NewPassword = Annotated[str, StringConstraints(min_length=8, max_length=128)]
+RequestEmail = Annotated[EmailStr, StringConstraints(max_length=254)]
+LoginPassword = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+JwtToken = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 
 
 class UserRegister(BaseModel):
     username: RegistrationUsername
-    email: EmailStr
+    email: RequestEmail
     password: NewPassword
 
 
@@ -29,8 +32,8 @@ class UserResponse(BaseModel):
 
 
 class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
+    email: RequestEmail
+    password: LoginPassword
 
 
 class LoginResponse(BaseModel):
@@ -43,9 +46,9 @@ class RegisterResponse(BaseModel):
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
+    email: RequestEmail
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str
+    token: JwtToken
     new_password: NewPassword
