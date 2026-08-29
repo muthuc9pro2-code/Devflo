@@ -126,7 +126,7 @@ def test_source_zip_with_matches_reports_match_count(monkeypatch):
         ],
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -153,7 +153,7 @@ def test_source_zip_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
         ],
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -174,7 +174,7 @@ def test_github_source_with_zero_matches_stays_ready_not_unavailable(monkeypatch
         evidence_kwargs=[{"service": "worker", "source_matches": None}],
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -235,7 +235,7 @@ def test_no_source_supplied_omits_the_source_key_entirely(monkeypatch):
     db.commit()
     db.close()
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()

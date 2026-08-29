@@ -402,6 +402,9 @@ def test_ocr_runs_at_most_once_per_uploaded_image(monkeypatch, tmp_path):
 
     db = Mock()
     db.query.return_value.filter.return_value.scalar.return_value = 1
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
+        "processing", 0,
+    )
     analysis = SimpleNamespace(id=1, processed_bytes=0, last_processed_line=0)
     artifact = SimpleNamespace(
         id=1,
@@ -417,6 +420,6 @@ def test_ocr_runs_at_most_once_per_uploaded_image(monkeypatch, tmp_path):
         duplicate_of_artifact_id=None,
     )
 
-    analysis_task._process_artifact(db=db, analysis=analysis, artifact=artifact)
+    analysis_task._process_artifact(db=db, analysis=analysis, artifact=artifact, generation=0)
 
     assert call_count["n"] == 1

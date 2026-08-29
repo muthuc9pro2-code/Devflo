@@ -233,7 +233,14 @@ def test_dispatch_publishes_progress_zero_first(monkeypatch):
         lambda *a, **kw: published.append((a, kw)),
     )
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="pending", source_kind=None)
+    analysis = SimpleNamespace(id=9, status="pending", source_kind=None, processing_generation=0)
+
+    def fake_execute(statement, *a, **k):
+        analysis.status = "processing"
+        analysis.processing_generation += 1
+        return SimpleNamespace(rowcount=1)
+
+    db.execute.side_effect = fake_execute
     db.query.return_value.filter.return_value.first.return_value = analysis
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
         SimpleNamespace(id=101, status="pending")
@@ -260,7 +267,7 @@ def test_finalize_reports_99_never_100_for_zero_evidence_analysis(monkeypatch, c
     )
 
     with caplog.at_level("INFO", logger="app.tasks.analysis"):
-        analysis_task._finalize_analysis_task.run([], analysis_id, None)
+        analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert 100 not in published_progress
     assert all(p is None or p == 99 for p in published_progress)
@@ -311,7 +318,7 @@ def test_simple_path_investigation_result_is_the_last_event(monkeypatch):
     )
     events = _events_in_order(monkeypatch)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert events, "expected at least one SSE event"
     assert events[-1][0] == "investigation_result"
@@ -350,7 +357,7 @@ def test_correlated_path_investigation_result_is_the_last_event(monkeypatch):
     )
     events = _events_in_order(monkeypatch)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert events, "expected at least one SSE event"
     assert events[-1][0] == "investigation_result"

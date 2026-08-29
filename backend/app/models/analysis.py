@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, Index, String, func
+from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
@@ -29,6 +29,24 @@ class Analysis(Base):
 
     processing_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # Execution-generation fencing: every winning pending->processing claim
+    # (process_analysis, or a recovery demotion-then-redispatch) increments
+    # this. Every child task (source prep, artifact processing, finalizer)
+    # carries the generation it was dispatched with and re-verifies it
+    # against this column before every durable mutation, so a zombie task
+    # from an already-superseded execution can never mutate the new one.
+    processing_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Set only once all artifacts for the current processing_generation are
+    # durably terminal and one finalizer invocation has atomically claimed
+    # the right to run identity/correlation/Gemini + final persistence.
+    # NULL means "no finalizer has claimed this generation yet"; reset to
+    # NULL whenever a new processing_generation begins.
+    finalization_generation: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(

@@ -168,7 +168,7 @@ def test_finalize_uses_fallback_when_whole_analysis_has_zero_evidence(monkeypatc
     )
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(calls) == 1  # exactly one Gemini call
     assert calls[0]["context_kind"] == "unstructured_fallback"
@@ -203,7 +203,7 @@ def test_finalize_stays_true_zero_evidence_when_no_artifact_has_fallback_context
     )
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert calls == []
     assert len(published) == 1
@@ -226,7 +226,7 @@ def test_reconnect_restores_fallback_result_without_calling_gemini_again(monkeyp
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
     assert len(live_calls) == 1
 
     def _must_not_be_called(context):
@@ -292,7 +292,7 @@ def test_fallback_never_fires_when_the_whole_analysis_already_has_real_evidence(
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     # Exactly one Gemini call for the REAL evidence (SIMPLE path, single
     # evidence row) - never a second "fallback" call for notes.txt.
@@ -328,7 +328,7 @@ def test_fallback_path_survives_gemini_unavailable(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()

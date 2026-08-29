@@ -53,7 +53,16 @@ def test_dispatch_builds_a_bounded_group_and_chord_instead_of_looping(monkeypatc
     them - it dispatches and returns.
     """
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="pending", source_kind=None)
+    analysis = SimpleNamespace(id=9, status="pending", source_kind=None, processing_generation=0)
+
+    def fake_execute(statement, *a, **k):
+        # Simulates the atomic pending->processing claim: one row affected,
+        # and the generation the caller would observe after db.refresh().
+        analysis.status = "processing"
+        analysis.processing_generation += 1
+        return SimpleNamespace(rowcount=1)
+
+    db.execute.side_effect = fake_execute
     db.query.return_value.filter.return_value.first.return_value = analysis
     artifacts = [
         SimpleNamespace(id=101, status="pending"),
@@ -90,14 +99,32 @@ def test_dispatch_builds_a_bounded_group_and_chord_instead_of_looping(monkeypatc
     assert analysis_task._process_artifact_task.si.call_count == 3
     for call in analysis_task._process_artifact_task.si.call_args_list:
         assert call.args[0] == 9  # analysis_id
+        assert call.args[2] == 1  # generation established by the claim
     assert {c.args[1] for c in analysis_task._process_artifact_task.si.call_args_list} == {101, 102, 103}
     assert captured["chord_callback"] is finalize_sig
     captured["workflow"].apply_async.assert_called_once_with()
 
 
-def test_source_prep_is_chained_before_the_artifact_chord_when_source_present(monkeypatch):
+def _claiming_db(analysis: SimpleNamespace) -> Mock:
+    """A Mock db whose execute() simulates the atomic pending->processing
+    claim process_analysis performs: one row affected, status flips, and
+    processing_generation advances exactly like a real conditional UPDATE
+    would - visible to the caller without needing db.refresh() to do
+    anything, since it mutates the same SimpleNamespace in place."""
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="pending", source_kind="zip")
+
+    def fake_execute(statement, *a, **k):
+        analysis.status = "processing"
+        analysis.processing_generation = getattr(analysis, "processing_generation", 0) + 1
+        return SimpleNamespace(rowcount=1)
+
+    db.execute.side_effect = fake_execute
+    return db
+
+
+def test_source_prep_is_chained_before_the_artifact_chord_when_source_present(monkeypatch):
+    analysis = SimpleNamespace(id=9, status="pending", source_kind="zip", processing_generation=0)
+    db = _claiming_db(analysis)
     db.query.return_value.filter.return_value.first.return_value = analysis
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
         SimpleNamespace(id=101, status="pending")
@@ -121,13 +148,13 @@ def test_source_prep_is_chained_before_the_artifact_chord_when_source_present(mo
     analysis_task.process_analysis.run(9)
 
     assert captured["steps"][0] is prep_sig
-    analysis_task._prepare_source_task.si.assert_called_once_with(9)
+    analysis_task._prepare_source_task.si.assert_called_once_with(9, 1)
     captured["workflow"].apply_async.assert_called_once_with()
 
 
 def test_dispatch_skips_source_chain_when_no_source_present(monkeypatch):
-    db = Mock()
-    analysis = SimpleNamespace(id=9, status="pending", source_kind=None)
+    analysis = SimpleNamespace(id=9, status="pending", source_kind=None, processing_generation=0)
+    db = _claiming_db(analysis)
     db.query.return_value.filter.return_value.first.return_value = analysis
     db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
         SimpleNamespace(id=101, status="pending")
@@ -151,7 +178,7 @@ def test_global_concurrency_is_explicitly_bounded_for_2_vcpu_target():
 
 def test_finalize_skips_downstream_work_when_an_artifact_is_incomplete(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="processing")
+    analysis = SimpleNamespace(id=9, status="processing", processing_generation=1)
     incomplete_artifact = SimpleNamespace(id=102, status="processing")
     db.query.return_value.filter.return_value.first.side_effect = [analysis, incomplete_artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
@@ -163,7 +190,13 @@ def test_finalize_skips_downstream_work_when_an_artifact_is_incomplete(monkeypat
     monkeypatch.setattr(analysis_task, "persist_resolved_identities", persist_identities)
     monkeypatch.setattr(analysis_task, "run_correlation", run_correlation)
 
-    analysis_task._finalize_analysis_task.run([1, 2], 9, None)
+    # Retries are exhausted synchronously here (self.request.retries starts
+    # at 0 < _FINALIZE_RETRY_MAX, so .run() would normally raise Retry) -
+    # force straight through to the plain "incomplete, skip" branch instead
+    # of exercising Celery's real retry machinery in this unit test.
+    monkeypatch.setattr(analysis_task, "_FINALIZE_RETRY_MAX", 0)
+
+    analysis_task._finalize_analysis_task.run([1, 2], 9, 1, None)
 
     choose_path.assert_not_called()
     persist_identities.assert_not_called()
@@ -173,53 +206,58 @@ def test_finalize_skips_downstream_work_when_an_artifact_is_incomplete(monkeypat
 
 def test_finalize_skips_when_analysis_already_marked_failed(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="failed")
+    analysis = SimpleNamespace(id=9, status="failed", processing_generation=1)
     db.query.return_value.filter.return_value.first.return_value = analysis
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     choose_path = Mock()
     monkeypatch.setattr(analysis_task, "choose_investigation_path", choose_path)
 
-    analysis_task._finalize_analysis_task.run([1], 9, None)
+    analysis_task._finalize_analysis_task.run([1], 9, 1, None)
 
     choose_path.assert_not_called()
 
 
 def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="processing")
+    db.execute.return_value = SimpleNamespace(rowcount=1)
+    analysis = SimpleNamespace(id=9, status="processing", processing_generation=1)
     artifact = SimpleNamespace(id=101, position=0, status="pending")
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
-    monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
+    # _bump_processing_heartbeat now owns its own isolated session (a
+    # separate sessionLocal() call) - give it its own Mock so closing it
+    # doesn't close the task's own `db` out from under the rest of this
+    # test, matching real production session isolation.
+    monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
     monkeypatch.setattr(analysis_task, "_prepare_source_index", Mock(return_value=None))
 
     def boom(**_kwargs):
         raise RuntimeError("parser exploded")
 
     monkeypatch.setattr(analysis_task, "_process_artifact", boom)
-    mark_failed = Mock()
+    mark_failed = Mock(return_value=False)
     monkeypatch.setattr(analysis_task, "_mark_analysis_failed", mark_failed)
 
     try:
-        analysis_task._process_artifact_task.run(9, 101)
+        analysis_task._process_artifact_task.run(9, 101, 1)
         raised = False
     except RuntimeError:
         raised = True
 
     assert raised
-    mark_failed.assert_called_once_with(db, 9)
+    mark_failed.assert_called_once_with(db, 9, generation=1)
     db.close.assert_called_once()
 
 
 def test_process_artifact_task_skips_an_already_completed_artifact(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="processing")
+    analysis = SimpleNamespace(id=9, status="processing", processing_generation=1)
     artifact = SimpleNamespace(id=101, status="completed")
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     process_artifact = Mock()
     monkeypatch.setattr(analysis_task, "_process_artifact", process_artifact)
 
-    result = analysis_task._process_artifact_task.run(9, 101)
+    result = analysis_task._process_artifact_task.run(9, 101, 1)
 
     assert result == 0
     process_artifact.assert_not_called()
@@ -236,14 +274,14 @@ def test_process_artifact_task_skips_an_already_controlled_failed_artifact_on_re
     controlled, terminal failure outcome in a PRIOR run. That outcome is
     exactly as final as "completed" and must not be re-processed."""
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="processing")
+    analysis = SimpleNamespace(id=9, status="processing", processing_generation=1)
     artifact = SimpleNamespace(id=101, status=terminal_status)
     db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     process_artifact = Mock()
     monkeypatch.setattr(analysis_task, "_process_artifact", process_artifact)
 
-    result = analysis_task._process_artifact_task.run(9, 101)
+    result = analysis_task._process_artifact_task.run(9, 101, 1)
 
     assert result == 0
     process_artifact.assert_not_called()
@@ -267,15 +305,27 @@ def test_sequential_and_per_task_processing_produce_equivalent_evidence(monkeypa
 
     fixtures = [(101, 0, "generic.txt"), (102, 1, "syslog.txt")]
 
+    def _fenced_db():
+        db = Mock()
+        # Every generation fence (_persist_artifact_batch's per-batch check,
+        # and _process_artifact's terminal-commit check) reads
+        # (status, processing_generation) via this same query shape.
+        db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
+            "processing",
+            1,
+        )
+        return db
+
     # OLD style: one shared analysis object, artifacts processed in a
     # sequential loop, last_processed_line accumulating naturally.
     monkeypatch.setattr(analysis_task, "persist_evidence_batch", capture(captured_sequential))
     shared_analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     for identifier, position, name in fixtures:
         _process_artifact(
-            db=Mock(),
+            db=_fenced_db(),
             analysis=shared_analysis,
             artifact=_artifact(identifier, position, name),
+            generation=1,
         )
 
     # NEW style: a fresh analysis object per artifact, global_line_number
@@ -288,9 +338,10 @@ def test_sequential_and_per_task_processing_produce_equivalent_evidence(monkeypa
             last_processed_line=position * analysis_task._GLOBAL_LINE_NUMBER_STRIDE,
         )
         _process_artifact(
-            db=Mock(),
+            db=_fenced_db(),
             analysis=per_task_analysis,
             artifact=_artifact(identifier, position, name),
+            generation=1,
         )
 
     assert len(captured_sequential) == len(captured_per_task) > 0
@@ -370,7 +421,7 @@ def test_total_lines_reports_real_per_artifact_sum_not_stride_bands(monkeypatch,
     analysis_id = _sqlite_analysis_with_artifacts(monkeypatch, [1_000_000, 2_273_410])
 
     with caplog.at_level("INFO", logger="app.tasks.analysis"):
-        analysis_task._finalize_analysis_task.run([], analysis_id, None)
+        analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     total_lines_records = [
         record for record in caplog.records if "total_lines=" in record.getMessage()
@@ -393,7 +444,7 @@ def test_total_processing_time_reflects_full_dispatch_to_finalize_span(monkeypat
     dispatch_start = time.time() - 5.0  # simulate 5s already spent dispatching/ingesting
 
     with caplog.at_level("INFO", logger="app.tasks.analysis"):
-        analysis_task._finalize_analysis_task.run([], analysis_id, dispatch_start)
+        analysis_task._finalize_analysis_task.run([], analysis_id, 0, dispatch_start)
 
     total_time_records = [
         record
@@ -413,7 +464,7 @@ def test_total_processing_time_falls_back_to_local_timing_without_dispatch_start
     analysis_id = _sqlite_analysis_with_artifacts(monkeypatch, [1])
 
     with caplog.at_level("INFO", logger="app.tasks.analysis"):
-        analysis_task._finalize_analysis_task.run([], analysis_id, None)
+        analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     total_time_records = [
         record

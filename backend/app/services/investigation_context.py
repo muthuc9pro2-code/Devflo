@@ -71,18 +71,28 @@ def _normalized_evidence_time(value: datetime | None) -> datetime:
 def _evidence_chronological_key(
     evidence: Evidence,
 ) -> tuple[datetime, int]:
+    # first_line_number - not evidence.id - is the tie-break: artifacts
+    # are processed by independent, concurrently-racing Celery workers, so
+    # the DB-assigned autoincrement id an Evidence row happens to get
+    # reflects commit-race order, not anything about the underlying
+    # diagnostic data. first_line_number is instead derived once, at
+    # upload time, from artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
+    # plus that artifact's own line number - the same input always yields
+    # the same value.
     return (
         _normalized_evidence_time(evidence.first_seen),
-        evidence.id,
+        evidence.first_line_number,
     )
 
 
 def _simple_llm_priority_key(evidence: Evidence) -> tuple:
     """Deterministic priority for SIMPLE-mode Gemini context selection -
     only already-computed signals (a real source-code match, severity,
-    occurrence_count, then a stable timestamp/id tiebreak), no AI-based
-    ranking and no second root-cause engine. Sorts ascending, so stronger
-    candidates (True/higher numbers) are negated to sort first."""
+    occurrence_count, then a stable timestamp/first_line_number tiebreak),
+    no AI-based ranking and no second root-cause engine. Sorts ascending,
+    so stronger candidates (True/higher numbers) are negated to sort
+    first. first_line_number, not evidence.id, closes the tie: see
+    _evidence_chronological_key."""
     has_source_match = bool(evidence.source_matches)
     severity_rank = _SIMPLE_LLM_SEVERITY_RANK.get(
         (evidence.severity or "").upper(), 0
@@ -95,7 +105,7 @@ def _simple_llm_priority_key(evidence: Evidence) -> tuple:
         -severity_rank,
         -(evidence.occurrence_count or 0),
         first_seen or _DATETIME_MIN_UTC,
-        evidence.id,
+        evidence.first_line_number,
     )
 
 
@@ -255,7 +265,7 @@ def select_bounded_evidence_from_db(
         rows = (
             db.query(Evidence)
             .filter(Evidence.analysis_id == analysis_id)
-            .order_by(Evidence.first_seen, Evidence.id)
+            .order_by(Evidence.first_seen, Evidence.first_line_number)
             .all()
         )
 
@@ -298,13 +308,13 @@ def select_bounded_evidence_from_db(
     boundary_rows = (
         db.query(Evidence)
         .filter(Evidence.analysis_id == analysis_id, Evidence.first_seen.isnot(None))
-        .order_by(Evidence.first_seen.asc(), Evidence.id.asc())
+        .order_by(Evidence.first_seen.asc(), Evidence.first_line_number.asc())
         .limit(boundary_reserve)
         .all()
     ) + (
         db.query(Evidence)
         .filter(Evidence.analysis_id == analysis_id, Evidence.first_seen.isnot(None))
-        .order_by(Evidence.first_seen.desc(), Evidence.id.desc())
+        .order_by(Evidence.first_seen.desc(), Evidence.first_line_number.desc())
         .limit(boundary_reserve)
         .all()
     )
@@ -364,7 +374,14 @@ def select_bounded_evidence_from_db(
     scored_candidates: list[tuple[float, Evidence]] = [
         (float("inf"), row) for row in reserved_by_id.values()
     ] + [(score, row) for score, _tiebreak, row in heap]
-    scored_candidates.sort(key=lambda item: item[0], reverse=True)
+    # Tie-broken by first_line_number (never left implicit, which would
+    # silently fall back to dict/heap-internal iteration order - itself
+    # driven by Evidence.id-ordered pagination scan order, not anything
+    # about the underlying data) so an exact score tie right at the
+    # max_records truncation boundary picks the same row on every run.
+    scored_candidates.sort(
+        key=lambda item: (item[0], item[1].first_line_number), reverse=True
+    )
 
     selected: list[Evidence] = []
     selected_bytes = 0
@@ -449,11 +466,33 @@ def _select_primary_component(components: list[Any]) -> Any | None:
     if not components:
         return None
 
-    def _component_key(component: Any) -> tuple[int, int]:
+    def _component_key(component: Any) -> tuple[int, int, int]:
         artifact_ids = {
             node.artifact_id for node in component.nodes if node.artifact_id is not None
         }
-        return (len(artifact_ids), len(component.nodes))
+        # Tie-broken by the component's own earliest first_line_number
+        # (never left as bare component-list order, which max() would
+        # otherwise use as its implicit first-occurrence-wins rule) -
+        # first_line_number is derived once at upload time from
+        # artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that
+        # artifact's own line number, so the SAME logical incident is
+        # always identified as "primary" regardless of the order
+        # components happened to be built/returned in this run.
+        # Negated so smaller (earlier) values win under max()'s
+        # largest-key-wins semantics.
+        earliest_line = min(
+            (
+                node.first_line_number
+                for node in component.nodes
+                if node.first_line_number is not None
+            ),
+            default=None,
+        )
+        return (
+            len(artifact_ids),
+            len(component.nodes),
+            -earliest_line if earliest_line is not None else float("-inf"),
+        )
 
     primary = max(components, key=_component_key)
     if len(primary.nodes) <= 1:

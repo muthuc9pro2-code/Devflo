@@ -8,6 +8,8 @@ Endpoint functions are called directly (db/current_user/response passed
 in explicitly), matching this repo's established pattern (see
 test_analysis_history_api.py) rather than a FastAPI TestClient.
 """
+from unittest.mock import Mock
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
@@ -428,7 +430,7 @@ def test_persist_artifact_batch_rolls_back_and_signals_cancellation_when_already
     original_processed_bytes = artifact.processed_bytes
 
     batch_result = _persist_artifact_batch(
-        db=db, analysis=analysis, artifact=artifact, batch=_retained_batch(),
+        db=db, analysis=analysis, artifact=artifact, generation=0, batch=_retained_batch(),
     )
 
     assert batch_result is None
@@ -449,7 +451,7 @@ def test_persist_artifact_batch_persists_normally_when_not_cancelled(monkeypatch
     )
 
     batch_result = _persist_artifact_batch(
-        db=db, analysis=analysis, artifact=artifact, batch=_retained_batch(),
+        db=db, analysis=analysis, artifact=artifact, generation=0, batch=_retained_batch(),
     )
 
     assert batch_result == 1
@@ -508,7 +510,7 @@ def test_process_artifact_task_returns_immediately_for_cancelled_analysis(monkey
         lambda **k: (_ for _ in ()).throw(AssertionError("must never parse a cancelled artifact")),
     )
 
-    result = analysis_task._process_artifact_task.run(analysis.id, artifact.id)
+    result = analysis_task._process_artifact_task.run(analysis.id, artifact.id, 0)
 
     assert result == 0
     assert db.query(Evidence).filter(Evidence.analysis_id == analysis.id).count() == 0
@@ -524,7 +526,7 @@ def test_prepare_source_task_skips_when_already_cancelled(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must never prepare source for cancelled")),
     )
 
-    analysis_task._prepare_source_task.run(analysis.id)
+    analysis_task._prepare_source_task.run(analysis.id, 0)
 
     reloaded = db.query(Analysis).filter(Analysis.id == analysis.id).first()
     assert reloaded.source_status is None  # never set to "ready" or "unavailable"
@@ -537,9 +539,12 @@ def test_prepare_source_task_discards_prepared_source_when_cancelled_mid_prep(mo
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", source_kind="zip", source_status=None)
     analysis_id = analysis.id
-    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    # _bump_processing_heartbeat now owns its own isolated session (closed
+    # by itself) - a throwaway Mock for that second sessionLocal() call
+    # keeps it from closing this test's real `db`.
+    monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
 
-    def fake_prepare(analysis_arg):
+    def fake_prepare(analysis_arg, generation_arg):
         # Simulate the cancel endpoint racing in while the (real,
         # slow) source prep call above was running.
         db.query(Analysis).filter(Analysis.id == analysis_id).update({"status": "cancelled"})
@@ -551,7 +556,7 @@ def test_prepare_source_task_discards_prepared_source_when_cancelled_mid_prep(mo
         analysis_task, "cleanup_prepared_source", lambda aid: cleanup_calls.append(aid)
     )
 
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     assert cleanup_calls == [analysis_id]
     reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -565,9 +570,9 @@ def test_prepare_source_task_does_not_mark_unavailable_for_a_cancelled_analysis(
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", source_kind="github", source_status=None)
     analysis_id = analysis.id
-    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
 
-    def fake_prepare(analysis_arg):
+    def fake_prepare(analysis_arg, generation_arg):
         db.query(Analysis).filter(Analysis.id == analysis_id).update({"status": "cancelled"})
         db.commit()
         raise SourceInputError("repository not found")
@@ -575,7 +580,7 @@ def test_prepare_source_task_does_not_mark_unavailable_for_a_cancelled_analysis(
     monkeypatch.setattr(analysis_task, "_prepare_source_index", fake_prepare)
     monkeypatch.setattr(analysis_task, "cleanup_prepared_source", lambda aid: None)
 
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert reloaded.status == "cancelled"
@@ -610,7 +615,7 @@ def test_finalize_does_nothing_for_an_already_cancelled_analysis(monkeypatch):
         lambda ctx: (_ for _ in ()).throw(AssertionError("must not call Gemini for a cancelled analysis")),
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db2 = session_factory()
     reloaded = db2.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -656,7 +661,7 @@ def test_finalize_discards_a_gemini_result_when_cancelled_arrives_while_gemini_w
         analysis_task, "publish_investigation_result", lambda aid, p: published.append(p)
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert published == []  # the (post-cancel) result was never published
     db2 = session_factory()
@@ -695,6 +700,11 @@ def test_finalize_commit_if_processing_discards_when_cancellation_wins_in_the_ga
     artifact = _artifact(db, analysis, status="completed")
     _evidence(db, analysis, artifact)
 
+    # This finalizer already won the durable finalization claim for
+    # generation 0 before reaching this final fence.
+    analysis.finalization_generation = 0
+    db.commit()
+
     # The finalizer's own in-memory pending change (set right after its own
     # Gemini call, before this final fence) - must never be flushed if
     # cancellation already won.
@@ -707,7 +717,7 @@ def test_finalize_commit_if_processing_discards_when_cancellation_wins_in_the_ga
     cancel_db.close()
 
     won = _finalize_commit_if_processing(
-        db, analysis, result_snapshot={"investigation_path": "simple"}, stage="test",
+        db, analysis, generation=0, result_snapshot={"investigation_path": "simple"}, stage="test",
     )
 
     assert won is False
@@ -726,11 +736,13 @@ def test_finalize_commit_if_processing_commits_normally_when_not_cancelled(monke
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing")
     analysis_id = analysis.id
+    analysis.finalization_generation = 0
+    db.commit()
 
     from app.tasks.analysis import _finalize_commit_if_processing
 
     won = _finalize_commit_if_processing(
-        db, analysis, result_snapshot={"investigation_path": "zero_evidence"}, stage="test",
+        db, analysis, generation=0, result_snapshot={"investigation_path": "zero_evidence"}, stage="test",
     )
 
     assert won is True
@@ -768,7 +780,7 @@ def test_finalize_zero_evidence_branch_completed_persistence_is_fenced(monkeypat
         analysis_task, "publish_investigation_result", lambda aid, p: published.append(p)
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert published == []
     db2 = session_factory()
@@ -818,7 +830,7 @@ def test_finalize_fallback_branch_completed_persistence_is_fenced(monkeypatch):
         analysis_task, "publish_investigation_result", lambda aid, p: published.append(p)
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert published == []
     db2 = session_factory()

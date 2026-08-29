@@ -447,7 +447,7 @@ def test_finalize_removes_prepared_source_after_all_artifacts_complete(tmp_path,
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert not dest.exists()
     assert not marker.exists()
@@ -470,17 +470,19 @@ def test_finalize_drops_process_local_source_index_cache_entry(tmp_path, monkeyp
     )
     _stage_prepared_source(tmp_path, analysis_id)
     monkeypatch.setattr(
-        analysis_task, "_source_index_process_cache", {analysis_id: object(), 12345: object()}
+        analysis_task,
+        "_source_index_process_cache",
+        {(analysis_id, 0): object(), (12345, 0): object()},
     )
 
     monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_gemini_unavailable)
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
-    assert analysis_id not in analysis_task._source_index_process_cache
-    assert 12345 in analysis_task._source_index_process_cache  # unrelated entries untouched
+    assert (analysis_id, 0) not in analysis_task._source_index_process_cache
+    assert (12345, 0) in analysis_task._source_index_process_cache  # unrelated entries untouched
 
 
 def test_persisted_source_matches_remain_usable_after_physical_source_cleanup(tmp_path, monkeypatch):
@@ -509,7 +511,7 @@ def test_persisted_source_matches_remain_usable_after_physical_source_cleanup(tm
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert not dest.exists()  # physical source is gone
 
@@ -540,7 +542,7 @@ def test_cleanup_oserror_does_not_fail_an_otherwise_valid_analysis(tmp_path, mon
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
     with caplog.at_level("WARNING", logger="app.tasks.analysis"):
-        analysis_task._finalize_analysis_task.run([], analysis_id, None)
+        analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -569,7 +571,7 @@ def test_cleanup_not_attempted_for_analyses_without_source_input(tmp_path, monke
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert calls == []
 

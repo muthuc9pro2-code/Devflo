@@ -274,7 +274,7 @@ def test_not_linked_evidence_remains_persisted_in_mysql_backed_finalize(monkeypa
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     payload = published[0]
     node_ids = {n["id"] for c in payload["components"] for n in c["nodes"]}

@@ -490,7 +490,7 @@ def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
     investigation_calls = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: investigation_calls.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     # investigation_result is the single authoritative full final payload -
     # published exactly once, never twice (there used to also be
@@ -536,7 +536,7 @@ def test_simple_end_to_end_publishes_investigation_result_only(monkeypatch):
     investigation_calls = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: investigation_calls.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(investigation_calls) == 1
     payload = investigation_calls[0]
@@ -566,7 +566,7 @@ def test_zero_evidence_end_to_end_builds_no_gemini_context(monkeypatch):
     monkeypatch.setattr(analysis_task, "build_simple_llm_context", simple_context_builder)
     monkeypatch.setattr(analysis_task, "build_llm_context", correlated_context_builder)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     simple_context_builder.assert_not_called()
     correlated_context_builder.assert_not_called()

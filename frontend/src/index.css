@@ -435,6 +435,15 @@ pre { margin: 0; }
   color: var(--text);
 }
 
+.new-investigation-button:disabled,
+.sidebar-logout:disabled,
+.sidebar-brand[aria-disabled="true"],
+.history-item[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 .new-investigation-button svg,
 .sidebar-logout svg,
 .mobile-menu-button svg {

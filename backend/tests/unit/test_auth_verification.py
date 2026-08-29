@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import jwt
 import pytest
-from fastapi import HTTPException, Response
+from fastapi import BackgroundTasks, HTTPException, Response
 
 from app.api import auth as auth_api
 from app.api import dependencies as auth_dependencies
@@ -595,6 +595,16 @@ def test_verification_email_links_to_the_frontend_verify_page(monkeypatch):
 # --- forgot-password: undefined send_password_reset_email regression ------
 
 
+def _run_background_tasks(background_tasks: BackgroundTasks) -> None:
+    """forgot_password() only QUEUES the reset email via BackgroundTasks
+    (its own provider round-trip must never be observable in the
+    response's timing) rather than sending it inline - a direct-call test
+    has to run the queued task itself to see what the real ASGI
+    background-task runner would do after the response is already sent."""
+    for task in background_tasks.tasks:
+        task.func(*task.args, **task.kwargs)
+
+
 def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch):
     """Regression for the previous bug: forgot_password() called
     send_password_reset_email(...) without it being imported/defined
@@ -615,9 +625,13 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
         lambda params: sent.update(params) or {"id": "fake"},
     )
 
+    background_tasks = BackgroundTasks()
     result = auth_api.forgot_password(
-        request=ForgotPasswordRequest(email=user.email), db=Mock()
+        request=ForgotPasswordRequest(email=user.email),
+        background_tasks=background_tasks,
+        db=Mock(),
     )
+    _run_background_tasks(background_tasks)
 
     assert result == {
         "message": (
@@ -647,7 +661,13 @@ def test_forgot_password_reset_token_is_a_real_password_reset_token(monkeypatch)
         lambda email, token: captured.update(email=email, token=token),
     )
 
-    auth_api.forgot_password(request=ForgotPasswordRequest(email=user.email), db=Mock())
+    background_tasks = BackgroundTasks()
+    auth_api.forgot_password(
+        request=ForgotPasswordRequest(email=user.email),
+        background_tasks=background_tasks,
+        db=Mock(),
+    )
+    _run_background_tasks(background_tasks)
 
     payload = jwt.decode(captured["token"], SECRET_KEY, algorithms=[ALGORITHM])
     assert payload["sub"] == user.email
@@ -663,7 +683,9 @@ def test_forgot_password_unknown_email_sends_nothing_but_same_message(monkeypatc
     monkeypatch.setattr(auth_api, "send_password_reset_email", send_mock)
 
     result = auth_api.forgot_password(
-        request=ForgotPasswordRequest(email="ghost@example.com"), db=Mock()
+        request=ForgotPasswordRequest(email="ghost@example.com"),
+        background_tasks=BackgroundTasks(),
+        db=Mock(),
     )
 
     assert result == {
@@ -684,7 +706,9 @@ def test_forgot_password_unverified_user_sends_nothing_but_same_message(monkeypa
     monkeypatch.setattr(auth_api, "send_password_reset_email", send_mock)
 
     result = auth_api.forgot_password(
-        request=ForgotPasswordRequest(email=user.email), db=Mock()
+        request=ForgotPasswordRequest(email=user.email),
+        background_tasks=BackgroundTasks(),
+        db=Mock(),
     )
 
     assert result == {

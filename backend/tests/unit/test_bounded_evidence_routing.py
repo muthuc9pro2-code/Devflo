@@ -111,7 +111,7 @@ def test_finalize_selects_the_bounded_working_set_exactly_once(monkeypatch):
     spy = Mock(side_effect=real_select)
     monkeypatch.setattr(analysis_task, "select_bounded_evidence_from_db", spy)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     spy.assert_called_once()
 
@@ -133,7 +133,7 @@ def test_simple_path_evidence_is_genuinely_bounded_not_unbounded_then_truncated(
     published = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(published) == 1
     payload = published[0]
@@ -176,7 +176,7 @@ def test_route_and_correlation_receive_the_exact_same_evidence_ids(monkeypatch):
     monkeypatch.setattr(analysis_task, "choose_investigation_path", spy_route)
     monkeypatch.setattr(analysis_task, "run_correlation", spy_correlate)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert captured["route_ids"]
     assert captured["route_ids"] == captured["correlate_ids"]
@@ -198,7 +198,7 @@ def test_correlated_real_total_evidence_count_survives_truncation(monkeypatch):
     published = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     payload = published[0]
     assert payload["investigation_path"] == "correlated"
@@ -225,7 +225,7 @@ def test_real_per_artifact_evidence_counts_survive_truncation(monkeypatch):
     published = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     payload = published[0]
     assert payload["evidence_artifact_count"] == 2  # both artifacts, even though only 2 rows total survive
@@ -281,7 +281,7 @@ def test_finalize_does_not_misclassify_an_artifact_whose_evidence_was_bounded_ou
     published = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     payload = published[0]
     # a.log's rows were genuinely excluded from the working set...
@@ -412,7 +412,7 @@ def test_small_investigation_below_the_bound_keeps_the_same_route_and_payload_se
     published = []
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     payload = published[0]
     assert payload["investigation_path"] == "correlated"

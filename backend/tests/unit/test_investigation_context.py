@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from app.models.evidence import Evidence
 from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import (
+    _select_primary_component,
     build_correlation_payload,
     build_llm_context,
     build_simple_llm_context,
@@ -473,3 +474,31 @@ def test_missing_optional_fields_do_not_break_serialization():
     sparse_evidence_context = next(e for e in simple_context["evidence"] if e["id"] == 1)
     assert sparse_evidence_context["source_matches"] is None
     assert sparse_evidence_context["trace_id"] is None
+
+
+def test_select_primary_component_ties_are_broken_by_earliest_line_not_list_order():
+    """Two components tying exactly on (distinct-artifact-count,
+    node-count) - a real possibility, e.g. two same-shaped 2-node
+    same-artifact bursts - must resolve to the SAME primary component
+    regardless of which order they appear in `components`, proving the
+    tie-break is an explicit, first_line_number-based rule rather than
+    max()'s implicit first-occurrence-wins behavior over component-list
+    order (itself downstream of correlation-engine construction order,
+    not anything about the underlying data)."""
+    from types import SimpleNamespace
+
+    def _node(artifact_id, first_line_number):
+        return SimpleNamespace(artifact_id=artifact_id, first_line_number=first_line_number)
+
+    component_early = SimpleNamespace(
+        nodes=[_node(1, 100), _node(1, 200)],
+    )
+    component_late = SimpleNamespace(
+        nodes=[_node(2, 900), _node(2, 950)],
+    )
+
+    forward = _select_primary_component([component_early, component_late])
+    reversed_order = _select_primary_component([component_late, component_early])
+
+    assert forward is component_early
+    assert reversed_order is component_early

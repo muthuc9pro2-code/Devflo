@@ -151,14 +151,14 @@ def test_completed_diagnostic_file_survives_until_analysis_finalizes(tmp_path, m
         path=valid_path, detected_format=ArtifactFormat.GENERIC.value,
     )
 
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
 
     # This artifact's own ingestion is done, but the finalizer has not run
     # yet - its physical bytes must still be there (a sibling artifact
     # could still be mid-processing in a real multi-artifact analysis).
     assert valid_path.exists()
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     # The final durable result is committed now - the file is reclaimed.
     assert not valid_path.exists()
@@ -195,7 +195,7 @@ def test_resource_limited_diagnostic_file_is_reclaimed_immediately(tmp_path, mon
         path=other_path, detected_format=ArtifactFormat.GENERIC.value,
     )
 
-    result = analysis_task._process_artifact_task.run(analysis_id, bad_id)
+    result = analysis_task._process_artifact_task.run(analysis_id, bad_id, 0)
 
     assert result == 0
     assert not bad_path.exists()  # reclaimed immediately
@@ -248,7 +248,7 @@ def test_cleanup_failure_does_not_fail_the_completed_analysis(tmp_path, monkeypa
         session_factory, analysis_id=analysis_id, position=0, filename="valid.log",
         path=valid_path, detected_format=ArtifactFormat.GENERIC.value,
     )
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
 
     def _boom_unlink(self, missing_ok=False):
         raise OSError("disk unavailable")
@@ -256,7 +256,7 @@ def test_cleanup_failure_does_not_fail_the_completed_analysis(tmp_path, monkeypa
     monkeypatch.setattr(analysis_task.Path, "unlink", _boom_unlink)
 
     with caplog.at_level("WARNING", logger="app.tasks.analysis"):
-        analysis_task._finalize_analysis_task.run([], analysis_id, None)
+        analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -286,8 +286,8 @@ def test_reconnect_reconstruction_works_after_diagnostic_files_are_gone(tmp_path
         session_factory, analysis_id=analysis_id, position=0, filename="valid.log",
         path=valid_path, detected_format=ArtifactFormat.GENERIC.value,
     )
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert not valid_path.exists()
 

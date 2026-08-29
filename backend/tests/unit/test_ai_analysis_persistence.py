@@ -109,7 +109,7 @@ def test_live_correlated_completion_persists_ai_analysis(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(calls) == 1  # exactly one live Gemini call
 
@@ -133,7 +133,7 @@ def test_live_simple_completion_persists_ai_analysis(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(calls) == 1
 
@@ -158,7 +158,7 @@ def test_reconnect_returns_persisted_ai_analysis_without_calling_gemini_again(mo
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
     assert len(live_calls) == 1
 
     # Simulate reconnect: a fresh call into generate_investigation_explanation
@@ -185,7 +185,7 @@ def test_zero_evidence_analysis_has_no_ai_analysis(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert calls == []  # no evidence -> no Gemini call at all, as before
 
@@ -219,7 +219,7 @@ def test_live_correlated_completion_survives_gemini_unavailable(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -241,7 +241,7 @@ def test_live_simple_completion_survives_gemini_unavailable(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -265,7 +265,7 @@ def test_reconnect_after_gemini_unavailable_completion_shows_deterministic_resul
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     def _must_not_be_called(context):
         raise AssertionError("reconnect must not call Gemini again")

@@ -76,7 +76,7 @@ def test_simple_finalize_persists_the_exact_published_payload(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     stored = db.query(Analysis).filter_by(id=analysis_id).first()
@@ -114,7 +114,7 @@ def test_correlated_finalize_persists_the_exact_published_payload(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     stored = db.query(Analysis).filter_by(id=analysis_id).first()
@@ -135,7 +135,7 @@ def test_zero_evidence_finalize_persists_the_exact_published_payload(monkeypatch
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     stored = db.query(Analysis).filter_by(id=analysis_id).first()
@@ -157,7 +157,7 @@ def test_unstructured_fallback_finalize_persists_the_exact_published_payload(mon
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda aid, p: published.append(p))
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     stored = db.query(Analysis).filter_by(id=analysis_id).first()
@@ -201,7 +201,7 @@ def test_result_is_committed_to_the_database_before_it_is_published(monkeypatch)
     monkeypatch.setattr(analysis_task, "publish_investigation_result", fake_publish)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert observed["status"] == "completed"
     assert observed["result_snapshot"] is not None

@@ -11,23 +11,38 @@ from app.tasks.analysis import _process_artifact
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
 
 
+def _fenced_mock_db(generation: int = 0) -> Mock:
+    """A Mock db whose generation-fence query (status, processing_generation)
+    - used by both _persist_artifact_batch's per-batch fence and
+    _process_artifact's terminal-commit fence - reports "processing" at
+    the given generation, so direct calls to these functions in this file
+    (which never touch a real Analysis row) still pass the fence."""
+    db = Mock()
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
+        "processing",
+        generation,
+    )
+    return db
+
+
 def test_two_artifacts_process_independently_with_position_based_line_bands():
     """Each artifact computes its own starting global_line_number
     from its own position band (exactly like _process_artifact_task does),
     independent of any other artifact - no shared, accumulating checkpoint
     on the Analysis row anymore."""
-    db = Mock()
+    db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     first = _artifact(101, 0, "generic.txt")
     second = _artifact(102, 1, "docker.jsonl")
 
     first_count = _process_artifact(
-        db=db, analysis=analysis, artifact=first, global_line_number=0
+        db=db, analysis=analysis, artifact=first, generation=0, global_line_number=0
     )
     second_count = _process_artifact(
         db=db,
         analysis=analysis,
         artifact=second,
+        generation=0,
         global_line_number=1 * analysis_task._GLOBAL_LINE_NUMBER_STRIDE,
     )
 
@@ -43,18 +58,20 @@ def test_processing_never_mutates_the_shared_analysis_row():
     shared Analysis.processed_bytes/last_processed_line row - only this
     artifact's own row is ever written. (Recomputing the legacy aggregate
     columns once, at finalize time, is covered separately.)"""
-    db = Mock()
+    db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = _artifact(101, 0, "generic.txt")
 
-    _process_artifact(db=db, analysis=analysis, artifact=artifact, global_line_number=0)
+    _process_artifact(
+        db=db, analysis=analysis, artifact=artifact, generation=0, global_line_number=0
+    )
 
     assert analysis.processed_bytes == 0
     assert analysis.last_processed_line == 0
 
 
 def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
-    db = Mock()
+    db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = SimpleNamespace(id=101, processed_bytes=0, last_processed_line=0)
     discarded = ParsedEvent(line_number=1, raw_line="INFO routine", level="INFO")
@@ -81,6 +98,7 @@ def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
         db=db,
         analysis=analysis,
         artifact=artifact,
+        generation=0,
         batch=batch,
     )
 
@@ -95,7 +113,7 @@ def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
 
 
 def test_artifact_batch_correlates_only_retained_events(monkeypatch):
-    db = Mock()
+    db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = SimpleNamespace(id=101, processed_bytes=0, last_processed_line=0)
     discarded = ParsedEvent(line_number=1, raw_line="INFO routine", level="INFO")
@@ -119,6 +137,7 @@ def test_artifact_batch_correlates_only_retained_events(monkeypatch):
         db=db,
         analysis=analysis,
         artifact=artifact,
+        generation=0,
         batch=batch,
         source_index=source_index,
     )
@@ -130,9 +149,9 @@ def test_artifact_batch_correlates_only_retained_events(monkeypatch):
 
 def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
     # The process-local cache is module-level and keyed by
-    # analysis.id - reset it so an id=9 entry left behind by another test
-    # (this fixture id is reused throughout the suite) can never make this
-    # test silently skip calling prepare_source.
+    # (analysis.id, generation) - reset it so an entry left behind by
+    # another test (this fixture id is reused throughout the suite) can
+    # never make this test silently skip calling prepare_source.
     monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
     analysis = SimpleNamespace(
         id=9,
@@ -145,7 +164,7 @@ def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
     monkeypatch.setattr(analysis_task, "prepare_source", prepare)
     monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", remove)
 
-    assert analysis_task._prepare_source_index(analysis) is index
+    assert analysis_task._prepare_source_index(analysis, 0) is index
     prepare.assert_called_once_with("zip", "uploads/source.zip", 9)
     remove.assert_called_once_with("uploads/source.zip")
 
@@ -156,7 +175,7 @@ def test_log_only_analysis_does_not_prepare_source(monkeypatch):
 
     assert (
         analysis_task._prepare_source_index(
-            SimpleNamespace(id=9, source_kind=None, source_reference=None)
+            SimpleNamespace(id=9, source_kind=None, source_reference=None), 0
         )
         is None
     )
@@ -220,7 +239,7 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
     first_line = b"ERROR first failure\n"
     path = tmp_path / "looks-structured.json"
     path.write_bytes(first_line + b"ERROR second failure\n")
-    db = Mock()
+    db = _fenced_mock_db()
     analysis = SimpleNamespace(
         id=9,
         processed_bytes=len(first_line),
@@ -241,7 +260,7 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
         processed_bytes=len(first_line),
     )
 
-    parsed_count = _process_artifact(db=db, analysis=analysis, artifact=artifact)
+    parsed_count = _process_artifact(db=db, analysis=analysis, artifact=artifact, generation=0)
 
     assert parsed_count == 1
     assert artifact.detected_format == ArtifactFormat.GENERIC.value
@@ -256,7 +275,7 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
 
 def test_legacy_single_file_artifact_resolves_unknown_size_and_detects_format():
     path = FIXTURES / "json_in_txt.txt"
-    db = Mock()
+    db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = SimpleNamespace(
         id=101,
@@ -271,7 +290,7 @@ def test_legacy_single_file_artifact_resolves_unknown_size_and_detects_format():
         processed_bytes=0,
     )
 
-    parsed_count = _process_artifact(db=db, analysis=analysis, artifact=artifact)
+    parsed_count = _process_artifact(db=db, analysis=analysis, artifact=artifact, generation=0)
 
     assert parsed_count == 1
     assert artifact.detected_format == ArtifactFormat.JSON.value

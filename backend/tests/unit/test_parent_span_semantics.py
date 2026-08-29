@@ -30,6 +30,7 @@ def _evidence(evidence_id, **kwargs):
         "fingerprint": f"fp-{evidence_id}",
         "occurrence_count": 1,
         "source_format": "opentelemetry",
+        "first_line_number": evidence_id,
     }
     defaults.update(kwargs)
     return Evidence(**defaults)

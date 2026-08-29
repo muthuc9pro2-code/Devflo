@@ -35,6 +35,7 @@ export default function HistorySidebar({
   error,
   nextCursor,
   user,
+  navigationLocked = false,
   onNavigate,
   onLoadMore,
   onRetry,
@@ -49,8 +50,11 @@ export default function HistorySidebar({
           <a
             className="sidebar-brand"
             href="/new"
+            aria-disabled={navigationLocked}
+            tabIndex={navigationLocked ? -1 : undefined}
             onClick={(event) => {
               event.preventDefault()
+              if (navigationLocked) return
               onNavigate('/new')
             }}
           >
@@ -69,7 +73,12 @@ export default function HistorySidebar({
             <span aria-hidden="true">×</span>
           </button>
         </div>
-        <button className="new-investigation-button" type="button" onClick={() => onNavigate('/new')}>
+        <button
+          className="new-investigation-button"
+          type="button"
+          onClick={() => onNavigate('/new')}
+          disabled={navigationLocked}
+        >
           <NewIcon />
           <span>New investigation</span>
         </button>
@@ -108,9 +117,12 @@ export default function HistorySidebar({
                   href={`/investigation/${item.analysis_id}`}
                   className={`history-item${isActive ? ' active' : ''}`}
                   aria-current={isActive ? 'page' : undefined}
+                  aria-disabled={navigationLocked}
+                  tabIndex={navigationLocked ? -1 : undefined}
                   title={title}
                   onClick={(event) => {
                     event.preventDefault()
+                    if (navigationLocked) return
                     onNavigate(`/investigation/${item.analysis_id}`)
                   }}
                 >
@@ -154,7 +166,13 @@ export default function HistorySidebar({
           <strong>{user?.username || 'Devflo user'}</strong>
           <span title={user?.email}>{user?.email}</span>
         </div>
-        <button type="button" className="sidebar-logout" onClick={onLogout} aria-label="Log out">
+        <button
+          type="button"
+          className="sidebar-logout"
+          onClick={onLogout}
+          aria-label="Log out"
+          disabled={navigationLocked}
+        >
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="M8 4H5.5A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8m4-3 3-3-3-3m3 3H8" />
           </svg>

@@ -255,9 +255,9 @@ def test_oversized_json_scalar_is_resource_limited_without_poisoning_the_chord(
     # the chord (Celery only invokes the finalizer once every task in the
     # group has "completed successfully", which .run() returning normally
     # here proves).
-    analysis_task._process_artifact_task.run(analysis_id, valid1_id)
-    result = analysis_task._process_artifact_task.run(analysis_id, bad_id)
-    analysis_task._process_artifact_task.run(analysis_id, valid2_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid1_id, 0)
+    result = analysis_task._process_artifact_task.run(analysis_id, bad_id, 0)
+    analysis_task._process_artifact_task.run(analysis_id, valid2_id, 0)
 
     assert result == 0
 
@@ -284,7 +284,7 @@ def test_oversized_json_scalar_is_resource_limited_without_poisoning_the_chord(
 
     # The finalizer runs (chord callback) and completes using only the
     # valid evidence.
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -327,8 +327,8 @@ def test_ocr_engine_failure_is_processing_error_without_poisoning_the_chord(tmp_
         path=image_path, detected_format=ArtifactFormat.IMAGE.value,
     )
 
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
-    result = analysis_task._process_artifact_task.run(analysis_id, image_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
+    result = analysis_task._process_artifact_task.run(analysis_id, image_id, 0)
     assert result == 0
 
     db = session_factory()
@@ -338,7 +338,7 @@ def test_ocr_engine_failure_is_processing_error_without_poisoning_the_chord(tmp_
     db.close()
 
     # Finalizer still runs.
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -379,7 +379,7 @@ def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
 
     # Controlled source failure must not raise - process_analysis's chain
     # (_prepare_source_task -> chord) must be able to continue.
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -393,7 +393,7 @@ def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
         session_factory, analysis_id=analysis_id, position=0, filename="valid.log",
         path=valid_path, detected_format=ArtifactFormat.GENERIC.value,
     )
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
 
     db = session_factory()
     evidence = db.query(Evidence).filter(Evidence.artifact_id == valid_id).first()
@@ -401,7 +401,7 @@ def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
     assert evidence.source_matches in (None, [])  # no source index was ever built
     db.close()
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -427,7 +427,7 @@ def test_source_github_controlled_failure_degrades_gracefully(tmp_path, monkeypa
         session_factory, source_kind="github", source_reference="https://github.com/acme/project"
     )
 
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -442,8 +442,8 @@ def test_source_github_controlled_failure_degrades_gracefully(tmp_path, monkeypa
         session_factory, analysis_id=analysis_id, position=0, filename="valid.log",
         path=valid_path, detected_format=ArtifactFormat.GENERIC.value,
     )
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -473,7 +473,7 @@ def test_unexpected_internal_artifact_failure_remains_fatal(tmp_path, monkeypatc
     )
 
     with pytest.raises(RuntimeError, match="programming bug"):
-        analysis_task._process_artifact_task.run(analysis_id, valid_id)
+        analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -500,7 +500,7 @@ def test_unexpected_source_acquisition_failure_degrades(tmp_path, monkeypatch):
         session_factory, source_kind="github", source_reference="https://github.com/acme/project"
     )
 
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -535,7 +535,7 @@ def test_source_index_construction_failure_degrades_and_diagnostics_continue(
         source_reference="https://github.com/acme/project",
     )
 
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     valid_path = _valid_generic_log(tmp_path, "valid.log", "diagnostic survived")
     valid_id = _add_artifact(
@@ -546,7 +546,7 @@ def test_source_index_construction_failure_degrades_and_diagnostics_continue(
         path=valid_path,
         detected_format=ArtifactFormat.GENERIC.value,
     )
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -578,14 +578,16 @@ def test_source_matching_failure_retains_evidence_without_source_matches(
         detected_format=ArtifactFormat.GENERIC.value,
     )
 
-    monkeypatch.setattr(analysis_task, "_prepare_source_index", lambda _analysis: object())
+    monkeypatch.setattr(
+        analysis_task, "_prepare_source_index", lambda _analysis, _generation: object()
+    )
     monkeypatch.setattr(
         analysis_task,
         "correlate_event",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("matcher crashed")),
     )
 
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
 
     db = session_factory()
     evidence = db.query(Evidence).filter(Evidence.artifact_id == valid_id).one()
@@ -630,9 +632,9 @@ def test_malformed_otlp_before_first_record_fails_only_that_artifact(
         detected_format=ArtifactFormat.OPENTELEMETRY.value,
     )
 
-    valid_result = analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    valid_result = analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
     malformed_result = analysis_task._process_artifact_task.run(
-        analysis_id, malformed_id
+        analysis_id, malformed_id, 0
     )
     assert malformed_result == 0
 
@@ -646,7 +648,7 @@ def test_malformed_otlp_before_first_record_fails_only_that_artifact(
     db.close()
 
     analysis_task._finalize_analysis_task.run(
-        [valid_result, malformed_result], analysis_id, None
+        [valid_result, malformed_result], analysis_id, 0, None
     )
     db = session_factory()
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "completed"
@@ -691,7 +693,11 @@ def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
 
     db = session_factory()
     bad = db.query(AnalysisArtifact).filter_by(id=bad_id).one()
-    bad.status = "processing"
+    # "pending" with a preserved partial checkpoint: recovery already reset
+    # a stuck-"processing" artifact back to "pending" (see
+    # _claim_and_demote_stale_processing), which is what this redispatch's
+    # own atomic artifact claim expects to find.
+    bad.status = "pending"
     bad.last_processed_line = 1
     bad.processed_bytes = 0
     bad.fallback_context = {"text": "unsafe stale fallback"}
@@ -710,8 +716,8 @@ def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
     db.commit()
     db.close()
 
-    bad_result = analysis_task._process_artifact_task.run(analysis_id, bad_id)
-    sibling_result = analysis_task._process_artifact_task.run(analysis_id, sibling_id)
+    bad_result = analysis_task._process_artifact_task.run(analysis_id, bad_id, 0)
+    sibling_result = analysis_task._process_artifact_task.run(analysis_id, sibling_id, 0)
 
     db = session_factory()
     bad = db.query(AnalysisArtifact).filter_by(id=bad_id).one()
@@ -724,7 +730,7 @@ def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
     db.close()
 
     analysis_task._finalize_analysis_task.run(
-        [bad_result, sibling_result], analysis_id, None
+        [bad_result, sibling_result], analysis_id, 0, None
     )
     db = session_factory()
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "completed"
@@ -751,7 +757,7 @@ def test_evidence_persistence_failure_remains_analysis_fatal(tmp_path, monkeypat
     )
 
     with pytest.raises(RuntimeError, match="evidence DB write failed"):
-        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
 
     db = session_factory()
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "failed"
@@ -798,7 +804,7 @@ def test_deterministic_correlation_failure_remains_analysis_fatal(
         )
     ]
     results = [
-        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
         for artifact_id in artifact_ids
     ]
     monkeypatch.setattr(
@@ -808,7 +814,7 @@ def test_deterministic_correlation_failure_remains_analysis_fatal(
     )
 
     with pytest.raises(RuntimeError, match="correlation engine bug"):
-        analysis_task._finalize_analysis_task.run(results, analysis_id, None)
+        analysis_task._finalize_analysis_task.run(results, analysis_id, 0, None)
 
     db = session_factory()
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "failed"
@@ -834,7 +840,7 @@ def test_mixed_investigation_isolates_artifact_source_ocr_and_gemini_failures(
         source_kind="github",
         source_reference="https://github.com/acme/project",
     )
-    analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id, 0)
 
     generic_path = tmp_path / "generic.log"
     generic_path.write_text(
@@ -887,7 +893,7 @@ def test_mixed_investigation_isolates_artifact_source_ocr_and_gemini_failures(
     )
 
     results = [
-        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
         for artifact_id in artifact_ids
     ]
 
@@ -913,7 +919,7 @@ def test_mixed_investigation_isolates_artifact_source_ocr_and_gemini_failures(
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Gemini SDK failed")),
     )
 
-    analysis_task._finalize_analysis_task.run(results, analysis_id, None)
+    analysis_task._finalize_analysis_task.run(results, analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter_by(id=analysis_id).one()
@@ -955,7 +961,7 @@ def test_gemini_response_object_failure_preserves_deterministic_result(
         path=path,
         detected_format=ArtifactFormat.GENERIC.value,
     )
-    result = analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+    result = analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
 
     class ThrowingResponse:
         @property
@@ -971,7 +977,7 @@ def test_gemini_response_object_failure_preserves_deterministic_result(
 
     monkeypatch.setattr(gemini_service._client, "_resolved_client", Client())
 
-    analysis_task._finalize_analysis_task.run([result], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([result], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter_by(id=analysis_id).one()
@@ -1010,7 +1016,7 @@ def test_resource_limited_outcome_survives_live_reconnect_and_final_result(tmp_p
         path=bad_path, detected_format=ArtifactFormat.JSON.value,
     )
 
-    analysis_task._process_artifact_task.run(analysis_id, bad_id)
+    analysis_task._process_artifact_task.run(analysis_id, bad_id, 0)
 
     # 1) live artifact_outcome payload
     assert len(live_events) == 1
@@ -1037,8 +1043,8 @@ def test_resource_limited_outcome_survives_live_reconnect_and_final_result(tmp_p
     )
 
     # 3) final result payload
-    analysis_task._process_artifact_task.run(analysis_id, valid_id)
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -1109,7 +1115,7 @@ def test_devflo_ai_unavailable_preserves_deterministic_result_without_naming_pro
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -1155,7 +1161,7 @@ def test_devflo_ai_unavailable_fallback_path_preserves_deterministic_result(monk
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()

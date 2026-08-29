@@ -94,11 +94,13 @@ def test_build_component_timeline_is_pure_in_memory_no_db_access():
 
     node_a = SimpleNamespace(
         id="evidence-1", first_seen=datetime(2026, 1, 1, tzinfo=timezone.utc), service="a",
+        first_line_number=1,
     )
     node_b = SimpleNamespace(
         id="evidence-2",
         first_seen=datetime(2026, 1, 1, 0, 0, 0, 5000, tzinfo=timezone.utc),
         service="b",
+        first_line_number=2,
     )
     component = SimpleNamespace(nodes=[node_b, node_a])  # deliberately out of order
     root_candidates = [

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from fastapi import HTTPException, Response
+from fastapi import BackgroundTasks, HTTPException, Response
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -236,6 +236,17 @@ def test_registration_uniqueness_race_rolls_back_and_returns_controlled_409(
     second_db.close()
 
 
+def _run_background_tasks(background_tasks: BackgroundTasks) -> None:
+    """forgot_password() now only QUEUES the reset email via
+    BackgroundTasks (see its own docstring: the provider round-trip must
+    never be observable in the response's own timing) instead of sending
+    it inline - a direct-call test therefore has to run the queued task
+    itself to observe what the real ASGI background-task runner would do
+    after the response is already on the wire."""
+    for task in background_tasks.tasks:
+        task.func(*task.args, **task.kwargs)
+
+
 def test_forgot_password_provider_failure_preserves_neutral_public_response(
     monkeypatch,
     caplog,
@@ -251,9 +262,11 @@ def test_forgot_password_provider_failure_preserves_neutral_public_response(
         "send_password_reset_email",
         Mock(side_effect=_provider_error()),
     )
+    background_tasks = BackgroundTasks()
 
     result = auth_api.forgot_password(
         request=ForgotPasswordRequest(email=user.email),
+        background_tasks=background_tasks,
         db=Mock(),
     )
 
@@ -263,9 +276,48 @@ def test_forgot_password_provider_failure_preserves_neutral_public_response(
             "a password reset link has been sent."
         )
     }
+    assert "Password reset email delivery failed" not in caplog.text  # not sent yet
+    _run_background_tasks(background_tasks)
     assert "Password reset email delivery failed" in caplog.text
     assert "provider unavailable" not in caplog.text
     assert user.email not in caplog.text
+
+
+def test_forgot_password_response_never_waits_on_the_email_provider(monkeypatch):
+    """The core timing side-channel this endpoint must not leak: an
+    attacker probing arbitrary emails could otherwise distinguish "account
+    exists and verified" (a real network round-trip to the email provider)
+    from every other case (no network call at all) purely by how long the
+    response takes. A slow/blocking send_password_reset_email must never
+    delay the HTTP response - it may only ever run afterward, via
+    BackgroundTasks, whether the account exists or not."""
+    verified_user = SimpleNamespace(
+        email="verified@example.com", is_verified=True, token_version=1,
+    )
+    slow_send = Mock(side_effect=RuntimeError("would have blocked for seconds"))
+    monkeypatch.setattr(auth_api, "send_password_reset_email", slow_send)
+
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=verified_user))
+    verified_background_tasks = BackgroundTasks()
+    verified_result = auth_api.forgot_password(
+        request=ForgotPasswordRequest(email=verified_user.email),
+        background_tasks=verified_background_tasks,
+        db=Mock(),
+    )
+    slow_send.assert_not_called()  # queued, not run, during the request itself
+
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
+    unknown_background_tasks = BackgroundTasks()
+    unknown_result = auth_api.forgot_password(
+        request=ForgotPasswordRequest(email="ghost@example.com"),
+        background_tasks=unknown_background_tasks,
+        db=Mock(),
+    )
+
+    assert verified_result == unknown_result
+    assert len(verified_background_tasks.tasks) == 1  # a real send was queued
+    assert len(unknown_background_tasks.tasks) == 0  # nothing to queue at all
+    slow_send.assert_not_called()
 
 
 def test_successful_login_deletes_custom_path_verification_handoff(monkeypatch):

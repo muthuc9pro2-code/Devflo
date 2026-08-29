@@ -63,13 +63,30 @@ def _artifact(db, analysis, position=0, status="pending", **kwargs) -> AnalysisA
 # --- The throttled heartbeat ----------------------------------------------
 
 
+def _heartbeat_session_factory(monkeypatch):
+    """_bump_processing_heartbeat now owns its own isolated session (see
+    its docstring) rather than reusing the caller's - it calls
+    sessionLocal() itself. Tests must therefore patch sessionLocal to a
+    real FACTORY bound to one shared engine (so the heartbeat's own
+    session reads/writes the same underlying data), not a single fixed
+    Session instance, which would be closed out from under any other code
+    still using it."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
+    return session_factory
+
+
 def test_bump_processing_heartbeat_writes_on_first_call(monkeypatch):
     monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
-    db = _session()
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", processing_heartbeat_at=None)
+    analysis_id = analysis.id
 
-    analysis_task._bump_processing_heartbeat(db, analysis.id)
+    analysis_task._bump_processing_heartbeat(analysis_id, analysis.processing_generation)
 
     db.expire_all()
     assert analysis.processing_heartbeat_at is not None
@@ -77,11 +94,13 @@ def test_bump_processing_heartbeat_writes_on_first_call(monkeypatch):
 
 def test_bump_processing_heartbeat_is_throttled_within_the_minimum_interval(monkeypatch):
     monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
-    db = _session()
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", processing_heartbeat_at=None)
+    analysis_id, generation = analysis.id, analysis.processing_generation
 
-    analysis_task._bump_processing_heartbeat(db, analysis.id)
+    analysis_task._bump_processing_heartbeat(analysis_id, generation)
     db.expire_all()
     first_write = analysis.processing_heartbeat_at
 
@@ -90,7 +109,7 @@ def test_bump_processing_heartbeat_is_throttled_within_the_minimum_interval(monk
     # what keeps the heartbeat from recreating per-batch shared-row
     # contention.
     for _ in range(50):
-        analysis_task._bump_processing_heartbeat(db, analysis.id)
+        analysis_task._bump_processing_heartbeat(analysis_id, generation)
 
     db.expire_all()
     assert analysis.processing_heartbeat_at == first_write
@@ -99,42 +118,109 @@ def test_bump_processing_heartbeat_is_throttled_within_the_minimum_interval(monk
 def test_bump_processing_heartbeat_writes_again_after_the_interval_elapses(monkeypatch):
     monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
     monkeypatch.setattr(analysis_task, "_HEARTBEAT_MIN_INTERVAL_SECONDS", 0.0)
-    db = _session()
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", processing_heartbeat_at=None)
+    analysis_id, generation = analysis.id, analysis.processing_generation
 
-    analysis_task._bump_processing_heartbeat(db, analysis.id)
+    analysis_task._bump_processing_heartbeat(analysis_id, generation)
     db.expire_all()
     first_write = analysis.processing_heartbeat_at
 
-    analysis_task._bump_processing_heartbeat(db, analysis.id)
+    analysis_task._bump_processing_heartbeat(analysis_id, generation)
 
     db.expire_all()
     assert analysis.processing_heartbeat_at is not None
     assert analysis.processing_heartbeat_at >= first_write
 
 
+def test_bump_processing_heartbeat_does_not_touch_a_stale_generation(monkeypatch):
+    """The conditional UPDATE's WHERE clause requires
+    processing_generation == generation - an old generation's heartbeat
+    call must not refresh a row a new generation now owns."""
+    monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(
+        db, alice, status="processing", processing_generation=2, processing_heartbeat_at=None,
+    )
+    analysis_id = analysis.id
+
+    analysis_task._bump_processing_heartbeat(analysis_id, 1)  # stale generation
+
+    db.expire_all()
+    assert analysis.processing_heartbeat_at is None
+
+
+def test_bump_processing_heartbeat_does_not_touch_a_terminal_analysis(monkeypatch):
+    monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="completed", processing_heartbeat_at=None)
+    analysis_id, generation = analysis.id, analysis.processing_generation
+
+    analysis_task._bump_processing_heartbeat(analysis_id, generation)
+
+    db.expire_all()
+    assert analysis.processing_heartbeat_at is None
+
+
 def test_bump_processing_heartbeat_failure_is_logged_and_swallowed(monkeypatch):
     monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
-    db = Mock()
-    db.query.return_value.filter.return_value.update.side_effect = RuntimeError("db gone")
+    broken_db = Mock()
+    broken_db.execute.side_effect = RuntimeError("db gone")
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: broken_db)
 
-    analysis_task._bump_processing_heartbeat(db, 9)  # must not raise
+    analysis_task._bump_processing_heartbeat(9, 0)  # must not raise
 
-    db.rollback.assert_called_once()
+    broken_db.rollback.assert_called_once()
+    broken_db.close.assert_called_once()
 
 
 def test_bump_processing_heartbeat_throttle_cache_is_bounded(monkeypatch):
     monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
     monkeypatch.setattr(analysis_task, "_HEARTBEAT_THROTTLE_CACHE_MAX_ENTRIES", 3)
-    db = _session()
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
     alice = _user(db)
     analyses = [_analysis(db, alice, status="processing") for _ in range(5)]
 
     for analysis in analyses:
-        analysis_task._bump_processing_heartbeat(db, analysis.id)
+        analysis_task._bump_processing_heartbeat(analysis.id, analysis.processing_generation)
 
     assert len(analysis_task._last_heartbeat_write) == 3
+
+
+def test_bump_processing_heartbeat_throttle_cache_keys_by_generation(monkeypatch):
+    """After recovery advances processing_generation, a throttle entry the
+    OLD generation left behind must not suppress the new generation's own
+    first heartbeat write."""
+    monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
+    alice = _user(db)
+    analysis = _analysis(
+        db, alice, status="processing", processing_generation=1, processing_heartbeat_at=None,
+    )
+    analysis_id = analysis.id
+
+    analysis_task._bump_processing_heartbeat(analysis_id, 1)
+    db.expire_all()
+    assert analysis.processing_heartbeat_at is not None
+
+    # Recovery advances the generation; the throttle cache still holds a
+    # fresh (analysis_id, 1) entry, but generation 2 has never written yet.
+    analysis.processing_generation = 2
+    analysis.processing_heartbeat_at = None
+    db.commit()
+
+    analysis_task._bump_processing_heartbeat(analysis_id, 2)
+
+    db.expire_all()
+    assert analysis.processing_heartbeat_at is not None  # not suppressed by generation 1's entry
 
 
 def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch, tmp_path):
@@ -148,7 +234,8 @@ def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch
     the real _bump_processing_heartbeat() (and its real throttle/DB write)
     still run underneath the spy."""
     monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
-    db = _session()
+    session_factory = _heartbeat_session_factory(monkeypatch)
+    db = session_factory()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", processing_heartbeat_at=None)
     artifact_path = tmp_path / "a.log"
@@ -165,13 +252,15 @@ def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch
     heartbeat_calls = []
     real_bump = analysis_task._bump_processing_heartbeat
 
-    def spy_bump(db_arg, analysis_id):
+    def spy_bump(analysis_id, generation):
         heartbeat_calls.append(analysis_id)
-        return real_bump(db_arg, analysis_id)
+        return real_bump(analysis_id, generation)
 
     monkeypatch.setattr(analysis_task, "_bump_processing_heartbeat", spy_bump)
 
-    parsed_count = analysis_task._process_artifact(db=db, analysis=analysis, artifact=artifact)
+    parsed_count = analysis_task._process_artifact(
+        db=db, analysis=analysis, artifact=artifact, generation=0
+    )
 
     # Invoked once per persisted batch (the cheap Python call this section
     # requires)...
@@ -239,6 +328,9 @@ def test_recover_stale_analyses_redispatches_when_heartbeat_is_older_than_thresh
     analysis = _stale_analysis(
         db, alice, age_seconds=analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS + 30
     )
+    # An actively-processing artifact is what makes the fast 300s window
+    # (rather than the conservative 30-minute queue-wait window) apply.
+    _artifact(db, analysis, status="processing")
     analysis_id = analysis.id
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     delayed = []
@@ -273,6 +365,7 @@ def test_recover_stale_analyses_claims_activity_301_seconds_old(monkeypatch):
     db = _session()
     alice = _user(db)
     analysis = _stale_analysis(db, alice, age_seconds=301)
+    _artifact(db, analysis, status="processing")
     analysis_id = analysis.id
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     delayed = []
@@ -282,6 +375,144 @@ def test_recover_stale_analyses_claims_activity_301_seconds_old(monkeypatch):
 
     assert claimed_count == 1
     assert delayed == [analysis_id]
+
+
+# --- IMAGE (OCR) artifacts: restart-only recovery, never a byte/line resume --
+
+
+def test_stale_recovery_resets_a_stuck_image_artifact_for_a_clean_restart(monkeypatch, tmp_path):
+    """OCR's own logical text-line offsets are not byte offsets into the
+    encoded image, so a partially-processed IMAGE artifact can never safely
+    resume from its checkpoint the way a text/JSON artifact can - the only
+    safe recovery is a full restart. Reclaiming a stuck IMAGE artifact must
+    therefore also erase its partial Evidence and OCR fallback excerpt
+    (which are only meaningful together with the checkpoint they were
+    produced alongside), while leaving the raw image file itself alone so
+    the next attempt can OCR it again from scratch."""
+    db = _session()
+    alice = _user(db)
+    analysis = _stale_analysis(db, alice, age_seconds=301)
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    artifact = _artifact(
+        db, analysis, status="processing",
+        detected_format="image",
+        saved_file_path=str(image_path),
+        processed_bytes=2,  # a bogus "line count", never a real byte offset
+        last_processed_line=2,
+        fallback_context="partial OCR excerpt from before the crash",
+    )
+    db.add(Evidence(
+        analysis_id=analysis.id, artifact_id=artifact.id, correlation_key="k1",
+        fingerprint="fp1", first_line_number=1, last_line_number=1,
+        severity="ERROR", event_type="exception",
+    ))
+    db.add(Evidence(
+        analysis_id=analysis.id, artifact_id=artifact.id, correlation_key="k2",
+        fingerprint="fp2", first_line_number=2, last_line_number=2,
+        severity="ERROR", event_type="exception",
+    ))
+    db.commit()
+    analysis_id = analysis.id
+    artifact_id = artifact.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: None)
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 1
+    reloaded = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).first()
+    assert reloaded.status == "pending"
+    assert reloaded.processed_bytes == 0
+    assert reloaded.last_processed_line == 0
+    assert reloaded.fallback_context is None
+    assert db.query(Evidence).filter(Evidence.artifact_id == artifact_id).count() == 0
+    # The raw image itself must survive - OCR needs to run on it again.
+    assert image_path.exists()
+    reloaded_analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded_analysis.status == "pending"
+
+
+def test_stale_recovery_does_not_touch_a_sibling_text_artifacts_checkpoint(monkeypatch):
+    """The IMAGE-specific wipe in stale recovery must be scoped to IMAGE
+    artifacts only - a text/JSON artifact stuck alongside a stuck IMAGE
+    artifact in the same analysis keeps its normal, safely-resumable
+    checkpoint and its already-committed Evidence untouched."""
+    db = _session()
+    alice = _user(db)
+    analysis = _stale_analysis(db, alice, age_seconds=301)
+    image_artifact = _artifact(
+        db, analysis, position=0, status="processing", detected_format="image",
+        processed_bytes=2, last_processed_line=2, fallback_context="partial ocr",
+    )
+    text_artifact = _artifact(
+        db, analysis, position=1, status="processing", detected_format="generic",
+        processed_bytes=500, last_processed_line=10, fallback_context="small text excerpt",
+    )
+    db.add(Evidence(
+        analysis_id=analysis.id, artifact_id=text_artifact.id, correlation_key="k1",
+        fingerprint="fp1", first_line_number=1, last_line_number=1,
+        severity="ERROR", event_type="exception",
+    ))
+    db.commit()
+    text_artifact_id = text_artifact.id
+    image_artifact_id = image_artifact.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: None)
+
+    analysis_task.recover_stale_analyses.run()
+
+    reloaded_text = (
+        db.query(AnalysisArtifact).filter(AnalysisArtifact.id == text_artifact_id).first()
+    )
+    assert reloaded_text.status == "pending"
+    assert reloaded_text.processed_bytes == 500  # untouched checkpoint
+    assert reloaded_text.last_processed_line == 10
+    assert reloaded_text.fallback_context == "small text excerpt"
+    assert db.query(Evidence).filter(Evidence.artifact_id == text_artifact_id).count() == 1
+    reloaded_image = (
+        db.query(AnalysisArtifact).filter(AnalysisArtifact.id == image_artifact_id).first()
+    )
+    assert reloaded_image.processed_bytes == 0
+    assert reloaded_image.fallback_context is None
+
+
+def test_image_artifact_processed_bytes_stays_zero_until_full_completion(monkeypatch, tmp_path):
+    """OCR text-reconstruction offsets are logical line positions within the
+    extracted text, never byte offsets into the encoded image - persisting
+    them into processed_bytes mid-run would masquerade as a real byte
+    checkpoint (and, combined with old partial Evidence, invite a resume
+    that double-counts). processed_bytes must stay 0 through every
+    intermediate batch and only become size_bytes on the single terminal
+    completion write."""
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing", processing_generation=3)
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    artifact = _artifact(
+        db, analysis, status="pending", detected_format=None,
+        saved_file_path=str(image_path), size_bytes=image_path.stat().st_size,
+    )
+    monkeypatch.setattr(
+        analysis_task, "extract_text_from_image_with_confidence",
+        lambda path: ("ERROR: first failure\nERROR: second failure\n", 0.9),
+    )
+    monkeypatch.setattr(analysis_task, "publish_artifact_outcome", lambda *a, **k: None)
+
+    seen_offsets = []
+
+    def fake_persist(*, db, analysis_id, events, artifact_id=None):
+        seen_offsets.append(artifact.processed_bytes)
+
+    monkeypatch.setattr(analysis_task, "persist_evidence_batch", fake_persist)
+
+    analysis_task._process_artifact(db=db, analysis=analysis, artifact=artifact, generation=3)
+
+    assert seen_offsets, "expected at least one persisted batch"
+    assert all(offset == 0 for offset in seen_offsets)
+    assert artifact.status == "completed"
+    assert artifact.processed_bytes == artifact.size_bytes  # only set at the very end
 
 
 def test_recover_stale_analyses_never_touches_a_fresh_heartbeat(monkeypatch):
@@ -353,17 +584,274 @@ def test_recover_stale_analyses_scan_is_bounded_per_tick(monkeypatch):
     assert claimed_count == limit  # bounded, not all (limit + 5)
 
 
+# --- pending recovery uses its own, much more conservative window --------
+#
+# Production incident: worker_concurrency=2 meant two large, genuinely
+# healthy analyses (~1GB and ~500MB) occupied both worker slots while a
+# third, smaller one sat normally queued. The old code treated "pending +
+# NULL heartbeat + 300s" as orphaned, so recovery redispatched a SECOND
+# process_analysis for the still-healthy queued one - once a worker slot
+# freed up, both the original and the falsely "recovered" copy ran,
+# causing duplicate artifact processing, duplicate finalization, and a
+# duplicate Gemini call. The tests below pin the fix: pending status uses
+# COALESCE(processing_heartbeat_at, created_at) against a much longer
+# (30-minute) grace window, completely independent of the 300-second
+# processing window.
+
+
+def _pending_analysis(db, user, *, created_age_seconds=0, heartbeat_age_seconds=None, **kwargs):
+    now = datetime.now(timezone.utc)
+    heartbeat = (
+        None if heartbeat_age_seconds is None
+        else now - timedelta(seconds=heartbeat_age_seconds)
+    )
+    return _analysis(
+        db, user, status="pending",
+        created_at=now - timedelta(seconds=created_age_seconds),
+        processing_heartbeat_at=heartbeat,
+        **kwargs,
+    )
+
+
+def test_pending_recovery_threshold_is_a_conservative_30_minute_constant():
+    assert analysis_task._PENDING_ANALYSIS_RECOVERY_THRESHOLD_SECONDS == 30 * 60
+
+
+def test_recover_stale_analyses_does_not_falsely_reclaim_a_healthy_pending_backlog(monkeypatch):
+    """Reproduces the exact production bug (Analyses 28/29/30): Analysis A
+    is a genuinely healthy large analysis occupying the (intentionally
+    small) worker pool; B and C are healthy pending analyses still queued
+    behind it - older than the old, wrong 300-second window but
+    comfortably inside the new 30-minute pending grace window. Recovery
+    must claim none of them, even across repeated Beat ticks, so it can
+    never create the duplicate top-level process_analysis dispatch that
+    caused duplicate work/finalization/Gemini calls in production."""
+    db = _session()
+    alice = _user(db)
+    analysis_a = _analysis(
+        db, alice, status="processing",
+        processing_heartbeat_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+    )
+    analysis_b = _pending_analysis(db, alice, created_age_seconds=400)
+    analysis_c = _pending_analysis(db, alice, created_age_seconds=600)
+    ids = [analysis_a.id, analysis_b.id, analysis_c.id]
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    first_claimed = analysis_task.recover_stale_analyses.run()
+    second_claimed = analysis_task.recover_stale_analyses.run()
+
+    assert first_claimed == 0
+    assert second_claimed == 0
+    assert delayed == []
+    for analysis_id in ids:
+        assert analysis_id not in delayed
+
+
+def test_pending_with_null_heartbeat_301_seconds_old_is_not_recovered(monkeypatch):
+    """This was specifically WRONG under the old shared 300-second rule."""
+    db = _session()
+    alice = _user(db)
+    _pending_analysis(db, alice, created_age_seconds=301)
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 0
+    assert delayed == []
+
+
+def test_pending_with_null_heartbeat_several_minutes_old_is_not_recovered(monkeypatch):
+    db = _session()
+    alice = _user(db)
+    _pending_analysis(db, alice, created_age_seconds=600)
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 0
+    assert delayed == []
+
+
+def test_pending_just_below_the_pending_threshold_is_not_recovered(monkeypatch):
+    db = _session()
+    alice = _user(db)
+    _pending_analysis(
+        db, alice,
+        created_age_seconds=analysis_task._PENDING_ANALYSIS_RECOVERY_THRESHOLD_SECONDS - 1,
+    )
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 0
+    assert delayed == []
+
+
+def test_pending_just_beyond_the_pending_threshold_is_recovered_exactly_once(monkeypatch):
+    db = _session()
+    alice = _user(db)
+    analysis = _pending_analysis(
+        db, alice,
+        created_age_seconds=analysis_task._PENDING_ANALYSIS_RECOVERY_THRESHOLD_SECONDS + 1,
+    )
+    analysis_id = analysis.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 1
+    assert delayed == [analysis_id]
+    reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert reloaded.processing_heartbeat_at is not None  # claim fence written
+
+
+def test_pending_previously_claimed_with_a_fresh_heartbeat_is_not_reclaimed_again(monkeypatch):
+    """Proves the COALESCE/fresh-claim-time behavior: an old created_at
+    must not matter once a previous recovery claim wrote a fresh
+    processing_heartbeat_at - that heartbeat becomes the new age
+    reference, exactly as it already does for "processing" rows."""
+    db = _session()
+    alice = _user(db)
+    _pending_analysis(db, alice, created_age_seconds=100_000, heartbeat_age_seconds=5)
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 0
+    assert delayed == []
+
+
+def test_pending_becomes_recoverable_again_once_its_claim_heartbeat_goes_stale(monkeypatch):
+    db = _session()
+    alice = _user(db)
+    analysis = _pending_analysis(
+        db, alice, created_age_seconds=100_000,
+        heartbeat_age_seconds=analysis_task._PENDING_ANALYSIS_RECOVERY_THRESHOLD_SECONDS + 1,
+    )
+    analysis_id = analysis.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 1
+    assert delayed == [analysis_id]
+
+
+def test_recover_stale_pending_claim_is_atomic_against_a_concurrent_second_scan(monkeypatch):
+    db = _session()
+    alice = _user(db)
+    analysis = _pending_analysis(
+        db, alice,
+        created_age_seconds=analysis_task._PENDING_ANALYSIS_RECOVERY_THRESHOLD_SECONDS + 1,
+    )
+    analysis_id = analysis.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    first_scan_claims = analysis_task.recover_stale_analyses.run()
+    second_scan_claims = analysis_task.recover_stale_analyses.run()
+
+    assert first_scan_claims == 1
+    assert second_scan_claims == 0
+    assert delayed == [analysis_id]  # exactly one redispatch, not two
+
+
+def test_recover_stale_pending_scan_is_bounded_per_tick(monkeypatch):
+    db = _session()
+    alice = _user(db)
+    limit = analysis_task._RECOVERY_SCAN_BATCH_LIMIT
+    threshold = analysis_task._PENDING_ANALYSIS_RECOVERY_THRESHOLD_SECONDS
+    for _ in range(limit + 5):
+        _pending_analysis(db, alice, created_age_seconds=threshold + 1)
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == limit  # bounded, not all (limit + 5)
+
+
+def test_recover_stale_analyses_processing_and_pending_windows_are_independent(monkeypatch):
+    """A single scan correctly separates the two populations: a stale
+    processing analysis is claimed under the 300s rule while a healthy
+    pending backlog under the 30-minute grace window is left alone, in
+    the same tick."""
+    db = _session()
+    alice = _user(db)
+    stale_processing = _stale_analysis(
+        db, alice, status="processing",
+        age_seconds=analysis_task._STALE_ANALYSIS_THRESHOLD_SECONDS + 30,
+    )
+    _artifact(db, stale_processing, status="processing")
+    healthy_pending = _pending_analysis(db, alice, created_age_seconds=400)
+    stale_processing_id = stale_processing.id
+    healthy_pending_id = healthy_pending.id
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    delayed = []
+    monkeypatch.setattr(analysis_task.process_analysis, "delay", lambda aid: delayed.append(aid))
+
+    claimed_count = analysis_task.recover_stale_analyses.run()
+
+    assert claimed_count == 1
+    assert delayed == [stale_processing_id]
+    assert healthy_pending_id not in delayed
+
+
 # --- process_analysis terminal guards allow legitimate redispatch ---------
 
 
-def test_process_analysis_allows_a_recovered_processing_analysis_to_redispatch(monkeypatch):
-    """A "processing" analysis reaching process_analysis again (via the
-    recovery scan's redispatch, or a legitimate redelivery of the
-    top-level task itself) must NOT be treated as already-terminal - only
-    cancelled/completed/failed are terminal guards."""
+def test_process_analysis_does_not_redispatch_an_already_processing_analysis(monkeypatch):
+    """The core fix for the production duplicate-dispatch incident:
+    process_analysis's ONLY way to start a workflow is winning an atomic
+    pending->processing claim. A duplicate invocation that finds the
+    analysis already "processing" (Celery broker redelivery, or any other
+    trigger) must return WITHOUT dispatching anything - it is no longer
+    treated as "fine to proceed from," unlike the old behavior. Only
+    recovery's own demote-to-pending step (see
+    _claim_and_demote_stale_processing) can make a genuinely-stale
+    "processing" analysis dispatchable again."""
     db = _session()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", source_kind=None)
+    _artifact(db, analysis, status="pending")
+    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    monkeypatch.setattr(
+        analysis_task, "group",
+        lambda sigs: (_ for _ in ()).throw(
+            AssertionError("must not dispatch for an already-processing analysis")
+        ),
+    )
+
+    analysis_task.process_analysis.run(analysis.id)  # must not raise, must not dispatch
+
+    db.expire_all()
+    assert analysis.status == "processing"
+    assert analysis.processing_generation == 0  # unclaimed - no new generation
+
+
+def test_process_analysis_claims_a_pending_analysis_and_establishes_a_fresh_generation(monkeypatch):
+    """The companion case: a genuinely "pending" analysis (a fresh upload,
+    or one recovery has just demoted back to pending) IS claimed and
+    dispatched, with processing_generation incremented exactly once."""
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="pending", source_kind=None)
     _artifact(db, analysis, status="pending")
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
@@ -380,6 +868,9 @@ def test_process_analysis_allows_a_recovered_processing_analysis_to_redispatch(m
     analysis_task.process_analysis.run(analysis.id)
 
     assert captured.get("dispatched") is True
+    db.expire_all()
+    assert analysis.status == "processing"
+    assert analysis.processing_generation == 1
 
 
 @pytest.mark.parametrize("status", ["cancelled", "completed", "failed"])
@@ -418,7 +909,11 @@ def test_prepare_source_task_reuses_the_ready_marker_instead_of_recloning(monkey
         db, alice, status="processing", source_kind="github",
         source_reference="https://github.com/example/repo", source_status="ready",
     )
-    monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
+    # _bump_processing_heartbeat now owns its own isolated session (a
+    # separate sessionLocal() call it closes itself) - give it its own
+    # throwaway Mock so it doesn't close this test's real `db` out from
+    # under the rest of _prepare_source_task.
+    monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
     monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
 
     clone_calls = []
@@ -430,7 +925,7 @@ def test_prepare_source_task_reuses_the_ready_marker_instead_of_recloning(monkey
         source_archive, "load_index_manifest", lambda manifest_path, d: {"cached": True}
     )
 
-    analysis_task._prepare_source_task.run(analysis.id)
+    analysis_task._prepare_source_task.run(analysis.id, 0)
 
     assert clone_calls == []  # the ready marker short-circuited real acquisition
     db.expire_all()
@@ -450,7 +945,7 @@ def test_prepare_source_task_does_not_retry_when_source_is_already_unavailable(m
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retry an already-unavailable source")),
     )
 
-    analysis_task._prepare_source_task.run(analysis.id)
+    analysis_task._prepare_source_task.run(analysis.id, 0)
 
     db.expire_all()
     assert analysis.source_status == "unavailable"
@@ -466,7 +961,11 @@ def test_process_analysis_finalizes_directly_when_every_artifact_is_already_term
     artifacts, never reparse them."""
     db = _session()
     alice = _user(db)
-    analysis = _analysis(db, alice, status="processing", source_kind=None)
+    # "pending": recovery's own demotion step (see
+    # _claim_and_demote_stale_processing) is what returns a genuinely-stale
+    # zombie analysis to "pending" before redispatching process_analysis -
+    # process_analysis itself only ever claims from "pending".
+    analysis = _analysis(db, alice, status="pending", source_kind=None)
     _artifact(db, analysis, position=0, status="completed")
     _artifact(db, analysis, position=1, status="resource_limited")
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
@@ -478,12 +977,12 @@ def test_process_analysis_finalizes_directly_when_every_artifact_is_already_term
     finalize_calls = []
     monkeypatch.setattr(
         analysis_task._finalize_analysis_task, "delay",
-        lambda results, aid, dispatch_start: finalize_calls.append((results, aid)),
+        lambda results, aid, generation, dispatch_start: finalize_calls.append((results, aid, generation)),
     )
 
     analysis_task.process_analysis.run(analysis.id)
 
-    assert finalize_calls == [([], analysis.id)]
+    assert finalize_calls == [([], analysis.id, 1)]
 
 
 def test_process_analysis_raises_when_the_analysis_has_no_artifacts_at_all(monkeypatch):
@@ -493,10 +992,12 @@ def test_process_analysis_raises_when_the_analysis_has_no_artifacts_at_all(monke
     error, not a recovery scenario."""
     db = _session()
     alice = _user(db)
-    analysis = _analysis(db, alice, status="processing", source_kind=None)
+    analysis = _analysis(db, alice, status="pending", source_kind=None)
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
-    monkeypatch.setattr(analysis_task, "_mark_analysis_failed", lambda db, aid: None)
+    monkeypatch.setattr(
+        analysis_task, "_mark_analysis_failed", lambda db, aid, generation=None: False
+    )
 
     with pytest.raises(RuntimeError, match="no persisted diagnostic artifacts"):
         analysis_task.process_analysis.run(analysis.id)
@@ -549,7 +1050,7 @@ def test_recovered_zombie_finalizes_end_to_end_without_reparsing_completed_artif
     # Exactly what process_analysis's finalize_only branch does: invoke
     # the finalizer directly with an empty results list (no artifact
     # tasks actually ran this time).
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(published) == 1
     db2 = session_factory()
@@ -581,8 +1082,13 @@ def test_artifact_left_processing_after_a_db_outage_is_recoverable_with_checkpoi
     db = _session()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing")
+    # "pending" with a nonzero checkpoint: a prior crash already left this
+    # exact resumable state (recovery resets a stuck-"processing" artifact
+    # back to "pending" while preserving its last committed checkpoint -
+    # see _claim_and_demote_stale_processing). This redispatch's own atomic
+    # artifact claim is what moves it back to "processing" below.
     artifact = _artifact(
-        db, analysis, status="processing", processed_bytes=500, last_processed_line=10,
+        db, analysis, status="pending", processed_bytes=500, last_processed_line=10,
     )
     db.add(Evidence(
         analysis_id=analysis.id, artifact_id=artifact.id, correlation_key="k1",
@@ -604,10 +1110,12 @@ def test_artifact_left_processing_after_a_db_outage_is_recoverable_with_checkpoi
     # DB is down for the whole scenario - _mark_analysis_failed's own real
     # write would fail and swallow too (proven elsewhere); stubbed here so
     # this test's assertions stay focused on the surrounding state.
-    monkeypatch.setattr(analysis_task, "_mark_analysis_failed", lambda db_arg, aid: None)
+    monkeypatch.setattr(
+        analysis_task, "_mark_analysis_failed", lambda db_arg, aid, generation=None: False
+    )
 
     with pytest.raises(OperationalError):
-        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
 
     reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert reloaded.status == "processing"  # never falsely "failed"
@@ -658,7 +1166,7 @@ def test_a_failing_rollback_does_not_mask_the_original_db_failure(monkeypatch):
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing")
     artifact = _artifact(
-        db, analysis, status="processing", processed_bytes=500, last_processed_line=10,
+        db, analysis, status="pending", processed_bytes=500, last_processed_line=10,
     )
     db.add(Evidence(
         analysis_id=analysis.id, artifact_id=artifact.id, correlation_key="k1",
@@ -682,10 +1190,12 @@ def test_a_failing_rollback_does_not_mask_the_original_db_failure(monkeypatch):
         db, "rollback",
         Mock(side_effect=OperationalError("ROLLBACK", {}, Exception("connection gone"))),
     )
-    monkeypatch.setattr(analysis_task, "_mark_analysis_failed", lambda db_arg, aid: None)
+    monkeypatch.setattr(
+        analysis_task, "_mark_analysis_failed", lambda db_arg, aid, generation=None: None
+    )
 
     with pytest.raises(OperationalError) as exc_info:
-        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
 
     assert exc_info.value is original_error  # not the rollback's own exception
     db.rollback.assert_called_once()
@@ -750,13 +1260,13 @@ def test_finalize_bumps_heartbeat_after_gemini_resolves(monkeypatch):
     heartbeat_calls = []
     real_bump = analysis_task._bump_processing_heartbeat
 
-    def spy_bump(db_arg, aid):
+    def spy_bump(aid, generation):
         heartbeat_calls.append(aid)
-        return real_bump(db_arg, aid)
+        return real_bump(aid, generation)
 
     monkeypatch.setattr(analysis_task, "_bump_processing_heartbeat", spy_bump)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     # Once at finalize entry, once more after Gemini resolves.
     assert heartbeat_calls == [analysis_id, analysis_id]

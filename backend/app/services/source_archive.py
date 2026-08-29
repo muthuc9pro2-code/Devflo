@@ -237,10 +237,17 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
         else:
             raise SourceInputError(f"Unsupported source kind: {source_kind}")
 
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.touch()
         index = build_index(dest)
         save_index_manifest(index, manifest_path)
+        # The ready marker is published LAST, only once the source tree,
+        # its index, and the on-disk manifest are all durably complete - a
+        # reader that observes the marker can trust the whole prepared
+        # state is loadable via the fast path above, with no dependency on
+        # this same process ever finishing. Publishing it any earlier would
+        # let a crash between the touch and the manifest write leave a
+        # marker whose promised state is not actually there yet.
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
     except Exception:
         cleanup_prepared_source(analysis_id)
         raise

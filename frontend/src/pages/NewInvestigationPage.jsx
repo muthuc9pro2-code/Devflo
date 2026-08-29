@@ -29,7 +29,7 @@ function persistUploadManifest(analysisId, selections) {
   }
 }
 
-export default function NewInvestigationPage({ onUploaded }) {
+export default function NewInvestigationPage({ onUploaded, onUploadingChange }) {
   const [files, setFiles] = useState([])
   const filesRef = useRef([])
   const [rejectedFiles, setRejectedFiles] = useState([])
@@ -192,6 +192,7 @@ export default function NewInvestigationPage({ onUploaded }) {
     uploadInFlightRef.current = true
     setUploadState('uploading')
     setErrorMessage('')
+    onUploadingChange?.(true)
 
     try {
       const result = await uploadFiles(
@@ -200,7 +201,13 @@ export default function NewInvestigationPage({ onUploaded }) {
       )
       persistUploadManifest(result.id, files)
       window.dispatchEvent(new Event('devflo:history-refresh'))
+      // Keep the lock held through the handoff: onUploaded() triggers
+      // AppShell's navigate() first, and releasing the lock right after
+      // (same synchronous tick, so React batches both) means navigation
+      // and unlock land in the same render - never a frame where controls
+      // are enabled while this page is still the one on screen.
       if (mountedRef.current) onUploaded(result)
+      onUploadingChange?.(false)
     } catch (error) {
       if (mountedRef.current) {
         setUploadState('error')
@@ -210,6 +217,7 @@ export default function NewInvestigationPage({ onUploaded }) {
             : 'Devflo could not start this investigation. Please try again.',
         )
       }
+      onUploadingChange?.(false)
     } finally {
       uploadInFlightRef.current = false
     }

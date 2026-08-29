@@ -390,7 +390,7 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
         lambda analysis_id, stage, message, progress=None: published_progress.append(progress),
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     # The overall analysis still succeeds normally.
     session_factory = analysis_task.sessionLocal
@@ -478,7 +478,7 @@ def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
         lambda analysis_id, payload: investigation_results.append(payload),
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(investigation_results) == 1
     assert investigation_results[0]["investigation_path"] == "zero_evidence"

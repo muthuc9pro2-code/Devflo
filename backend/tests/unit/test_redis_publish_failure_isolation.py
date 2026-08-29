@@ -194,7 +194,7 @@ def test_finalize_survives_a_real_redis_publish_failure_at_the_final_event(monke
         lambda ctx: (_ for _ in ()).throw(GeminiUnavailableError("unavailable")),
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -227,7 +227,7 @@ def test_finalize_correlated_path_survives_a_real_redis_publish_failure(monkeypa
         lambda ctx: (_ for _ in ()).throw(GeminiUnavailableError("unavailable")),
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()

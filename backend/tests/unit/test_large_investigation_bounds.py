@@ -160,7 +160,7 @@ def test_finalize_applies_the_correlated_bound_end_to_end(monkeypatch):
     )
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(published) == 1
     payload = published[0]

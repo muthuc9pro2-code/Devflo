@@ -429,7 +429,7 @@ def test_finalize_does_not_block_on_duplicate_or_unsupported_artifacts(monkeypat
         lambda aid, p: investigation_calls.append(p),
     )
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     # Reached the zero-evidence completion path (no Evidence rows at all
     # here) instead of being stuck skipping finalize forever.

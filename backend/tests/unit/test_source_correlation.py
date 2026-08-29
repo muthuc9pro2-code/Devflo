@@ -197,3 +197,92 @@ def test_source_zip_and_github_source_share_one_index_path(tmp_path, monkeypatch
     github_index = prepare_source("github", "https://github.com/acme/project", 2)
 
     assert set(zip_index.by_path) == set(github_index.by_path) == {"app/main.py"}
+
+
+# --- Crash safety: the .ready marker is published LAST ---------------------
+
+
+def test_ready_marker_is_not_written_if_index_build_crashes(tmp_path, monkeypatch):
+    """A reader must be able to trust that observing the .ready marker
+    means the WHOLE prepared state (tree + index + manifest) is loadable -
+    so the marker can only ever be published after build_index() and
+    save_index_manifest() both succeed. If index building crashes, no
+    marker may exist yet, even though the tree itself was fully cloned."""
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    def fake_clone(url, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "app.py").write_text("print(1)\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+    monkeypatch.setattr(
+        source_archive, "build_index",
+        lambda dest: (_ for _ in ()).throw(RuntimeError("index build crashed")),
+    )
+
+    with pytest.raises(RuntimeError, match="index build crashed"):
+        prepare_source("github", "https://github.com/acme/project", 55)
+
+    dest = tmp_path / "sources" / "55"
+    marker = source_archive._ready_marker(dest)
+    assert not marker.exists()
+    # The crash's own cleanup (prepare_source's except-block) also removes
+    # the partial tree itself, matching the existing "partial dest must
+    # never look prepared" contract proven above.
+    assert not dest.exists()
+
+
+def test_ready_marker_is_only_written_after_the_manifest_is_saved(tmp_path, monkeypatch):
+    """Same crash window, one step later: the tree is cloned AND the index
+    is built in memory, but persisting the manifest itself fails. The
+    marker still must not exist - a reader must never see "ready" while the
+    on-disk manifest a fast resume depends on is missing."""
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    def fake_clone(url, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "app.py").write_text("print(1)\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+    monkeypatch.setattr(
+        source_archive, "save_index_manifest",
+        lambda index, manifest_path: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        prepare_source("github", "https://github.com/acme/project", 56)
+
+    dest = tmp_path / "sources" / "56"
+    marker = source_archive._ready_marker(dest)
+    assert not marker.exists()
+
+
+def test_prepare_source_adopts_an_already_ready_source_without_recloning(tmp_path, monkeypatch):
+    """The other side of the crash window: the marker (now only ever
+    written last) IS present, meaning the tree, index, and manifest were
+    all genuinely completed by a prior attempt - even if that prior
+    process then crashed before the caller got to persist
+    Analysis.source_status="ready" in the database. A resumed
+    prepare_source() call must adopt that already-complete state as-is,
+    never re-clone or re-extract."""
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    clone_calls = []
+
+    def fake_clone(url, dest):
+        clone_calls.append(url)
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "app.py").write_text("print(1)\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+
+    first = prepare_source("github", "https://github.com/acme/project", 57)
+    assert len(clone_calls) == 1
+
+    # Simulate the exact crash window: everything prepare_source() itself
+    # does (tree, index, manifest, marker) already fully happened - only
+    # the CALLER's later "source_status = ready" DB commit never ran.
+    second = prepare_source("github", "https://github.com/acme/project", 57)
+
+    assert len(clone_calls) == 1  # never re-cloned
+    assert set(first.by_path) == set(second.by_path) == {"app.py"}

@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
+logger = logging.getLogger(__name__)
 
 
 @router.post(
@@ -315,7 +317,23 @@ def upload_file(
                 },
             )
 
-    process_analysis.delay(analysis.id)
+    # create_analysis() has already durably committed the Analysis and its
+    # AnalysisArtifact rows above - from the caller's perspective the
+    # upload has already succeeded. A broker/producer error enqueuing the
+    # follow-up Celery task must not turn that into an HTTP failure: the
+    # frontend would then plausibly retry the whole (up to 1 GiB) upload,
+    # creating a second durable Analysis for the same investigation. The
+    # durably-pending row is instead picked up naturally by
+    # recover_stale_analyses's own pending-queue-age recovery once the
+    # broker is reachable again.
+    try:
+        process_analysis.delay(analysis.id)
+    except Exception:
+        logger.exception(
+            "Analysis %s | could not enqueue process_analysis; will be "
+            "picked up by stale-analysis recovery",
+            analysis.id,
+        )
     return analysis
 
 

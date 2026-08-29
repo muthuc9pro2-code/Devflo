@@ -449,14 +449,24 @@ _IDENTITY_GROUP_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _identity_group_sort_key(evidence: Evidence):
-    """Stable (first_seen, id) ordering for a shared-identity group -
-    deterministic regardless of naive/aware timestamps or input list order,
-    and regardless of whether first_seen is even known (falls back to the
-    earliest possible sentinel, then evidence.id)."""
+    """Stable (first_seen, first_line_number) ordering for a shared-identity
+    group - deterministic regardless of naive/aware timestamps or input
+    list order, and regardless of whether first_seen is even known (falls
+    back to the earliest possible sentinel, then first_line_number).
+
+    first_line_number - not evidence.id - is the tie-break: artifacts are
+    processed by independent, concurrently-racing Celery workers
+    (app.tasks.analysis's per-artifact group/chord), so the DB-assigned
+    autoincrement id an Evidence row happens to get reflects commit-race
+    order, not anything about the underlying diagnostic data.
+    first_line_number is instead derived once, at upload time, from
+    artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that artifact's own
+    line number - the same input always yields the same value, regardless
+    of which worker processes which artifact first or how fast each runs."""
     first_seen = evidence.first_seen
     if first_seen is not None and first_seen.tzinfo is None:
         first_seen = first_seen.replace(tzinfo=timezone.utc)
-    return (first_seen or _IDENTITY_GROUP_MIN_TIMESTAMP, evidence.id)
+    return (first_seen or _IDENTITY_GROUP_MIN_TIMESTAMP, evidence.first_line_number)
 
 
 def iter_identity_candidate_pairs(indexes: CorrelationIndexes):
@@ -648,13 +658,19 @@ def iter_temporal_candidates(
     evidence_rows: list[Evidence],
     window_ms: float = 5000.0,
 ):
+    # Tie-broken by first_line_number (never left implicit, which would
+    # silently fall back to evidence_rows's own incoming order - itself
+    # DB-query/commit-race order across concurrently-processing artifact
+    # workers) so two evidence rows sharing an exact timestamp (common
+    # with second-granularity log timestamps or a bulk-imported burst)
+    # sort identically regardless of run-to-run scheduling.
     ordered = sorted(
         (
             evidence
             for evidence in evidence_rows
             if evidence.first_seen is not None
         ),
-        key=lambda evidence: evidence.first_seen,
+        key=lambda evidence: (evidence.first_seen, evidence.first_line_number),
     )
 
     left = 0
@@ -819,17 +835,20 @@ def _canonical_pair_order(
     is bookkeeping for a stable, reproducible score/delta_ms, never itself
     a claim of direction (see _has_strict_time_direction, which is what
     actually decides inferred_propagation-vs-association). Falls back to
-    evidence.id when timestamps tie or are missing so the SAME unordered pair always
-    canonicalizes to the SAME order regardless of which iteration
-    direction - or which shuffled input order - encounters it first;
-    required for correlation to stay invariant to evidence input order.
+    first_line_number - never evidence.id, which reflects commit-race
+    order across concurrently-processing artifact workers, not anything
+    about the underlying data - when timestamps tie or are missing, so the
+    SAME unordered pair always canonicalizes to the SAME order regardless
+    of which iteration direction - or which shuffled input order -
+    encounters it first; required for correlation to stay invariant to
+    evidence input order.
     """
     left_ts, right_ts = left.first_seen, right.first_seen
 
     if left_ts is not None and right_ts is not None and left_ts != right_ts:
         return (left, right) if left_ts < right_ts else (right, left)
 
-    return (left, right) if left.id < right.id else (right, left)
+    return (left, right) if left.first_line_number < right.first_line_number else (right, left)
 
 def build_correlation_edges(
     evidence_rows: list[Evidence],
@@ -1041,10 +1060,26 @@ def build_correlation_components(
                 if neighbor_id not in visited:
                     stack.append(neighbor_id)
 
-        component_nodes = [
-            node_by_id[node_id]
-            for node_id in component_ids
-        ]
+        # Sorted by first_line_number (never left as raw set() iteration
+        # order) so component.nodes has the same order for the same
+        # underlying diagnostic data regardless of Python's per-process
+        # string-hash randomization (no PYTHONHASHSEED is pinned anywhere
+        # in this codebase) and regardless of which node.id string
+        # happened to be assigned to which logical event this run -
+        # first_line_number is derived once at upload time from
+        # artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that
+        # artifact's own line number, so it identifies the same logical
+        # event the same way on every run. This directly feeds
+        # rank_root_causes' and _select_primary_component's own
+        # tie-breaking (see their docstrings), which otherwise inherit
+        # whatever order this produced.
+        component_nodes = sorted(
+            (node_by_id[node_id] for node_id in component_ids),
+            key=lambda node: (
+                node.first_line_number if node.first_line_number is not None else float("inf"),
+                node.id,
+            ),
+        )
 
         component_edges = [
             edge
@@ -1099,8 +1134,32 @@ def _is_time_ordered(edge: CorrelationEdge) -> bool:
     return edge.delta_ms is not None and edge.delta_ms > 0.0
 
 
+def _edge_endpoint_line_number(
+    node_id: str, evidence_by_id: dict[int, Evidence] | None
+) -> float:
+    """Resolves a CorrelationEdge endpoint (an "evidence-<id>" string) back
+    to its underlying Evidence.first_line_number - a value-stable
+    tie-break key, unlike the id embedded in node_id itself, which
+    reflects commit-race order across concurrently-processing artifact
+    workers rather than anything about the underlying data. Falls back to
+    +inf (sorts last) when no lookup was supplied or the id cannot be
+    resolved, so callers that omit evidence_by_id keep their exact prior
+    behavior."""
+    if not evidence_by_id:
+        return float("inf")
+    try:
+        evidence_id = int(node_id.rsplit("-", 1)[-1])
+    except (ValueError, IndexError):
+        return float("inf")
+    evidence = evidence_by_id.get(evidence_id)
+    if evidence is None or evidence.first_line_number is None:
+        return float("inf")
+    return float(evidence.first_line_number)
+
+
 def enforce_dag(
     edges: list[CorrelationEdge],
+    evidence_by_id: dict[int, Evidence] | None = None,
 ) -> list[CorrelationEdge]:
     """A directed cycle needs at least one edge that does NOT strictly
     advance in time: a chain of strictly-increasing timestamps can never
@@ -1127,14 +1186,25 @@ def enforce_dag(
     that turned out to conflict with it - time-ordered edges are now
     always preferred there, which is at least as defensible as pure score.
     """
+    # Tie-broken by the edge's endpoints' first_line_number (never left
+    # implicit, which would silently fall back to `edges`' own incoming
+    # order) so two edges with an identical score sort the same way
+    # regardless of run-to-run scheduling/id-assignment differences.
+    def _edge_tie_break_key(edge: CorrelationEdge) -> tuple[float, float, float]:
+        return (
+            edge.score,
+            -_edge_endpoint_line_number(edge.source_id, evidence_by_id),
+            -_edge_endpoint_line_number(edge.target_id, evidence_by_id),
+        )
+
     time_ordered = sorted(
         (edge for edge in edges if _is_time_ordered(edge)),
-        key=lambda edge: edge.score,
+        key=_edge_tie_break_key,
         reverse=True,
     )
     remaining = sorted(
         (edge for edge in edges if not _is_time_ordered(edge)),
-        key=lambda edge: edge.score,
+        key=_edge_tie_break_key,
         reverse=True,
     )
 
@@ -1435,8 +1505,21 @@ def rank_root_causes(
         for node in component.nodes
     ]
 
+    # Explicit tie-break by first_line_number (never left implicit, which
+    # would silently inherit component.nodes' own order - itself already
+    # made deterministic in build_correlation_components, but only an
+    # accident of this function relying on stable sort rather than a
+    # documented guarantee): root_cause_score can and does tie exactly
+    # (e.g. two nodes with identical graph-stats/role/severity inputs), so
+    # without this the "root cause" shown to the user could depend on
+    # component-construction order rather than an explicit, reviewable
+    # rule.
+    node_by_id = {node.id: node for node in component.nodes}
     candidates.sort(
-        key=lambda candidate: candidate.score,
+        key=lambda candidate: (
+            candidate.score,
+            -(node_by_id[candidate.node_id].first_line_number or 0),
+        ),
         reverse=True,
     )
 
@@ -1679,7 +1762,7 @@ def run_correlation(
     dag_start = perf_counter()
     # enforce_dag only makes sense for directed edges - associations are
     # non-directional by definition, so there is no "cycle" for them.
-    dag_edges = enforce_dag(edges)
+    dag_edges = enforce_dag(edges, evidence_by_id)
     dag_seconds = perf_counter() - dag_start
 
     node_start = perf_counter()

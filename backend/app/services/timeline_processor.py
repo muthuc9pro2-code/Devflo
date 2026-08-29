@@ -21,9 +21,17 @@ def build_component_timeline(
     """
     role_by_node_id = {candidate.node_id: candidate.role for candidate in root_candidates}
 
+    # Tie-broken by first_line_number, not node.id: node.id embeds
+    # Evidence.id, which reflects commit-race order across concurrently-
+    # processing artifact workers, not anything about the underlying
+    # data - first_line_number is derived once at upload time and
+    # identifies the same logical event the same way on every run.
     timed_nodes = sorted(
         (node for node in component.nodes if node.first_seen is not None),
-        key=lambda node: (node.first_seen, node.id),
+        key=lambda node: (
+            node.first_seen,
+            node.first_line_number if node.first_line_number is not None else float("inf"),
+        ),
     )
     untimed_nodes = [node for node in component.nodes if node.first_seen is None]
 

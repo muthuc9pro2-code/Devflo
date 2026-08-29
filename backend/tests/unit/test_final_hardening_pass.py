@@ -536,8 +536,8 @@ def test_process_local_cache_skips_even_the_manifest_read(tmp_path, monkeypatch)
     analysis = SimpleNamespace(id=123, source_kind="zip", source_reference=str(tmp_path / "x.zip"))
     monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", lambda ref: None)
 
-    first = analysis_task._prepare_source_index(analysis)
-    second = analysis_task._prepare_source_index(analysis)
+    first = analysis_task._prepare_source_index(analysis, 0)
+    second = analysis_task._prepare_source_index(analysis, 0)
 
     assert first is second
     assert len(calls) == 1
@@ -647,7 +647,7 @@ def test_low_structure_artifact_survives_alongside_structured_evidence(monkeypat
     )
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     assert len(published) == 1
     payload = published[0]
@@ -721,7 +721,7 @@ def test_truly_irrelevant_artifact_remains_true_no_evidence(monkeypatch):
     )
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
-    analysis_task._finalize_analysis_task.run([], analysis_id, None)
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     payload = published[0]
     assert "supplemental_low_structure_context" not in payload

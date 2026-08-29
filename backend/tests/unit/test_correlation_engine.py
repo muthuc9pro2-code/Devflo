@@ -4,15 +4,20 @@ import pytest
 
 from app.models.evidence import Evidence
 from app.services.correlation_engine import (
+    CorrelationComponent,
+    CorrelationNode,
     NodeGraphStats,
+    build_correlation_components,
     build_correlation_edges,
     build_correlation_indexes,
     classify_node_role,
     match_correlation_signals,
     match_parent_span,
+    rank_root_causes,
     run_correlation,
     temporal_score,
 )
+from app.services import correlation_engine as correlation_engine_module
 
 
 def _evidence(
@@ -30,6 +35,12 @@ def _evidence(
         "first_seen": datetime.now(timezone.utc),
         "last_seen": datetime.now(timezone.utc),
         "source_format": "generic",
+        # Real Evidence.first_line_number is NOT NULL (see the model) -
+        # every deterministic tie-break in correlation_engine.py now uses
+        # it instead of evidence.id, so test fixtures need a real value
+        # too. Distinct per evidence_id, matching this helper's existing
+        # convention for id/fingerprint.
+        "first_line_number": evidence_id,
     }
 
     defaults.update(kwargs)
@@ -482,6 +493,78 @@ def test_correlation_direction_is_deterministic_regardless_of_evidence_row_order
 
     assert signature(shuffled) == baseline
     assert signature(list(reversed(rows))) == baseline
+
+
+def test_rank_root_causes_breaks_an_exact_score_tie_by_first_line_number(monkeypatch):
+    """Two nodes tying exactly on root_cause_score (a real possibility -
+    several float terms of that score can coincide, e.g. two structurally
+    symmetric isolated nodes) must resolve to the SAME winner regardless of
+    which order they happen to appear in component.nodes - proving the
+    tie-break is an explicit, first_line_number-based rule, not an
+    accident of whatever order build_correlation_components (or a shuffled
+    input) produced. root_cause_score itself is stubbed to force the tie
+    deterministically rather than hoping real scoring inputs happen to
+    coincide."""
+    monkeypatch.setattr(correlation_engine_module, "root_cause_score", lambda *a, **k: 0.5)
+
+    node_early = CorrelationNode(
+        id="evidence-a", service="svc", fingerprint=None,
+        first_seen=None, last_seen=None, first_line_number=50,
+    )
+    node_late = CorrelationNode(
+        id="evidence-b", service="svc", fingerprint=None,
+        first_seen=None, last_seen=None, first_line_number=100,
+    )
+
+    forward = CorrelationComponent(nodes=[node_early, node_late], edges=[], associations=[])
+    reversed_order = CorrelationComponent(nodes=[node_late, node_early], edges=[], associations=[])
+
+    ranked_forward = rank_root_causes(forward, {})
+    ranked_reversed = rank_root_causes(reversed_order, {})
+
+    # The earlier (smaller first_line_number) node wins the tie, and wins
+    # it identically regardless of input list order.
+    assert ranked_forward[0].node_id == "evidence-a"
+    assert ranked_reversed[0].node_id == "evidence-a"
+
+
+def test_build_correlation_components_node_order_is_deterministic_regardless_of_set_iteration():
+    """component.nodes must reflect first_line_number order, never raw
+    set() iteration order over string node-ids - Python's per-process
+    string-hash randomization (this repo pins no PYTHONHASHSEED) would
+    otherwise make component.nodes (and everything downstream that relies
+    on its order as an implicit tie-break, e.g. rank_root_causes) vary
+    between worker processes for identical input."""
+    nodes = [
+        CorrelationNode(
+            id=f"evidence-{i}", service="svc", fingerprint=None,
+            first_seen=None, last_seen=None, first_line_number=100 - i,
+        )
+        for i in range(1, 6)
+    ]
+
+    components = build_correlation_components(nodes, edges=[], associations=[])
+
+    assert len(components) == 5  # no edges at all - every node is its own component
+    for component in components:
+        assert len(component.nodes) == 1
+
+    # Now link them all into one component and confirm ordering.
+    from app.services.correlation_engine import CorrelationEdge
+
+    edges = [
+        CorrelationEdge(
+            source_id=nodes[i].id, target_id=nodes[i + 1].id,
+            score=0.9, delta_ms=10.0, relationship_type="explicit_parent_child",
+        )
+        for i in range(len(nodes) - 1)
+    ]
+
+    [linked_component] = build_correlation_components(nodes, edges, associations=[])
+
+    assert [node.first_line_number for node in linked_component.nodes] == sorted(
+        node.first_line_number for node in nodes
+    )
 
 
 def test_equal_timestamp_same_request_id_is_associated_not_causal():

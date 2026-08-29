@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 import logging
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -77,6 +77,21 @@ def _send_verification_email_or_503(email: str, token: str) -> None:
             status_code=503,
             detail="Unable to send verification email. Please try again.",
         ) from None
+
+
+def _send_password_reset_email_background(email: str, token: str) -> None:
+    """Runs after the neutral /forgot-password response has already been
+    sent (see BackgroundTasks usage below) - never inline in the request
+    path. The email provider's round-trip latency (whether it succeeds,
+    fails, or is skipped entirely because no account matched) must never
+    be observable in how long the HTTP response itself takes: that timing
+    is exactly the side channel an attacker could otherwise use to
+    enumerate which email addresses have an account, defeating the whole
+    point of the response's identical wording for every input."""
+    try:
+        send_password_reset_email(email=email, token=token)
+    except ResendError:
+        logger.error("Password reset email delivery failed")
 
 
 @router.post("/register", response_model=RegisterResponse)
@@ -364,20 +379,20 @@ def refresh_token(request: Request, response: Response, db: Session = Depends(ge
 @router.post("/forgot-password")
 def forgot_password(
     request: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     user = get_user_by_email(db, request.email)
 
     if user and user.is_verified:
         reset_token = create_password_reset_token(user.email, user.token_version)
-
-        try:
-            send_password_reset_email(
-                email=user.email,
-                token=reset_token,
-            )
-        except ResendError:
-            logger.error("Password reset email delivery failed")
+        # Backgrounded so the email provider's latency never leaks into
+        # this response's timing (see _send_password_reset_email_background).
+        background_tasks.add_task(
+            _send_password_reset_email_background,
+            email=user.email,
+            token=reset_token,
+        )
 
     return {
         "message": (

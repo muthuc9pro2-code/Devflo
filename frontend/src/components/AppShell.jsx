@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getAnalysisHistory } from '../api/analysis'
 import { ApiError } from '../api/client'
 import { useAuth } from '../context/useAuth'
+import { useCriticalOperation } from '../context/useCriticalOperation'
 import AnalysisPage from '../pages/AnalysisPage'
 import NewInvestigationPage from '../pages/NewInvestigationPage'
 import HistorySidebar from './HistorySidebar'
@@ -34,6 +35,17 @@ export default function AppShell({ pathname, navigate }) {
   const [historyError, setHistoryError] = useState('')
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [newInvestigationKey, setNewInvestigationKey] = useState(0)
+  // True only while the browser->server diagnostic upload
+  // (POST /analysis/upload) is actually in flight - before the durable
+  // Analysis exists. Once it resolves (or fails) this clears immediately;
+  // it is never held during Celery processing, where normal navigation
+  // and the existing Cancel analysis flow apply instead. Shared (not
+  // local state) so App.jsx's own top-level takeovers - a session
+  // expiring, or a backend 503 discovered by some other request - can
+  // also defer tearing down this whole shell while the upload is in
+  // flight; see CriticalOperationContext.
+  const { locked: uploadNavigationLocked, setLocked: setUploadNavigationLocked } =
+    useCriticalOperation()
   const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 900px)').matches)
   const historyRequestRef = useRef(0)
   const liveStatusRef = useRef(new Map())
@@ -182,10 +194,14 @@ export default function AppShell({ pathname, navigate }) {
   }, [isKnownRoute, navigate])
 
   const handleNavigate = useCallback((to) => {
+    // The real safety fence: even if a click handler fires unexpectedly
+    // (e.g. keyboard activation of a nominally disabled control), an
+    // in-flight diagnostic upload must never be abandoned mid-request.
+    if (uploadNavigationLocked) return
     setDrawerOpen(false)
     if (to === '/new') setNewInvestigationKey((value) => value + 1)
     navigate(to)
-  }, [navigate])
+  }, [navigate, uploadNavigationLocked])
 
   const handleUploaded = useCallback((analysis) => {
     navigate(`/investigation/${analysis.id}`)
@@ -219,6 +235,7 @@ export default function AppShell({ pathname, navigate }) {
   }, [])
 
   const handleLogout = useCallback(async () => {
+    if (uploadNavigationLocked) return
     try {
       await logout()
     } catch {
@@ -226,7 +243,7 @@ export default function AppShell({ pathname, navigate }) {
     } finally {
       navigate('/login', { replace: true })
     }
-  }, [logout, navigate])
+  }, [logout, navigate, uploadNavigationLocked])
 
   return (
     <div className="authenticated-shell">
@@ -245,6 +262,7 @@ export default function AppShell({ pathname, navigate }) {
           error={historyError}
           nextCursor={nextCursor}
           user={user}
+          navigationLocked={uploadNavigationLocked}
           onNavigate={handleNavigate}
           onLoadMore={() => loadHistory({ cursor: nextCursor, append: true })}
           onRetry={() => loadHistory()}
@@ -285,7 +303,11 @@ export default function AppShell({ pathname, navigate }) {
 
         <main className={`workspace-main${analysisId ? ' analysis-workspace' : ''}`}>
           {isNewRoute && (
-            <NewInvestigationPage key={newInvestigationKey} onUploaded={handleUploaded} />
+            <NewInvestigationPage
+              key={newInvestigationKey}
+              onUploaded={handleUploaded}
+              onUploadingChange={setUploadNavigationLocked}
+            />
           )}
           {analysisId && (
             <AnalysisPage
