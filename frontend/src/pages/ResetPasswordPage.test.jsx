@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api/client'
@@ -188,6 +189,65 @@ describe('ResetPasswordPage same-password rejection', () => {
     expect(mocks.resetPassword).toHaveBeenLastCalledWith({
       token: 'reset-token',
       newPassword: 'a-different-password',
+    })
+    expect(screen.getByText('Password reset successfully.')).toBeTruthy()
+  })
+})
+
+// A realistic JWT shape (three dot-separated base64url segments, which may
+// themselves contain '-' and '_'), not the "reset-token"/"legacy-reset-token"
+// literals used elsewhere in this file - guards against a fragment-parsing
+// or serialization bug that only a real, dot-and-hyphen-bearing JWT would
+// expose (investigated after a live-deployment report of genuine reset
+// tokens being rejected as "Invalid or expired").
+const REALISTIC_JWT =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' +
+  '.eyJzdWIiOiJ1c2VyQGV4YW1wbGUuY29tIiwidHlwZSI6InBhc3N3b3JkX3Jlc2V0IiwidmVyIjozLCJleHAiOjE3ODAwMDAwMDB9' +
+  '.xprL2iHW-qv7VM8CLXntk2fAkeKVdbMniStvq8bjRzo'
+
+describe('ResetPasswordPage realistic JWT fragment round-trip', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.search = ''
+  })
+
+  it('captures a real JWT-shaped token byte-for-byte, scrubs the URL, and submits the exact same token', async () => {
+    window.history.replaceState({}, '', `/reset-password#token=${REALISTIC_JWT}`)
+    mocks.resetPassword.mockResolvedValue({ message: 'Password reset successfully' })
+
+    render(<ResetPasswordPage />)
+
+    // clearEmailLinkToken runs in a layout effect on mount.
+    expect(window.location.pathname).toBe('/reset-password')
+    expect(window.location.hash).toBe('')
+
+    await submitPasswordReset()
+
+    expect(mocks.resetPassword).toHaveBeenCalledWith({
+      token: REALISTIC_JWT,
+      newPassword: 'new-password',
+    })
+    expect(screen.getByText('Password reset successfully.')).toBeTruthy()
+  })
+
+  it('retains the exact captured token across StrictMode double-invoked mount effects', async () => {
+    window.history.replaceState({}, '', `/reset-password#token=${REALISTIC_JWT}`)
+    mocks.resetPassword.mockResolvedValue({ message: 'Password reset successfully' })
+
+    render(
+      <StrictMode>
+        <ResetPasswordPage />
+      </StrictMode>,
+    )
+    await act(async () => {})
+
+    expect(window.location.hash).toBe('')
+
+    await submitPasswordReset()
+
+    expect(mocks.resetPassword).toHaveBeenCalledWith({
+      token: REALISTIC_JWT,
+      newPassword: 'new-password',
     })
     expect(screen.getByText('Password reset successfully.')).toBeTruthy()
   })
