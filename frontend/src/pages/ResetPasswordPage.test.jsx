@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '../api/client'
 
 const mocks = vi.hoisted(() => ({
   logout: vi.fn(),
@@ -148,5 +149,46 @@ describe('ResetPasswordPage success state', () => {
     expect(window.location.pathname).toBe('/reset-password')
     expect(window.location.search).toBe('')
     expect(window.location.hash).toBe('')
+  })
+})
+
+describe('ResetPasswordPage same-password rejection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.search = ''
+    window.history.replaceState({}, '', '/reset-password#token=reset-token')
+  })
+
+  it('shows the backend message, stays on the form, and lets the user retry with a different password', async () => {
+    mocks.resetPassword.mockRejectedValueOnce(
+      new ApiError('Choose a password different from your current password.', 400),
+    )
+
+    render(<ResetPasswordPage />)
+    await submitPasswordReset()
+
+    expect(
+      screen.getByText('Choose a password different from your current password.'),
+    ).toBeTruthy()
+    expect(screen.queryByText('Password reset successfully.')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Back to sign in' })).toBeNull()
+    expect(mocks.navigate).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Reset password' })).toBeTruthy()
+
+    mocks.resetPassword.mockResolvedValueOnce({ message: 'Password reset successfully' })
+    fireEvent.change(screen.getByLabelText(/^New password/), {
+      target: { value: 'a-different-password' },
+    })
+    fireEvent.change(screen.getByLabelText(/^Confirm new password/), {
+      target: { value: 'a-different-password' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset password' }))
+    await act(async () => {})
+
+    expect(mocks.resetPassword).toHaveBeenLastCalledWith({
+      token: 'reset-token',
+      newPassword: 'a-different-password',
+    })
+    expect(screen.getByText('Password reset successfully.')).toBeTruthy()
   })
 })

@@ -54,7 +54,9 @@ export default function HistorySidebar({
               onNavigate('/new')
             }}
           >
-            <span className="brand-mark" aria-hidden="true">D</span>
+            <span className="brand-mark" aria-hidden="true">
+              <img src="/devflo-logo.png" alt="" />
+            </span>
             <span className="brand">Devflo</span>
           </a>
           <button

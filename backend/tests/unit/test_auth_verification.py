@@ -634,7 +634,7 @@ def test_forgot_password_unverified_user_sends_nothing_but_same_message(monkeypa
 def test_password_reset_replaces_hash_and_increments_version_atomically(monkeypatch):
     user = SimpleNamespace(
         email="verified@example.com",
-        hashed_password="old-password-hash",
+        hashed_password=hash_password("old-password"),
         token_version=4,
     )
     hash_mock = Mock(return_value="new-password-hash")

@@ -417,6 +417,12 @@ def reset_password(
             detail="Invalid or expired password reset token",
         )
 
+    if verify_password(request.new_password, user.hashed_password):
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a password different from your current password.",
+        )
+
     user.hashed_password = hash_password(request.new_password)
     user.token_version += 1
 

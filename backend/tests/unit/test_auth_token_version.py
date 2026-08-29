@@ -316,6 +316,45 @@ def test_reset_token_is_single_use_and_only_new_password_authenticates(monkeypat
     assert authenticate_user(db=Mock(), email=user.email, password=new_password) is user
 
 
+def test_reset_to_current_password_is_rejected_without_consuming_the_token():
+    current_password = "current-password"
+    original_hash = hash_password(current_password)
+    user = SimpleNamespace(
+        email="user@example.com",
+        is_verified=True,
+        hashed_password=original_hash,
+        token_version=6,
+    )
+    reset_token = create_password_reset_token(user.email, user.token_version)
+    db = Mock()
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = user
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.reset_password(
+            request=ResetPasswordRequest(token=reset_token, new_password=current_password),
+            db=db,
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "Choose a password different from your current password."
+    assert user.hashed_password == original_hash
+    assert user.token_version == 6
+    db.commit.assert_not_called()
+
+    new_password = "a-genuinely-new-password"
+    result = auth_api.reset_password(
+        request=ResetPasswordRequest(token=reset_token, new_password=new_password),
+        db=db,
+    )
+
+    assert result == {"message": "Password reset successfully"}
+    assert user.token_version == 7
+    assert user.hashed_password != original_hash
+    assert verify_password(new_password, user.hashed_password)
+    assert not verify_password(current_password, user.hashed_password)
+    db.commit.assert_called_once()
+
+
 def test_stale_reset_token_is_rejected_without_password_change_or_commit():
     original_hash = hash_password("current-password")
     user = SimpleNamespace(
