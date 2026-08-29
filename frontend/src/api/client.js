@@ -57,6 +57,7 @@ const NO_REFRESH_RETRY = new Set([
   '/auth/verify-email',
   '/auth/forgot-password',
   '/auth/reset-password',
+  '/auth/reset-password-status',
 ])
 
 let refreshPromise = null

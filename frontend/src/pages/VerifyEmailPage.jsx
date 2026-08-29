@@ -1,18 +1,26 @@
-import { useEffect, useLayoutEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { verifyEmail } from '../api/auth'
 import { useRouter } from '../router/useRouter'
-import { clearEmailLinkToken, readEmailLinkToken } from '../utils/emailLinkToken'
+import { useEmailLinkToken } from '../utils/emailLinkToken'
 import { ApiError } from '../api/client'
 
 export default function VerifyEmailPage() {
   const { search, navigate } = useRouter()
-  const [token] = useState(() => readEmailLinkToken(search))
-  const [state, setState] = useState(token ? 'verifying' : 'error') // verifying | success | error
-  const [message, setMessage] = useState(token ? '' : 'This verification link is missing its token.')
+  const token = useEmailLinkToken('/verify-email', search)
+  const [checkedToken, setCheckedToken] = useState(null)
+  const [state, setState] = useState(() => (token ? 'verifying' : 'error')) // verifying | success | error
+  const [message, setMessage] = useState(() => (token ? '' : 'This verification link is missing its token.'))
 
-  useLayoutEffect(() => {
-    if (token) clearEmailLinkToken('/verify-email')
-  }, [token])
+  // A newly-arrived token (same mounted page, different email link) must be
+  // verified fresh rather than leaving a previous token's success/error
+  // state on screen. Resetting it here, during render, is React's
+  // documented way to reset state when a prop-like value changes without
+  // forcing a remount - the effect below only does the actual async call.
+  if (token && token !== checkedToken) {
+    setCheckedToken(token)
+    setState('verifying')
+    setMessage('')
+  }
 
   useEffect(() => {
     if (!token) return
@@ -38,7 +46,7 @@ export default function VerifyEmailPage() {
     return () => {
       cancelled = true
     }
-  }, [navigate, token])
+  }, [token])
 
   return (
     <div className="auth-shell">

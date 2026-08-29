@@ -15,7 +15,10 @@ placeholder token, to prove or disprove a frontend/serialization/DB-lookup
 bug in the repository code itself.
 """
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import jwt as pyjwt
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -26,6 +29,7 @@ from app.core.config import Settings
 from app.core.security import (
     ALGORITHM,
     SECRET_KEY,
+    create_access_token,
     create_password_reset_token,
     decode_password_reset_token,
     hash_password,
@@ -34,6 +38,7 @@ from app.core.security import (
 from app.db.database import Base, get_db
 from app.main import app
 from app.models.user import User
+from app.schemas.user import ResetPasswordStatusRequest
 from app.services import email as email_service
 
 
@@ -135,6 +140,13 @@ def test_reset_password_http_boundary_preserves_a_genuine_token_and_succeeds(mon
             genuine_token = captured["token"]
             assert genuine_token
 
+            status_response = client.post(
+                "/auth/reset-password-status",
+                json={"token": genuine_token},
+            )
+            assert status_response.status_code == 200
+            assert status_response.json() == {"status": "valid"}
+
             # Same current password: must be rejected without mutation and
             # without consuming the token.
             same_password_response = client.post(
@@ -181,6 +193,15 @@ def test_reset_password_http_boundary_preserves_a_genuine_token_and_succeeds(mon
             assert replay_response.json() == {
                 "detail": "Invalid or expired password reset token"
             }
+
+            # The status endpoint now (correctly) reports the same token as
+            # already used - for UX only, never as authorization to reset.
+            used_status_response = client.post(
+                "/auth/reset-password-status",
+                json={"token": genuine_token},
+            )
+            assert used_status_response.status_code == 200
+            assert used_status_response.json() == {"status": "used"}
     finally:
         app.dependency_overrides.clear()
 
@@ -215,10 +236,129 @@ def test_jwt_signature_and_algorithm_are_consistent_across_generation_and_decodi
     """Guards against a SECRET_KEY/ALGORITHM mismatch between the process
     that mints a reset token and the one that decodes it - the two must
     always be app.core.security's own module-level constants."""
-    import jwt as pyjwt
-
     token = create_password_reset_token("user@example.com", 0)
     raw_payload = pyjwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
 
     assert raw_payload["type"] == "password_reset"
     assert decode_password_reset_token(token) == raw_payload
+
+
+def _status_lookup_db(user) -> Mock:
+    """reset_password_status() is read-only UX classification, not
+    authorization - it uses the plain get_user_by_email() lookup, never
+    the SELECT ... FOR UPDATE lock the real mutation endpoint takes."""
+    db = Mock()
+    db.query.return_value.filter.return_value.first.return_value = user
+    return db
+
+
+def test_reset_password_status_valid_when_token_version_matches_db():
+    user = SimpleNamespace(email="user@example.com", token_version=3)
+    token = create_password_reset_token(user.email, 3)
+
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=token),
+        db=_status_lookup_db(user),
+    )
+
+    assert result == {"status": "valid"}
+
+
+def test_reset_password_status_used_when_token_version_behind_db():
+    """token.ver < user.token_version can only happen if a successful reset
+    already incremented the version since this link was issued."""
+    user = SimpleNamespace(email="user@example.com", token_version=4)
+    token = create_password_reset_token(user.email, 3)
+
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=token),
+        db=_status_lookup_db(user),
+    )
+
+    assert result == {"status": "used"}
+
+
+def test_reset_password_status_invalid_when_token_version_ahead_of_db():
+    """token.ver > user.token_version is an impossible/inconsistent state
+    (it would require guessing a version the account never reached) -
+    classified as invalid, never valid or used."""
+    user = SimpleNamespace(email="user@example.com", token_version=1)
+    token = create_password_reset_token(user.email, 5)
+
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=token),
+        db=_status_lookup_db(user),
+    )
+
+    assert result == {"status": "invalid"}
+
+
+def test_reset_password_status_invalid_for_unknown_user():
+    token = create_password_reset_token("ghost@example.com", 0)
+
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=token),
+        db=_status_lookup_db(None),
+    )
+
+    assert result == {"status": "invalid"}
+
+
+def test_reset_password_status_invalid_for_malformed_token():
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token="not-a-jwt"),
+        db=Mock(),
+    )
+
+    assert result == {"status": "invalid"}
+
+
+def test_reset_password_status_invalid_for_expired_token():
+    expired = pyjwt.encode(
+        {
+            "sub": "user@example.com",
+            "type": "password_reset",
+            "ver": 0,
+            "exp": datetime.now(UTC) - timedelta(seconds=1),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=expired),
+        db=Mock(),
+    )
+
+    assert result == {"status": "invalid"}
+
+
+def test_reset_password_status_invalid_for_wrong_jwt_type():
+    """A validly-signed access token must not double as a reset-status
+    credential just because the JWT itself verifies."""
+    token = create_access_token("user@example.com", 0)
+
+    result = auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=token),
+        db=Mock(),
+    )
+
+    assert result == {"status": "invalid"}
+
+
+def test_reset_password_status_never_mutates_or_locks():
+    user = SimpleNamespace(
+        email="user@example.com", token_version=3, hashed_password="original-hash"
+    )
+    token = create_password_reset_token(user.email, 3)
+    db = _status_lookup_db(user)
+
+    auth_api.reset_password_status(
+        request=ResetPasswordStatusRequest(token=token),
+        db=db,
+    )
+
+    db.commit.assert_not_called()
+    db.query.return_value.filter.return_value.with_for_update.assert_not_called()
+    assert user.hashed_password == "original-hash"
+    assert user.token_version == 3

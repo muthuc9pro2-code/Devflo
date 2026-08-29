@@ -60,3 +60,10 @@ export function resetPassword({ token, newPassword }) {
     body: JSON.stringify({ token, new_password: newPassword }),
   })
 }
+
+export function resetPasswordStatus(token) {
+  return request('/auth/reset-password-status', {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+  })
+}

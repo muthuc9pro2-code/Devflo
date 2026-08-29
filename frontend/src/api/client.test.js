@@ -139,6 +139,7 @@ describe('verification handoff API retry behavior', () => {
     '/auth/verify-email',
     '/auth/forgot-password',
     '/auth/reset-password',
+    '/auth/reset-password-status',
   ])('does not refresh after a public auth 401 from %s', async (path) => {
     const fetchMock = vi.fn().mockResolvedValue({
       status: 401,

@@ -1,8 +1,8 @@
-import { useLayoutEffect, useState } from 'react'
-import { resetPassword } from '../api/auth'
+import { useEffect, useState } from 'react'
+import { resetPassword, resetPasswordStatus } from '../api/auth'
 import { useAuth } from '../context/useAuth'
 import { useRouter } from '../router/useRouter'
-import { clearEmailLinkToken, readEmailLinkToken } from '../utils/emailLinkToken'
+import { useEmailLinkToken } from '../utils/emailLinkToken'
 import { ApiError } from '../api/client'
 
 const AUTH_EVENTS_CHANNEL = 'devflo-auth-events'
@@ -25,14 +25,50 @@ function publishPasswordResetSuccess() {
 export default function ResetPasswordPage() {
   const { search, navigate } = useRouter()
   const { logout } = useAuth()
-  const [token] = useState(() => readEmailLinkToken(search))
+  const token = useEmailLinkToken('/reset-password', search)
+  const [checkedToken, setCheckedToken] = useState(null)
+  const [linkStatus, setLinkStatus] = useState(() => (token ? 'checking' : 'idle'))
   const [form, setForm] = useState({ newPassword: '', confirmPassword: '' })
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [success, setSuccess] = useState(false)
 
-  useLayoutEffect(() => {
-    if (token) clearEmailLinkToken('/reset-password')
+  // A newly-arrived token (same mounted page, different email link) must be
+  // evaluated fresh - any stale form/error/success state from a previous
+  // token must not linger on screen while this one is being classified.
+  // Resetting it here, during render, is React's documented way to reset
+  // state when a prop-like value changes without forcing a remount (see
+  // https://react.dev/learn/you-might-not-need-an-effect) - the effect
+  // below is left to do only the actual async status fetch.
+  if (token && token !== checkedToken) {
+    setCheckedToken(token)
+    setLinkStatus('checking')
+    setError('')
+    setForm({ newPassword: '', confirmPassword: '' })
+    setSuccess(false)
+    setSubmitting(false)
+  }
+
+  useEffect(() => {
+    if (!token) return
+
+    let cancelled = false
+
+    resetPasswordStatus(token)
+      .then((result) => {
+        if (cancelled) return
+        setLinkStatus(result.status)
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Fail closed: never fall open into showing the password form when
+        // the link's status genuinely could not be determined.
+        setLinkStatus('invalid')
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [token])
 
   const handleChange = (event) => {
@@ -60,6 +96,22 @@ export default function ResetPasswordPage() {
       setSuccess(true)
       publishPasswordResetSuccess()
     } catch (err) {
+      // The token may have been consumed by another device between the
+      // last status check and this submission. Re-check once so that
+      // specific race lands on the success screen instead of a confusing
+      // error - any other rejection (including the same-current-password
+      // one, which never changes token state) keeps its real message.
+      if (err instanceof ApiError && err.status >= 400) {
+        try {
+          const recheck = await resetPasswordStatus(token)
+          if (recheck.status === 'used') {
+            setLinkStatus('used')
+            return
+          }
+        } catch {
+          // Best-effort UX only; fall through to the real error below.
+        }
+      }
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setSubmitting(false)
@@ -76,7 +128,21 @@ export default function ResetPasswordPage() {
     }
   }
 
-  if (success) {
+  if (!token) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <h1 className="brand">Devflo</h1>
+          <p className="status-error" role="alert">This password reset link is missing its token.</p>
+          <button className="btn-secondary" type="button" onClick={() => navigate('/forgot-password')}>
+            Request a new link
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (success || linkStatus === 'used') {
     return (
       <div className="auth-shell">
         <div className="auth-card">
@@ -90,15 +156,26 @@ export default function ResetPasswordPage() {
     )
   }
 
-  if (!token) {
+  if (linkStatus === 'invalid') {
     return (
       <div className="auth-shell">
         <div className="auth-card">
           <h1 className="brand">Devflo</h1>
-          <p className="status-error" role="alert">This password reset link is missing its token.</p>
+          <p className="status-error" role="alert">This password reset link is invalid or has expired.</p>
           <button className="btn-secondary" type="button" onClick={() => navigate('/forgot-password')}>
             Request a new link
           </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (linkStatus === 'checking') {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <h1 className="brand">Devflo</h1>
+          <p className="tagline" role="status">Checking your reset link…</p>
         </div>
       </div>
     )

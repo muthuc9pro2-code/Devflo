@@ -9,7 +9,7 @@ const client = vi.hoisted(() => ({
 
 vi.mock('./client', () => client)
 
-import { completeVerificationSession, verifyEmail } from './auth'
+import { completeVerificationSession, resetPasswordStatus, verifyEmail } from './auth'
 
 describe('verification auth API', () => {
   beforeEach(() => {
@@ -46,5 +46,22 @@ describe('verification auth API', () => {
       method: 'POST',
     })
     expect(client.markSessionEstablished).toHaveBeenCalledOnce()
+  })
+})
+
+describe('resetPasswordStatus', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('sends the token as JSON body and returns the classification unchanged', async () => {
+    client.request.mockResolvedValue({ status: 'used' })
+
+    await expect(resetPasswordStatus('reset-token')).resolves.toEqual({ status: 'used' })
+
+    expect(client.request).toHaveBeenCalledWith('/auth/reset-password-status', {
+      method: 'POST',
+      body: JSON.stringify({ token: 'reset-token' }),
+    })
   })
 })

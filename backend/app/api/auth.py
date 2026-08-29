@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.crud.user import create_user, get_user_by_email, authenticate_user, get_user_by_username
 from app.db.database import get_db
-from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse, ForgotPasswordRequest, ResetPasswordRequest, VerifyEmailRequest
+from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse, ForgotPasswordRequest, ResetPasswordRequest, ResetPasswordStatusRequest, VerifyEmailRequest
 from app.core.security import (
     create_email_verification_token,
     decode_email_verification_token,
@@ -160,14 +160,24 @@ def verify_email(
 
     email = payload["sub"]
 
-    user = get_user_by_email(db, email)
+    user = (
+        db.query(User)
+        .filter(User.email == email)
+        .with_for_update()
+        .first()
+    )
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not user.is_verified:
-        user.is_verified = True
-        db.commit()
+    if user.is_verified:
+        raise HTTPException(
+            status_code=400,
+            detail="This verification link has already been used.",
+        )
+
+    user.is_verified = True
+    db.commit()
 
     return {"message": "Email verified successfully"}
 
@@ -431,6 +441,40 @@ def reset_password(
     return {
         "message": "Password reset successfully"
     }
+
+@router.post("/reset-password-status")
+def reset_password_status(
+    request: ResetPasswordStatusRequest,
+    db: Session = Depends(get_db),
+):
+    """Read-only classification for a password-reset link, used purely to
+    drive frontend UX (e.g. an already-used link should show the success
+    screen instead of a password form). Never authorizes or performs a
+    reset - POST /auth/reset-password independently re-validates
+    everything from scratch."""
+    try:
+        payload = decode_password_reset_token(request.token)
+    except (jwt.PyJWTError, ValueError):
+        return {"status": "invalid"}
+
+    email = payload.get("sub")
+    token_version = payload.get("ver")
+
+    if not email or type(token_version) is not int:
+        return {"status": "invalid"}
+
+    user = get_user_by_email(db, email)
+
+    if not user:
+        return {"status": "invalid"}
+
+    if token_version == user.token_version:
+        return {"status": "valid"}
+
+    if token_version < user.token_version:
+        return {"status": "used"}
+
+    return {"status": "invalid"}
 
 @router.post("/logout")
 def logout(response: Response):

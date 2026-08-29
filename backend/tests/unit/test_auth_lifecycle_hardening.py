@@ -429,6 +429,20 @@ def test_verify_email_is_post_only_and_excessive_token_is_rejected(image_client)
     assert query_only.status_code == 422
 
 
+def test_reset_password_status_is_post_only_and_excessive_token_is_rejected(image_client):
+    status_operations = app.openapi()["paths"]["/auth/reset-password-status"]
+
+    assert set(status_operations) == {"post"}
+    response = image_client.post(
+        "/auth/reset-password-status",
+        json={"token": "x" * 4097},
+    )
+    assert response.status_code == 422
+
+    query_only = image_client.post("/auth/reset-password-status?token=legacy-query-token")
+    assert query_only.status_code == 422
+
+
 def test_auth_me_is_not_cacheable(image_client):
     app.dependency_overrides[get_current_verified_user] = lambda: SimpleNamespace(
         id=1,

@@ -206,10 +206,17 @@ def test_existing_verified_registration_behavior_remains_unchanged(monkeypatch):
     assert _cookie_names(response) == set()
 
 
-def test_successful_verification_marks_user_verified_without_authenticating(monkeypatch):
-    user = SimpleNamespace(email="new@example.com", is_verified=False)
+def _locked_db(user) -> Mock:
+    """A Mock db whose SELECT ... FOR UPDATE lookup (the same narrow
+    row-lock pattern reset_password() uses) resolves to `user`."""
     db = Mock()
-    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = user
+    return db
+
+
+def test_successful_verification_marks_user_verified_without_authenticating():
+    user = SimpleNamespace(email="new@example.com", is_verified=False)
+    db = _locked_db(user)
     response = Response()
 
     result = auth_api.verify_email(
@@ -220,22 +227,82 @@ def test_successful_verification_marks_user_verified_without_authenticating(monk
     assert result == {"message": "Email verified successfully"}
     assert user.is_verified is True
     db.commit.assert_called_once()
+    db.query.return_value.filter.return_value.with_for_update.assert_called_once_with()
     assert _cookie_names(response) == set()
 
 
-def test_already_verified_user_revisiting_valid_link_is_idempotent(monkeypatch):
+def test_replayed_verification_of_already_verified_user_is_rejected_without_mutation():
+    """First use of a verification link must durably consume it: is_verified
+    is the fence (never token_version - see
+    test_first_verification_does_not_change_token_version), so any
+    replay - the same link again, or a second link issued before the first
+    succeeded - must be rejected once the account is already verified,
+    with no mutation and no authentication cookies."""
     user = SimpleNamespace(email="already@example.com", is_verified=True)
-    db = Mock()
-    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    db = _locked_db(user)
     response = Response()
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.verify_email(
+            request=VerifyEmailRequest(token=_token(user.email)),
+            db=db,
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "This verification link has already been used."
+    db.commit.assert_not_called()
+    assert _cookie_names(response) == set()
+
+
+def test_first_verification_does_not_change_token_version():
+    user = SimpleNamespace(email="new@example.com", is_verified=False, token_version=4)
+    db = _locked_db(user)
 
     auth_api.verify_email(
         request=VerifyEmailRequest(token=_token(user.email)),
         db=db,
     )
 
-    db.commit.assert_not_called()  # nothing new to persist
-    assert _cookie_names(response) == set()
+    assert user.is_verified is True
+    assert user.token_version == 4
+
+
+def test_original_browser_handoff_survives_verification_from_a_different_device(
+    monkeypatch,
+):
+    """The cross-device signup flow: Computer A holds a verification_handoff
+    cookie minted at token_version N; Phone B verifies the email through
+    the real verify_email() endpoint. Because verification only ever sets
+    is_verified (never token_version), Computer A's still-N handoff must
+    then successfully authenticate."""
+    user = SimpleNamespace(
+        email="cross-device@example.com", is_verified=False, token_version=0
+    )
+    handoff = create_verification_handoff_token(user.email, user.token_version)
+
+    auth_api.verify_email(
+        request=VerifyEmailRequest(token=_token(user.email)),
+        db=_locked_db(user),
+    )
+
+    assert user.is_verified is True
+    assert user.token_version == 0
+
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
+    response = Response()
+
+    result = auth_api.complete_verification_session(
+        request=SimpleNamespace(cookies={"verification_handoff": handoff}),
+        response=response,
+        db=Mock(),
+    )
+
+    assert result == {"status": "authenticated"}
+    assert _cookie_names(response) == {
+        "access_token",
+        "refresh_token",
+        "verification_handoff",
+    }
 
 
 def test_verification_session_pending_does_not_set_authentication_cookies(monkeypatch):
@@ -499,13 +566,11 @@ def test_wrong_token_type_is_rejected_safely():
     assert error.value.status_code == 400
 
 
-def test_unknown_user_returns_404_not_500(monkeypatch):
-    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
-
+def test_unknown_user_returns_404_not_500():
     with pytest.raises(HTTPException) as error:
         auth_api.verify_email(
             request=VerifyEmailRequest(token=_token("ghost@example.com")),
-            db=Mock(),
+            db=_locked_db(None),
         )
 
     assert error.value.status_code == 404

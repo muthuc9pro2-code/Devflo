@@ -56,3 +56,7 @@ class VerifyEmailRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: JwtToken
     new_password: NewPassword
+
+
+class ResetPasswordStatusRequest(BaseModel):
+    token: JwtToken
