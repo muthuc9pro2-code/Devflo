@@ -20,7 +20,12 @@ from app.core.security import (
     decode_verification_handoff_token,
     hash_password,
 )
-from app.schemas.user import ForgotPasswordRequest, ResetPasswordRequest, UserRegister
+from app.schemas.user import (
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    UserRegister,
+    VerifyEmailRequest,
+)
 from app.services.email import send_verification_email
 
 
@@ -207,7 +212,10 @@ def test_successful_verification_marks_user_verified_without_authenticating(monk
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     response = Response()
 
-    result = auth_api.verify_email(token=_token(user.email), response=response, db=db)
+    result = auth_api.verify_email(
+        request=VerifyEmailRequest(token=_token(user.email)),
+        db=db,
+    )
 
     assert result == {"message": "Email verified successfully"}
     assert user.is_verified is True
@@ -221,7 +229,10 @@ def test_already_verified_user_revisiting_valid_link_is_idempotent(monkeypatch):
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     response = Response()
 
-    auth_api.verify_email(token=_token(user.email), response=response, db=db)
+    auth_api.verify_email(
+        request=VerifyEmailRequest(token=_token(user.email)),
+        db=db,
+    )
 
     db.commit.assert_not_called()  # nothing new to persist
     assert _cookie_names(response) == set()
@@ -455,7 +466,10 @@ def test_expired_token_is_rejected_safely_with_no_cookies_set(monkeypatch):
     expired = _token(user.email, expires_in=timedelta(hours=-1))
 
     with pytest.raises(HTTPException) as error:
-        auth_api.verify_email(token=expired, response=response, db=Mock())
+        auth_api.verify_email(
+            request=VerifyEmailRequest(token=expired),
+            db=Mock(),
+        )
 
     assert error.value.status_code == 400
     assert _cookie_names(response) == set()
@@ -463,7 +477,10 @@ def test_expired_token_is_rejected_safely_with_no_cookies_set(monkeypatch):
 
 def test_malformed_token_is_rejected_safely():
     with pytest.raises(HTTPException) as error:
-        auth_api.verify_email(token="not-a-real-token", response=Response(), db=Mock())
+        auth_api.verify_email(
+            request=VerifyEmailRequest(token="not-a-real-token"),
+            db=Mock(),
+        )
 
     assert error.value.status_code == 400
 
@@ -474,7 +491,10 @@ def test_wrong_token_type_is_rejected_safely():
     wrong_type_token = _token("x@example.com", token_type="access")
 
     with pytest.raises(HTTPException) as error:
-        auth_api.verify_email(token=wrong_type_token, response=Response(), db=Mock())
+        auth_api.verify_email(
+            request=VerifyEmailRequest(token=wrong_type_token),
+            db=Mock(),
+        )
 
     assert error.value.status_code == 400
 
@@ -483,7 +503,10 @@ def test_unknown_user_returns_404_not_500(monkeypatch):
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
 
     with pytest.raises(HTTPException) as error:
-        auth_api.verify_email(token=_token("ghost@example.com"), response=Response(), db=Mock())
+        auth_api.verify_email(
+            request=VerifyEmailRequest(token=_token("ghost@example.com")),
+            db=Mock(),
+        )
 
     assert error.value.status_code == 404
 
@@ -500,7 +523,7 @@ def test_verification_email_links_to_the_frontend_verify_page(monkeypatch):
 
     send_verification_email(email="user@example.com", token="abc123")
 
-    assert sent["url"] == f"{Settings.FRONTEND_URL}/verify-email?token=abc123"
+    assert sent["url"] == f"{Settings.FRONTEND_URL}/verify-email#token=abc123"
     assert "localhost:8000" not in sent["url"]
 
 
@@ -541,7 +564,7 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
     assert sent["subject"] == "Reset your Devflo password"
     assert sent["subject"] != "Verify your Devflo account"
     reset_body = sent["text"]
-    assert f"{Settings.FRONTEND_URL}/reset-password?token=" in reset_body
+    assert f"{Settings.FRONTEND_URL}/reset-password#token=" in reset_body
     assert "localhost:3000" not in reset_body
 
 
@@ -693,5 +716,5 @@ def test_password_reset_email_links_to_frontend_reset_page_not_localhost(monkeyp
 
     send_password_reset_email(email="user@example.com", token="reset-abc123")
 
-    assert sent["url"] == f"{Settings.FRONTEND_URL}/reset-password?token=reset-abc123"
+    assert sent["url"] == f"{Settings.FRONTEND_URL}/reset-password#token=reset-abc123"
     assert "localhost:3000" not in sent["url"]

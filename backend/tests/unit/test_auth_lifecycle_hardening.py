@@ -175,6 +175,67 @@ def test_registration_email_failure_keeps_created_unverified_account_and_no_hand
     db.close()
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (
+            UserRegister(
+                username="first_user",
+                email="same@example.com",
+                password="new-password",
+            ),
+            UserRegister(
+                username="second_user",
+                email="same@example.com",
+                password="new-password",
+            ),
+        ),
+        (
+            UserRegister(
+                username="same_user",
+                email="first@example.com",
+                password="new-password",
+            ),
+            UserRegister(
+                username="same_user",
+                email="second@example.com",
+                password="new-password",
+            ),
+        ),
+    ],
+    ids=["email", "username"],
+)
+def test_registration_uniqueness_race_rolls_back_and_returns_controlled_409(
+    first,
+    second,
+    monkeypatch,
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    first_db = session_factory()
+    second_db = session_factory()
+    monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
+    monkeypatch.setattr(auth_api, "get_user_by_username", Mock(return_value=None))
+    send_mock = Mock()
+    monkeypatch.setattr(auth_api, "send_verification_email", send_mock)
+
+    auth_api.register(user=first, response=Response(), db=first_db)
+    losing_response = Response()
+
+    with pytest.raises(HTTPException) as error:
+        auth_api.register(user=second, response=losing_response, db=second_db)
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "Registration conflict"
+    assert "integrity" not in error.value.detail.lower()
+    assert second_db.query(User).count() == 1
+    assert send_mock.call_count == 1
+    assert _cookie_headers(losing_response) == []
+    first_db.close()
+    second_db.close()
+
+
 def test_forgot_password_provider_failure_preserves_neutral_public_response(
     monkeypatch,
     caplog,
@@ -358,8 +419,28 @@ def test_verify_email_is_post_only_and_excessive_token_is_rejected(image_client)
     verification_operations = app.openapi()["paths"]["/auth/verify-email"]
 
     assert set(verification_operations) == {"post"}
-    response = image_client.post(f"/auth/verify-email?token={'x' * 4097}")
+    response = image_client.post(
+        "/auth/verify-email",
+        json={"token": "x" * 4097},
+    )
     assert response.status_code == 422
+
+    query_only = image_client.post("/auth/verify-email?token=legacy-query-token")
+    assert query_only.status_code == 422
+
+
+def test_auth_me_is_not_cacheable(image_client):
+    app.dependency_overrides[get_current_verified_user] = lambda: SimpleNamespace(
+        id=1,
+        username="verified_user",
+        email="verified@example.com",
+        is_verified=True,
+    )
+
+    response = image_client.get("/auth/me")
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_refresh_rejection_http_response_expires_stale_auth_cookies(image_client):

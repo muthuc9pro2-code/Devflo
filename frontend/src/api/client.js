@@ -1,24 +1,32 @@
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, code = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
 }
 
-async function parseErrorMessage(response) {
+async function parseError(response) {
   try {
     const data = await response.json()
+    let message
     if (Array.isArray(data.detail)) {
-      return data.detail.map((item) => item.msg).join('; ')
+      message = data.detail.map((item) => item.msg).join('; ')
+    } else if (typeof data.detail === 'string') {
+      message = data.detail
     }
-    if (typeof data.detail === 'string') {
-      return data.detail
+    return {
+      message: message || response.statusText || `Request failed with status ${response.status}`,
+      code: typeof data.code === 'string' ? data.code : null,
     }
   } catch {
     // response had no JSON body
   }
-  return response.statusText || `Request failed with status ${response.status}`
+  return {
+    message: response.statusText || `Request failed with status ${response.status}`,
+    code: null,
+  }
 }
 
 async function rawRequest(path, options) {
@@ -46,6 +54,9 @@ const NO_REFRESH_RETRY = new Set([
   '/auth/refresh',
   '/auth/register',
   '/auth/verification-session',
+  '/auth/verify-email',
+  '/auth/forgot-password',
+  '/auth/reset-password',
 ])
 
 let refreshPromise = null
@@ -67,8 +78,11 @@ function reportServiceUnavailable() {
 }
 
 async function throwApiError(response) {
-  if (response.status === 503) reportServiceUnavailable()
-  throw new ApiError(await parseErrorMessage(response), response.status)
+  const error = await parseError(response)
+  if (response.status === 503 && error.code === 'service_unavailable') {
+    reportServiceUnavailable()
+  }
+  throw new ApiError(error.message, response.status, error.code)
 }
 
 function refreshAccessCookie() {
@@ -116,7 +130,8 @@ export async function request(path, options = {}) {
   ) {
     const refreshResponse = await refreshAccessCookie()
     if (requestEpoch !== sessionEpoch || logoutPending || !refreshResponse) {
-      throw new ApiError(await parseErrorMessage(response), response.status)
+      const error = await parseError(response)
+      throw new ApiError(error.message, response.status, error.code)
     }
     if (refreshResponse.ok) {
       const retryResponse = await rawRequest(path, options)

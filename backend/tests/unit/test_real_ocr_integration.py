@@ -82,8 +82,9 @@ def test_real_screenshot_ocr_runs_exactly_once():
 
     from app.services import image_text_extractor
 
+    engine = image_text_extractor._get_ocr_engine()
     with patch.object(
-        image_text_extractor, "_ocr", wraps=image_text_extractor._ocr
+        image_text_extractor, "_ocr", wraps=engine
     ) as ocr_spy:
         list(
             stream_artifact_events(

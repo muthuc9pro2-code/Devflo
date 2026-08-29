@@ -1,13 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useState } from 'react'
 import { verifyEmail } from '../api/auth'
 import { useRouter } from '../router/useRouter'
+import { clearEmailLinkToken, readEmailLinkToken } from '../utils/emailLinkToken'
 import { ApiError } from '../api/client'
 
 export default function VerifyEmailPage() {
   const { search, navigate } = useRouter()
-  const token = new URLSearchParams(search).get('token')
+  const [token] = useState(() => readEmailLinkToken(search))
   const [state, setState] = useState(token ? 'verifying' : 'error') // verifying | success | error
   const [message, setMessage] = useState(token ? '' : 'This verification link is missing its token.')
+
+  useLayoutEffect(() => {
+    if (token) clearEmailLinkToken('/verify-email')
+  }, [token])
 
   useEffect(() => {
     if (!token) return
@@ -19,7 +24,6 @@ export default function VerifyEmailPage() {
         if (cancelled) return
         setState('success')
         setMessage('Email verified successfully.')
-        navigate('/verify-email', { replace: true })
       })
       .catch((err) => {
         if (cancelled) return

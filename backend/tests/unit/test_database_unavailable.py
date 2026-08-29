@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.api.dependencies import get_current_verified_user
 from app.db.database import get_db
-from app.main import _SERVICE_UNAVAILABLE_DETAIL, app
+from app.main import _SERVICE_UNAVAILABLE_CODE, _SERVICE_UNAVAILABLE_DETAIL, app
 from app.models.user import User
 
 
@@ -69,7 +69,10 @@ def test_operational_error_maps_to_a_sanitized_503():
         app.dependency_overrides.clear()
 
     assert response.status_code == 503
-    assert response.json() == {"detail": _SERVICE_UNAVAILABLE_DETAIL}
+    assert response.json() == {
+        "detail": _SERVICE_UNAVAILABLE_DETAIL,
+        "code": _SERVICE_UNAVAILABLE_CODE,
+    }
 
     leaked_terms = ("pymysql", "3306", "traceback", "connect to mysql", "operationalerror")
     body_lower = response.text.lower()

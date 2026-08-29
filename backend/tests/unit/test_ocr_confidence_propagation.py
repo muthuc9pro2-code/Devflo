@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 from PIL import Image
+import pytest
 
 from app.models.evidence import Evidence
 from app.services import diagnostic_adapters, evidence_store, image_text_extractor
@@ -105,6 +106,57 @@ def test_no_ocr_results_at_all_returns_empty_text_and_none_confidence(monkeypatc
 
     assert text == ""
     assert confidence is None
+
+
+def test_rapidocr_initialization_failure_is_converted_after_validation(monkeypatch, tmp_path):
+    image_path = _write_tiny_png(tmp_path / "shot.png")
+    monkeypatch.setattr(image_text_extractor, "_ocr", None)
+
+    def fail_initialization():
+        raise RuntimeError("native model initialization failed")
+
+    monkeypatch.setattr(
+        "rapidocr_onnxruntime.RapidOCR",
+        fail_initialization,
+    )
+
+    with pytest.raises(image_text_extractor.OcrProcessingError):
+        image_text_extractor.extract_text_from_image(image_path)
+
+
+def test_rapidocr_inference_failure_is_converted(monkeypatch, tmp_path):
+    image_path = _write_tiny_png(tmp_path / "shot.png")
+
+    def fail_inference(_path):
+        raise RuntimeError("onnx inference failed")
+
+    monkeypatch.setattr(image_text_extractor, "_ocr", fail_inference)
+
+    with pytest.raises(image_text_extractor.OcrProcessingError):
+        image_text_extractor.extract_text_from_image(image_path)
+
+
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        None,
+        ([None], None),
+        ([(None, None, 0.8)], None),
+        ([(None, "ERROR boom", "not-a-number")], None),
+    ],
+)
+def test_malformed_rapidocr_results_are_converted(
+    monkeypatch, tmp_path, malformed_result
+):
+    image_path = _write_tiny_png(tmp_path / "shot.png")
+    monkeypatch.setattr(
+        image_text_extractor,
+        "_ocr",
+        lambda _path: malformed_result,
+    )
+
+    with pytest.raises(image_text_extractor.OcrProcessingError):
+        image_text_extractor.extract_text_from_image(image_path)
 
 
 # --- diagnostic_adapters: confidence lands on the ParsedEvent -------------

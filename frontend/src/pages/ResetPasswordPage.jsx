@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useLayoutEffect, useState } from 'react'
 import { resetPassword } from '../api/auth'
 import { useAuth } from '../context/useAuth'
 import { useRouter } from '../router/useRouter'
+import { clearEmailLinkToken, readEmailLinkToken } from '../utils/emailLinkToken'
 import { ApiError } from '../api/client'
 
 const AUTH_EVENTS_CHANNEL = 'devflo-auth-events'
@@ -24,11 +25,15 @@ function publishPasswordResetSuccess() {
 export default function ResetPasswordPage() {
   const { search, navigate } = useRouter()
   const { logout } = useAuth()
-  const token = new URLSearchParams(search).get('token')
+  const [token] = useState(() => readEmailLinkToken(search))
   const [form, setForm] = useState({ newPassword: '', confirmPassword: '' })
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [success, setSuccess] = useState(false)
+
+  useLayoutEffect(() => {
+    if (token) clearEmailLinkToken('/reset-password')
+  }, [token])
 
   const handleChange = (event) => {
     const { name, value } = event.target
@@ -53,7 +58,6 @@ export default function ResetPasswordPage() {
       await resetPassword({ token, newPassword: form.newPassword })
       setForm({ newPassword: '', confirmPassword: '' })
       setSuccess(true)
-      navigate('/reset-password', { replace: true })
       publishPasswordResetSuccess()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')

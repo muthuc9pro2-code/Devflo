@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 from google.genai import errors as genai_errors
 from app.schemas.gemini import GeminiInvestigationResponse
@@ -7,6 +7,7 @@ from app.services.gemini_service import (
     _REQUEST_TIMEOUT_SECONDS,
     generate_investigation_explanation,
 )
+from app.services import gemini_service
 
 _MINIMAL_GEMINI_JSON = (
     '{"title": "t", "summary": "s", "probable_root_causes": [], '
@@ -311,6 +312,40 @@ def test_schema_invalid_json_response_raises_unavailable_not_retried(monkeypatch
         return_value=_mock_response(text='{"title": "t"}'),
     ) as generate_content:
         with pytest.raises(GeminiUnavailableError):
+            generate_investigation_explanation({"analysis_id": 1})
+
+    generate_content.assert_called_once()
+    assert sleep_calls == []
+
+
+def test_lazy_client_initialization_failure_raises_unavailable(monkeypatch):
+    monkeypatch.setattr(gemini_service._client, "_resolved_client", None)
+
+    def fail_client_initialization(**_kwargs):
+        raise RuntimeError("SDK initialization failed")
+
+    monkeypatch.setattr(gemini_service.genai, "Client", fail_client_initialization)
+
+    with pytest.raises(GeminiUnavailableError, match="SDK initialization failed"):
+        generate_investigation_explanation({"analysis_id": 1})
+
+
+def test_throwing_response_text_property_raises_unavailable_without_retry(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(
+        "app.services.gemini_service.sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+    response = MagicMock()
+    type(response).text = PropertyMock(
+        side_effect=RuntimeError("response object could not decode text")
+    )
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=response,
+    ) as generate_content:
+        with pytest.raises(GeminiUnavailableError, match="response object"):
             generate_investigation_explanation({"analysis_id": 1})
 
     generate_content.assert_called_once()

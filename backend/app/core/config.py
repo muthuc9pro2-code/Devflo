@@ -1,7 +1,14 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSettings):
+_UNSAFE_SECRET_KEYS = {
+    "replace-me",
+    "replace-with-at-least-32-random-bytes",
+}
+
+
+class AppSettings(BaseSettings):
     APP_NAME: str 
     APP_VERSION: str 
     DATABASE_URL: str
@@ -26,9 +33,22 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
+    @field_validator("SECRET_KEY")
+    @classmethod
+    def validate_secret_key(cls, value: str) -> str:
+        candidate = value.strip()
+        if (
+            candidate.lower() in _UNSAFE_SECRET_KEYS
+            or len(candidate.encode("utf-8")) < 32
+        ):
+            raise ValueError(
+                "SECRET_KEY must contain at least 32 bytes and must not be a placeholder"
+            )
+        return value
+
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True
     )
 
-Settings = Settings()
+Settings = AppSettings()

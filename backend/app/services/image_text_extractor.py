@@ -1,8 +1,11 @@
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
-from rapidocr_onnxruntime import RapidOCR
 from app.core.processing_config import MAX_OCR_IMAGE_BYTES, MAX_OCR_IMAGE_PIXELS, MEBIBYTE
-_ocr = RapidOCR()
+
+# RapidOCR loads native ONNX libraries and model data.  Keep that optional
+# dependency outside application/task-module import so a broken OCR runtime can
+# affect only an image that actually needs it.
+_ocr = None
 
 _ALLOWED_IMAGE_EXTENSIONS = {
     ".png",
@@ -34,6 +37,16 @@ class InvalidOcrImageError(OcrImageError):
 
 class OcrProcessingError(Exception):
     """RapidOCR failed after the image passed Devflo's validation gates."""
+
+
+def _get_ocr_engine():
+    global _ocr
+
+    if _ocr is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        _ocr = RapidOCR()
+    return _ocr
 
 
 def validate_ocr_image(file_path: str | Path) -> None:
@@ -97,22 +110,22 @@ def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
     validate_ocr_image(path)
 
     try:
-        results, _ = _ocr(str(path))
+        results, _ = _get_ocr_engine()(str(path))
+
+        if not results:
+            return []
+
+        lines: list[tuple[str, float | None]] = []
+        for result in results:
+            text = result[1].strip()
+            if not text:
+                continue
+            confidence = result[2] if len(result) > 2 else None
+            lines.append((text, float(confidence) if confidence is not None else None))
+
+        return lines
     except Exception as error:
         raise OcrProcessingError("Image OCR could not be completed") from error
-
-    if not results:
-        return []
-
-    lines: list[tuple[str, float | None]] = []
-    for result in results:
-        text = result[1].strip()
-        if not text:
-            continue
-        confidence = result[2] if len(result) > 2 else None
-        lines.append((text, float(confidence) if confidence is not None else None))
-
-    return lines
 
 
 def extract_text_from_image(file_path: str) -> str:

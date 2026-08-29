@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # expected constraint violation, not a service outage, and must keep
 # surfacing as their normal (existing) error handling, not a blanket 503.
 _SERVICE_UNAVAILABLE_DETAIL = "Devflo is temporarily unavailable. Please try again."
+_SERVICE_UNAVAILABLE_CODE = "service_unavailable"
 
 
 @asynccontextmanager
@@ -33,7 +34,13 @@ app = FastAPI(title=Settings.APP_NAME, version=Settings.APP_VERSION, lifespan=li
 @app.exception_handler(OperationalError)
 async def handle_database_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
     logger.error("Database unavailable for %s %s", request.method, request.url.path, exc_info=exc)
-    return JSONResponse(status_code=503, content={"detail": _SERVICE_UNAVAILABLE_DETAIL})
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": _SERVICE_UNAVAILABLE_DETAIL,
+            "code": _SERVICE_UNAVAILABLE_CODE,
+        },
+    )
 
 
 app.include_router(health_router)
@@ -46,5 +53,4 @@ app.include_router(analysis_stream.router)
 def root():
     logger.info("Root endpoint called")
     return {"app": Settings.APP_NAME, "version": Settings.APP_VERSION}
-
 

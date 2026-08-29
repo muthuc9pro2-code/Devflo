@@ -147,9 +147,13 @@ def stream_otlp_events(*, file_path: str, source_file: str, skip_records: int=0,
                         log_scope = str(value)
                     elif 'resourcespans.' in normalized_prefix:
                         span_scope = str(value)
-    except ijson.JSONError:
+    except ijson.JSONError as error:
         if not emitted:
-            raise
+            from .diagnostic_adapters import ArtifactInputError
+
+            raise ArtifactInputError(
+                "OpenTelemetry diagnostic could not be parsed"
+            ) from error
         logger.warning(
             'Malformed/truncated OTLP document %s after %s record(s) '
             'already extracted; stopping here instead of discarding them',

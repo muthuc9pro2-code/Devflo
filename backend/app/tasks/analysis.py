@@ -26,6 +26,7 @@ from app.services import (
 )
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import (
+    ArtifactInputError,
     stream_artifact_events,
     stream_image_events_from_text,
 )
@@ -39,6 +40,7 @@ from app.services.image_text_extractor import (
 )
 from app.services.source_archive import (
     SourceInputError,
+    SourceSubsystemError,
     cleanup_prepared_source,
     prepare_source,
 )
@@ -364,7 +366,13 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
 
         _bump_processing_heartbeat(db, analysis_id)
 
-        source_index = _prepare_source_index(analysis)
+        try:
+            source_index = _prepare_source_index(analysis)
+        except (SourceInputError, SourceSubsystemError) as error:
+            db.rollback()
+            if not _record_optional_source_failure(db, analysis, error):
+                return 0
+            source_index = None
 
         global_line_number = artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
 
@@ -404,6 +412,22 @@ def _process_artifact_task(analysis_id: int, artifact_id: int) -> int:
             artifact_id=artifact_id,
             status="processing_error",
             reason="Image OCR could not be completed.",
+        )
+        return 0
+    except ArtifactInputError:
+        db.rollback()
+        logger.warning(
+            "Analysis %s | artifact %s could not be parsed safely",
+            analysis_id,
+            artifact_id,
+            exc_info=True,
+        )
+        _record_controlled_artifact_failure(
+            db=db,
+            analysis_id=analysis_id,
+            artifact_id=artifact_id,
+            status="processing_error",
+            reason="Diagnostic file could not be processed safely.",
         )
         return 0
     except Exception:
@@ -478,48 +502,12 @@ def _prepare_source_task(analysis_id: int) -> None:
             analysis.source_kind,
             perf_counter() - source_prep_start,
         )
-    except SourceInputError as error:
+    except (SourceInputError, SourceSubsystemError) as error:
         db.rollback()
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
         if analysis is None:
             return
-        if analysis.status == "cancelled":
-           
-            logger.info(
-                "Analysis %s | cancelled; ignoring source preparation failure",
-                analysis_id,
-            )
-            return
-
-        source_kind = analysis.source_kind
-        if source_kind == "zip":
-            reason = f"Uploaded source ZIP could not be prepared: {error}"
-        elif source_kind == "github":
-            reason = f"Source repository could not be accessed or prepared: {error}"
-        else:
-            reason = f"Source code could not be prepared: {error}"
-
-        analysis.source_status = "unavailable"
-        analysis.source_failure_reason = reason[:500]
-        db.commit()
-
-      
-        try:
-            cleanup_prepared_source(analysis_id)
-        except OSError:
-            logger.warning(
-                "Analysis %s | could not clean failed optional source preparation",
-                analysis_id,
-                exc_info=True,
-            )
-
-        logger.warning(
-            "Analysis %s | optional source unavailable (%s): %s; "
-            "continuing diagnostic analysis without source correlation",
-            analysis_id,
-            source_kind,
-            error,
-        )
+        _record_optional_source_failure(db, analysis, error)
         return
     except Exception:
         _safe_rollback(db)
@@ -1111,6 +1099,13 @@ def _process_artifact(
             )
             return parsed_count
         parsed_count += batch_result
+
+        # A source-matcher failure is recorded by _persist_artifact_batch on
+        # the shared Analysis row.  Stop invoking that optional matcher for
+        # later batches in this same artifact; parsing/evidence persistence
+        # continue normally without repeated failures or source work.
+        if getattr(analysis, "source_status", None) == "unavailable":
+            source_index = None
        
         _bump_processing_heartbeat(db, analysis.id)
         if (
@@ -1291,7 +1286,9 @@ def _persist_artifact_batch(
         if is_evidence_worthy(event):
             important_append(event)
 
-    _correlate_source_events(important_events, source_index)
+    source_matching_succeeded = _correlate_source_events(
+        important_events, source_index
+    )
     _assign_batch_fingerprints(important_events)
 
     # Cancel-vs-Evidence-commit race fence. A plain unlocked
@@ -1334,6 +1331,14 @@ def _persist_artifact_batch(
         artifact_id=artifact.id,
     )
 
+    if not source_matching_succeeded:
+        analysis.source_status = "unavailable"
+        analysis.source_failure_reason = (
+            "Source matching became unavailable; diagnostic evidence was "
+            "retained without source enrichment."
+        )
+        _source_index_process_cache.pop(analysis.id, None)
+
     last_record = batch[-1]
     previous_offset = artifact.processed_bytes
     new_offset = max(previous_offset, last_record.end_offset)
@@ -1352,12 +1357,27 @@ def _persist_artifact_batch(
     return len(batch)
 
 
-def _correlate_source_events(events, source_index) -> None:
+def _correlate_source_events(events, source_index) -> bool:
     if source_index is None:
-        return
+        return True
 
-    for event in events:
-        event.source_matches = correlate_event(event, source_index)
+    try:
+        matches_by_event = [
+            correlate_event(event, source_index) for event in events
+        ]
+    except Exception:
+        logger.warning(
+            "Optional source matching failed; retaining diagnostic evidence "
+            "without source enrichment",
+            exc_info=True,
+        )
+        for event in events:
+            event.source_matches = []
+        return False
+
+    for event, source_matches in zip(events, matches_by_event, strict=True):
+        event.source_matches = source_matches
+    return True
 
 
 _source_index_process_cache: dict[int, object] = {}
@@ -1375,13 +1395,24 @@ def _prepare_source_index(analysis: Analysis):
     if cached is not None:
         return cached
 
-    index = prepare_source(
-        analysis.source_kind,
-        analysis.source_reference,
-        analysis.id,
-    )
-    if analysis.source_kind == "zip":
-        _remove_staged_source_archive(analysis.source_reference)
+    try:
+        index = prepare_source(
+            analysis.source_kind,
+            analysis.source_reference,
+            analysis.id,
+        )
+        if analysis.source_kind == "zip":
+            _remove_staged_source_archive(analysis.source_reference)
+    except SourceInputError:
+        raise
+    except Exception as error:
+        logger.exception(
+            "Analysis %s | optional source acquisition/indexing failed",
+            analysis.id,
+        )
+        raise SourceSubsystemError(
+            "Optional source acquisition or indexing failed"
+        ) from error
 
     if len(_source_index_process_cache) >= SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES:
         oldest_analysis_id = next(iter(_source_index_process_cache))
@@ -1389,6 +1420,60 @@ def _prepare_source_index(analysis: Analysis):
     _source_index_process_cache[analysis.id] = index
 
     return index
+
+
+def _record_optional_source_failure(
+    db: Session,
+    analysis: Analysis,
+    error: SourceInputError | SourceSubsystemError,
+) -> bool:
+    """Durably degrade only the optional source subsystem.
+
+    Returns False when cancellation already won.  Database reads/commits are
+    deliberately outside any source-specific catch so core persistence
+    failures still propagate as analysis-wide failures.
+    """
+    if _is_analysis_cancelled(db, analysis.id):
+        logger.info(
+            "Analysis %s | cancelled; ignoring source preparation failure",
+            analysis.id,
+        )
+        return False
+
+    detail = (
+        str(error)
+        if isinstance(error, SourceInputError)
+        else "Optional source processing failed"
+    )
+    source_kind = analysis.source_kind
+    if source_kind == "zip":
+        reason = f"Uploaded source ZIP could not be prepared: {detail}"
+    elif source_kind == "github":
+        reason = f"Source repository could not be accessed or prepared: {detail}"
+    else:
+        reason = f"Source code could not be prepared: {detail}"
+
+    analysis.source_status = "unavailable"
+    analysis.source_failure_reason = reason[:500]
+    db.commit()
+    _source_index_process_cache.pop(analysis.id, None)
+
+    try:
+        cleanup_prepared_source(analysis.id)
+    except OSError:
+        logger.warning(
+            "Analysis %s | could not clean failed optional source preparation",
+            analysis.id,
+            exc_info=True,
+        )
+
+    logger.warning(
+        "Analysis %s | optional source unavailable (%s); continuing "
+        "diagnostic analysis without source correlation",
+        analysis.id,
+        source_kind,
+    )
+    return True
 
 
 def _remove_staged_source_archive(reference: str) -> None:
@@ -1964,4 +2049,3 @@ def recover_stale_analyses() -> int:
         process_analysis.delay(analysis_id)
 
     return len(claimed_ids)
-

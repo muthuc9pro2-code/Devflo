@@ -22,8 +22,11 @@ describe('verification auth API', () => {
     await verifyEmail('verification token')
 
     expect(client.request).toHaveBeenCalledWith(
-      '/auth/verify-email?token=verification%20token',
-      { method: 'POST' },
+      '/auth/verify-email',
+      {
+        method: 'POST',
+        body: JSON.stringify({ token: 'verification token' }),
+      },
     )
     expect(client.markSessionEstablished).not.toHaveBeenCalled()
   })

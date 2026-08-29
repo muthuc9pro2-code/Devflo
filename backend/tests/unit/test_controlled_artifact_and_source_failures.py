@@ -9,8 +9,8 @@ gracefully; internal/infrastructure failures must remain fatal. Covers:
 - an image that fails RapidOCR after passing validation (processing_error);
 - optional source ZIP/GitHub acquisition failing in a controlled way
   (source_status="unavailable") without failing the diagnostic investigation;
-- unexpected/internal failures (artifact and source) remaining fatal, never
-  silently converted into a controlled/degraded outcome;
+- source-contained acquisition/index/matching failures degrading while core
+  artifact, database, and deterministic-correlation failures remain fatal;
 - resource_limited/processing_error artifact outcomes surviving the live
   event, a mid-processing reconnect snapshot, and the final result payload;
 - Devflo AI (Gemini) unavailability across CORRELATED/SIMPLE/fallback paths
@@ -18,8 +18,10 @@ gracefully; internal/infrastructure failures must remain fatal. Covers:
 """
 import json
 from datetime import datetime, timezone
+from io import BytesIO
 
 import pytest
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -29,6 +31,8 @@ from app.services.artifact_detector import ArtifactFormat
 from app.services.gemini_service import GeminiUnavailableError
 from app.services.image_text_extractor import OcrProcessingError
 from app.services.source_archive import SourceInputError
+from app.services.diagnostic_parser import parse_timestamp
+from app.services import gemini_service, image_text_extractor
 from app.tasks import analysis as analysis_task
 from app.services import source_archive
 
@@ -75,6 +79,21 @@ def _use_sqlite_compatible_evidence_persistence(monkeypatch):
             resolved_artifact_id = (
                 artifact_id if artifact_id is not None else getattr(event, "artifact_id", None)
             )
+            trace_id = getattr(event, "trace_id", None)
+            request_id = getattr(event, "request_id", None)
+            if trace_id:
+                resolved_identity = f"trace:{trace_id}"
+                identity_match_type = "trace_id"
+                identity_strength = 1.0
+            elif request_id:
+                resolved_identity = f"request:{request_id}"
+                identity_match_type = "request_id"
+                identity_strength = 0.9
+            else:
+                resolved_identity = f"unresolved:test-{counter['n']}"
+                identity_match_type = "unresolved"
+                identity_strength = 0.0
+            timestamp = parse_timestamp(getattr(event, "timestamp", None))
             db.add(
                 Evidence(
                     analysis_id=analysis_id,
@@ -82,7 +101,18 @@ def _use_sqlite_compatible_evidence_persistence(monkeypatch):
                     correlation_key=f"ck-{counter['n']}",
                     fingerprint=getattr(event, "fingerprint", None) or f"fp-{counter['n']}",
                     service=getattr(event, "service", None),
+                    trace_id=trace_id,
+                    request_id=request_id,
+                    span_id=getattr(event, "span_id", None),
+                    parent_span_id=getattr(event, "parent_span_id", None),
+                    source_file=getattr(event, "source_file", None),
                     source_format=getattr(event, "source_format", None),
+                    source_matches=getattr(event, "source_matches", None),
+                    first_seen=timestamp,
+                    last_seen=timestamp,
+                    resolved_identity=resolved_identity,
+                    identity_match_type=identity_match_type,
+                    identity_strength=identity_strength,
                     first_line_number=getattr(event, "line_number", None) or 1,
                     last_line_number=getattr(event, "line_number", None) or 1,
                     severity=getattr(event, "level", None),
@@ -180,6 +210,13 @@ def _oversized_json_array(tmp_path, good_count: int = 2):
 def _valid_generic_log(tmp_path, name: str, marker: str):
     path = tmp_path / name
     path.write_text(f"2026-08-12 10:00:00 ERROR service=api ConnectionError: {marker}\n")
+    return path
+
+
+def _valid_png(path):
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
+    path.write_bytes(buffer.getvalue())
     return path
 
 
@@ -312,20 +349,32 @@ def test_ocr_engine_failure_is_processing_error_without_poisoning_the_chord(tmp_
 # --- TEST 3/4: controlled optional-source failure (ZIP and GitHub) ---------
 
 
-def test_source_zip_controlled_failure_degrades_gracefully(tmp_path, monkeypatch):
+def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
+    tmp_path,
+    monkeypatch,
+):
     session_factory = _db_with_schema(monkeypatch)
     _use_sqlite_compatible_evidence_persistence(monkeypatch)
     _quiet_sse(monkeypatch)
     monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_gemini_unavailable)
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
 
-    def _raise_source_input_error(_path, _dest):
-        raise SourceInputError("Uploaded file is not a valid ZIP archive")
+    archive = tmp_path / "upload.zip"
+    corrupt_payload = b"unique-payload-that-will-have-a-bad-crc"
+    with source_archive.zipfile.ZipFile(archive, "w", source_archive.zipfile.ZIP_STORED) as zf:
+        zf.writestr("first.py", b"print('valid file extracted first')\n")
+        zf.writestr("second.py", corrupt_payload)
+    archive_bytes = bytearray(archive.read_bytes())
+    payload_offset = archive_bytes.index(corrupt_payload)
+    archive_bytes[payload_offset] ^= 0xFF
+    archive.write_bytes(archive_bytes)
 
-    monkeypatch.setattr(source_archive, "_extract_zip", _raise_source_input_error)
+    # Central-directory-only upload validation deliberately succeeds. The
+    # corruption is discovered only when the worker reads the file body.
+    source_archive.validate_source_zip(archive)
 
     analysis_id = _seed_user_and_analysis(
-        session_factory, source_kind="zip", source_reference=str(tmp_path / "upload.zip")
+        session_factory, source_kind="zip", source_reference=str(archive)
     )
 
     # Controlled source failure must not raise - process_analysis's chain
@@ -336,6 +385,7 @@ def test_source_zip_controlled_failure_degrades_gracefully(tmp_path, monkeypatch
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert analysis.source_status == "unavailable"
     assert analysis.source_failure_reason.startswith("Uploaded source ZIP could not be prepared:")
+    assert not (tmp_path / "sources" / str(analysis_id)).exists()
     db.close()
 
     valid_path = _valid_generic_log(tmp_path, "valid.log", "db refused")
@@ -433,16 +483,16 @@ def test_unexpected_internal_artifact_failure_remains_fatal(tmp_path, monkeypatc
     db.close()
 
 
-# --- TEST 6: unexpected/internal source failure remains fatal --------------
+# --- TEST 6: source-contained unexpected acquisition failure degrades -------
 
 
-def test_unexpected_internal_source_failure_remains_fatal(tmp_path, monkeypatch):
+def test_unexpected_source_acquisition_failure_degrades(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
 
     def _boom(_url, _dest):
-        raise RuntimeError("database connection lost")
+        raise RuntimeError("source SDK crashed")
 
     monkeypatch.setattr(source_archive, "_clone_github", _boom)
 
@@ -450,14 +500,484 @@ def test_unexpected_internal_source_failure_remains_fatal(tmp_path, monkeypatch)
         session_factory, source_kind="github", source_reference="https://github.com/acme/project"
     )
 
-    with pytest.raises(RuntimeError, match="database connection lost"):
-        analysis_task._prepare_source_task.run(analysis_id)
+    analysis_task._prepare_source_task.run(analysis_id)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-    assert analysis.status == "failed"
-    # Never silently reframed as a controlled optional-source degradation.
-    assert analysis.source_status != "unavailable"
+    assert analysis.status == "processing"
+    assert analysis.source_status == "unavailable"
+    assert "Optional source processing failed" in analysis.source_failure_reason
+    db.close()
+
+
+def test_source_index_construction_failure_degrades_and_diagnostics_continue(
+    tmp_path, monkeypatch
+):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    def fake_clone(_url, destination):
+        destination.mkdir(parents=True)
+        (destination / "app.py").write_text("raise RuntimeError('boom')\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+    monkeypatch.setattr(
+        source_archive,
+        "build_index",
+        lambda _root: (_ for _ in ()).throw(RuntimeError("index builder crashed")),
+    )
+
+    analysis_id = _seed_user_and_analysis(
+        session_factory,
+        source_kind="github",
+        source_reference="https://github.com/acme/project",
+    )
+
+    analysis_task._prepare_source_task.run(analysis_id)
+
+    valid_path = _valid_generic_log(tmp_path, "valid.log", "diagnostic survived")
+    valid_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename="valid.log",
+        path=valid_path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+    assert analysis.status == "processing"
+    assert analysis.source_status == "unavailable"
+    assert db.query(Evidence).filter(Evidence.artifact_id == valid_id).count() == 1
+    db.close()
+
+
+def test_source_matching_failure_retains_evidence_without_source_matches(
+    tmp_path, monkeypatch
+):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+
+    analysis_id = _seed_user_and_analysis(
+        session_factory,
+        source_kind="github",
+        source_reference="https://github.com/acme/project",
+    )
+    valid_path = _valid_generic_log(tmp_path, "valid.log", "matcher survived")
+    valid_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename="valid.log",
+        path=valid_path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+
+    monkeypatch.setattr(analysis_task, "_prepare_source_index", lambda _analysis: object())
+    monkeypatch.setattr(
+        analysis_task,
+        "correlate_event",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("matcher crashed")),
+    )
+
+    analysis_task._process_artifact_task.run(analysis_id, valid_id)
+
+    db = session_factory()
+    evidence = db.query(Evidence).filter(Evidence.artifact_id == valid_id).one()
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id).one()
+    assert evidence.source_matches in (None, [])
+    assert analysis.status == "processing"
+    assert analysis.source_status == "unavailable"
+    assert "retained without source enrichment" in analysis.source_failure_reason
+    db.close()
+
+
+def test_malformed_otlp_before_first_record_fails_only_that_artifact(
+    tmp_path, monkeypatch
+):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(
+        analysis_task,
+        "generate_investigation_explanation",
+        _raise_gemini_unavailable,
+    )
+
+    analysis_id = _seed_user_and_analysis(session_factory)
+    valid_path = _valid_generic_log(tmp_path, "valid.log", "OTLP sibling survived")
+    malformed_path = tmp_path / "bad-otlp.json"
+    malformed_path.write_text('{"resourceLogs":[{"scopeLogs":[', encoding="utf-8")
+    valid_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename="valid.log",
+        path=valid_path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+    malformed_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=1,
+        filename="bad-otlp.json",
+        path=malformed_path,
+        detected_format=ArtifactFormat.OPENTELEMETRY.value,
+    )
+
+    valid_result = analysis_task._process_artifact_task.run(analysis_id, valid_id)
+    malformed_result = analysis_task._process_artifact_task.run(
+        analysis_id, malformed_id
+    )
+    assert malformed_result == 0
+
+    db = session_factory()
+    malformed = db.query(AnalysisArtifact).filter_by(id=malformed_id).one()
+    analysis = db.query(Analysis).filter_by(id=analysis_id).one()
+    assert malformed.status == "processing_error"
+    assert db.query(Evidence).filter_by(artifact_id=malformed_id).count() == 0
+    assert db.query(Evidence).filter_by(artifact_id=valid_id).count() == 1
+    assert analysis.status == "processing"
+    db.close()
+
+    analysis_task._finalize_analysis_task.run(
+        [valid_result, malformed_result], analysis_id, None
+    )
+    db = session_factory()
+    assert db.query(Analysis).filter_by(id=analysis_id).one().status == "completed"
+    db.close()
+
+
+def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
+    tmp_path, monkeypatch
+):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(
+        analysis_task,
+        "generate_investigation_explanation",
+        _raise_gemini_unavailable,
+    )
+
+    analysis_id = _seed_user_and_analysis(session_factory)
+    bad_path = tmp_path / "resume.json"
+    bad_path.write_text(
+        '[{"level":"ERROR","message":"already committed"},{"level":',
+        encoding="utf-8",
+    )
+    sibling_path = _valid_generic_log(tmp_path, "sibling.log", "resume sibling survived")
+    bad_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename="resume.json",
+        path=bad_path,
+        detected_format=ArtifactFormat.JSON.value,
+    )
+    sibling_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=1,
+        filename="sibling.log",
+        path=sibling_path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+
+    db = session_factory()
+    bad = db.query(AnalysisArtifact).filter_by(id=bad_id).one()
+    bad.status = "processing"
+    bad.last_processed_line = 1
+    bad.processed_bytes = 0
+    bad.fallback_context = {"text": "unsafe stale fallback"}
+    db.add(
+        Evidence(
+            analysis_id=analysis_id,
+            artifact_id=bad_id,
+            correlation_key="prior-checkpoint",
+            fingerprint="prior-checkpoint",
+            first_line_number=1,
+            last_line_number=1,
+            severity="ERROR",
+            representative_line="already committed",
+        )
+    )
+    db.commit()
+    db.close()
+
+    bad_result = analysis_task._process_artifact_task.run(analysis_id, bad_id)
+    sibling_result = analysis_task._process_artifact_task.run(analysis_id, sibling_id)
+
+    db = session_factory()
+    bad = db.query(AnalysisArtifact).filter_by(id=bad_id).one()
+    assert bad.status == "processing_error"
+    assert bad.processed_bytes == 0
+    assert bad.last_processed_line == 0
+    assert bad.fallback_context is None
+    assert db.query(Evidence).filter_by(artifact_id=bad_id).count() == 0
+    assert db.query(Evidence).filter_by(artifact_id=sibling_id).count() == 1
+    db.close()
+
+    analysis_task._finalize_analysis_task.run(
+        [bad_result, sibling_result], analysis_id, None
+    )
+    db = session_factory()
+    assert db.query(Analysis).filter_by(id=analysis_id).one().status == "completed"
+    db.close()
+
+
+def test_evidence_persistence_failure_remains_analysis_fatal(tmp_path, monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    analysis_id = _seed_user_and_analysis(session_factory)
+    path = _valid_generic_log(tmp_path, "valid.log", "core persistence")
+    artifact_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename="valid.log",
+        path=path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+    monkeypatch.setattr(
+        analysis_task,
+        "persist_evidence_batch",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("evidence DB write failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="evidence DB write failed"):
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+
+    db = session_factory()
+    assert db.query(Analysis).filter_by(id=analysis_id).one().status == "failed"
+    artifact = db.query(AnalysisArtifact).filter_by(id=artifact_id).one()
+    assert artifact.status not in ("resource_limited", "processing_error")
+    db.close()
+
+
+def test_deterministic_correlation_failure_remains_analysis_fatal(
+    tmp_path, monkeypatch
+):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    analysis_id = _seed_user_and_analysis(session_factory)
+    generic_path = tmp_path / "generic.log"
+    generic_path.write_text(
+        "2026-08-12T10:00:00Z ERROR trace_id=fatal-trace service=api RuntimeError: failed\n"
+    )
+    json_path = tmp_path / "events.jsonl"
+    json_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-12T10:00:01Z",
+                "level": "ERROR",
+                "message": "database timed out",
+                "trace_id": "fatal-trace",
+                "service": "database",
+            }
+        )
+        + "\n"
+    )
+    artifact_ids = [
+        _add_artifact(
+            session_factory,
+            analysis_id=analysis_id,
+            position=position,
+            filename=path.name,
+            path=path,
+            detected_format=artifact_format.value,
+        )
+        for position, (path, artifact_format) in enumerate(
+            ((generic_path, ArtifactFormat.GENERIC), (json_path, ArtifactFormat.JSON))
+        )
+    ]
+    results = [
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        for artifact_id in artifact_ids
+    ]
+    monkeypatch.setattr(
+        analysis_task,
+        "run_correlation",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("correlation engine bug")),
+    )
+
+    with pytest.raises(RuntimeError, match="correlation engine bug"):
+        analysis_task._finalize_analysis_task.run(results, analysis_id, None)
+
+    db = session_factory()
+    assert db.query(Analysis).filter_by(id=analysis_id).one().status == "failed"
+    db.close()
+
+
+def test_mixed_investigation_isolates_artifact_source_ocr_and_gemini_failures(
+    tmp_path, monkeypatch
+):
+    """Integration-style task regression for the complete isolation rule."""
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+    monkeypatch.setattr(
+        source_archive,
+        "_clone_github",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("optional source SDK failed")),
+    )
+
+    analysis_id = _seed_user_and_analysis(
+        session_factory,
+        source_kind="github",
+        source_reference="https://github.com/acme/project",
+    )
+    analysis_task._prepare_source_task.run(analysis_id)
+
+    generic_path = tmp_path / "generic.log"
+    generic_path.write_text(
+        "2026-08-12T10:00:00Z ERROR trace_id=mixed-trace service=api RuntimeError: request failed\n"
+    )
+    json_path = tmp_path / "events.jsonl"
+    json_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-12T10:00:01Z",
+                "level": "ERROR",
+                "message": "database timed out",
+                "trace_id": "mixed-trace",
+                "service": "database",
+            }
+        )
+        + "\n"
+    )
+    web_path = tmp_path / "nginx.log"
+    web_path.write_text(
+        '127.0.0.1 - - [12/Aug/2026:10:00:02 +0000] "GET /checkout HTTP/1.1" 503 123\n'
+    )
+    otlp_path = tmp_path / "broken-otlp.json"
+    otlp_path.write_text('{"resourceLogs":[{"scopeLogs":[', encoding="utf-8")
+    image_path = _valid_png(tmp_path / "screenshot.png")
+
+    artifacts = [
+        (generic_path, ArtifactFormat.GENERIC),
+        (json_path, ArtifactFormat.JSON),
+        (web_path, ArtifactFormat.WEB_SERVER),
+        (otlp_path, ArtifactFormat.OPENTELEMETRY),
+        (image_path, ArtifactFormat.IMAGE),
+    ]
+    artifact_ids = [
+        _add_artifact(
+            session_factory,
+            analysis_id=analysis_id,
+            position=position,
+            filename=path.name,
+            path=path,
+            detected_format=artifact_format.value,
+        )
+        for position, (path, artifact_format) in enumerate(artifacts)
+    ]
+
+    monkeypatch.setattr(image_text_extractor, "_ocr", None)
+    monkeypatch.setattr(
+        "rapidocr_onnxruntime.RapidOCR",
+        lambda: (_ for _ in ()).throw(RuntimeError("OCR model failed to load")),
+    )
+
+    results = [
+        analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+        for artifact_id in artifact_ids
+    ]
+
+    identity_calls = []
+    correlation_calls = []
+    real_identity = analysis_task.persist_resolved_identities
+    real_run_correlation = analysis_task.run_correlation
+
+    def tracked_identity(**kwargs):
+        identity_calls.append(kwargs["analysis_id"])
+        return real_identity(**kwargs)
+
+    def tracked_correlation(**kwargs):
+        correlation_calls.append(kwargs["analysis_id"])
+        return real_run_correlation(**kwargs)
+
+    monkeypatch.setattr(analysis_task, "persist_resolved_identities", tracked_identity)
+    monkeypatch.setattr(analysis_task, "run_correlation", tracked_correlation)
+    monkeypatch.setattr(gemini_service._client, "_resolved_client", None)
+    monkeypatch.setattr(
+        gemini_service.genai,
+        "Client",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Gemini SDK failed")),
+    )
+
+    analysis_task._finalize_analysis_task.run(results, analysis_id, None)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter_by(id=analysis_id).one()
+    rows = db.query(AnalysisArtifact).filter_by(analysis_id=analysis_id).all()
+    status_by_name = {row.original_filename: row.status for row in rows}
+    evidence = db.query(Evidence).filter_by(analysis_id=analysis_id).all()
+
+    assert status_by_name["broken-otlp.json"] == "processing_error"
+    assert status_by_name["screenshot.png"] == "processing_error"
+    assert status_by_name["generic.log"] == "completed"
+    assert status_by_name["events.jsonl"] == "completed"
+    assert status_by_name["nginx.log"] == "completed"
+    assert {row.source_format for row in evidence} >= {"generic", "json", "web_server"}
+    assert all(
+        row.artifact_id not in {artifact_ids[3], artifact_ids[4]} for row in evidence
+    )
+    assert analysis.source_status == "unavailable"
+    assert analysis.status == "completed"
+    assert analysis.result_snapshot["investigation_path"] == "correlated"
+    assert analysis.result_snapshot.get("ai_analysis") is None
+    assert identity_calls == [analysis_id]
+    assert correlation_calls == [analysis_id]
+    db.close()
+
+
+def test_gemini_response_object_failure_preserves_deterministic_result(
+    tmp_path, monkeypatch
+):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    analysis_id = _seed_user_and_analysis(session_factory)
+    path = _valid_generic_log(tmp_path, "valid.log", "Gemini response failed")
+    artifact_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename="valid.log",
+        path=path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+    result = analysis_task._process_artifact_task.run(analysis_id, artifact_id)
+
+    class ThrowingResponse:
+        @property
+        def text(self):
+            raise RuntimeError("response decoding failed")
+
+    class Models:
+        def generate_content(self, **_kwargs):
+            return ThrowingResponse()
+
+    class Client:
+        models = Models()
+
+    monkeypatch.setattr(gemini_service._client, "_resolved_client", Client())
+
+    analysis_task._finalize_analysis_task.run([result], analysis_id, None)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter_by(id=analysis_id).one()
+    assert analysis.status == "completed"
+    assert analysis.result_snapshot["investigation_path"] == "simple"
+    assert analysis.result_snapshot.get("ai_analysis") is None
     db.close()
 
 

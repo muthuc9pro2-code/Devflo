@@ -1,7 +1,6 @@
 import json
 import logging
 from time import perf_counter, sleep
-from pydantic import ValidationError
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -170,7 +169,25 @@ Be decisive when the evidence is strong, explicit when it is weak, and faithful
 to Devflo's deterministic findings.
 """
 
-_client = genai.Client(api_key=Settings.GEMINI_API_KEY)
+class _LazyGeminiClient:
+    """Construct the optional SDK client only when an explanation is needed."""
+
+    def __init__(self) -> None:
+        self._resolved_client = None
+
+    def get(self):
+        if self._resolved_client is None:
+            self._resolved_client = genai.Client(api_key=Settings.GEMINI_API_KEY)
+        return self._resolved_client
+
+    @property
+    def models(self):
+        # Kept as a property so existing call sites and tests can target the
+        # SDK's models facade while client construction remains lazy.
+        return self.get().models
+
+
+_client = _LazyGeminiClient()
 
 def generate_investigation_explanation(
     context: dict,
@@ -179,23 +196,28 @@ def generate_investigation_explanation(
     logger.info("Gemini request starting")
 
     api_call_start = perf_counter()
-    contents = json.dumps(context, default=str)
-    config = types.GenerateContentConfig(
-        system_instruction=_SYSTEM_INSTRUCTION,
-        response_mime_type="application/json",
-        response_schema=GeminiInvestigationResponse,
-        temperature=0.2,
-        http_options=types.HttpOptions(timeout=_REQUEST_TIMEOUT_SECONDS * 1000),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-            disable=True,
-        ),
-    )
+    try:
+        contents = json.dumps(context, default=str)
+        config = types.GenerateContentConfig(
+            system_instruction=_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=GeminiInvestigationResponse,
+            temperature=0.2,
+            http_options=types.HttpOptions(timeout=_REQUEST_TIMEOUT_SECONDS * 1000),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True,
+            ),
+        )
+        models = _client.models
+    except Exception as exc:
+        logger.warning("Gemini client initialization failed: %s", exc)
+        raise GeminiUnavailableError(str(exc)) from exc
 
     attempt = 0
     while True:
         attempt += 1
         try:
-            response = _client.models.generate_content(
+            response = models.generate_content(
                 model=Settings.GEMINI_MODEL,
                 contents=contents,
                 config=config,
@@ -235,9 +257,10 @@ def generate_investigation_explanation(
 
     processing_start = perf_counter()
     try:
-        result = GeminiInvestigationResponse.model_validate_json(response.text)
-    except ValidationError as exc:
-        logger.warning("Gemini response failed schema validation: %s", exc)
+        response_text = response.text
+        result = GeminiInvestigationResponse.model_validate_json(response_text)
+    except Exception as exc:
+        logger.warning("Gemini response could not be decoded or validated: %s", exc)
         raise GeminiUnavailableError(str(exc)) from exc
     processing_seconds = perf_counter() - processing_start
 

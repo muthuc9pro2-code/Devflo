@@ -13,7 +13,7 @@ from app.services.batch_processor import (
     MAX_BATCH_ITEMS,
     create_batches,
 )
-from app.services.diagnostic_adapters import stream_artifact_events
+from app.services.diagnostic_adapters import ArtifactInputError, stream_artifact_events
 from app.services.otel_adapter import _OtelCapture
 from app.utils.bounded_json import BoundedJsonStream, OversizedJsonScalarError
 from app.utils.file_reader import stream_text_lines
@@ -113,13 +113,27 @@ def test_malformed_json_structured_checkpoint_does_not_switch_to_text(tmp_path):
     path = tmp_path / "partial.json"
     path.write_text('[{"level":"ERROR","message":"first"},{"level":', encoding="utf-8")
 
-    with pytest.raises(ijson.JSONError):
+    with pytest.raises(ArtifactInputError, match="resumed safely"):
         list(
             stream_artifact_events(
                 file_path=str(path),
                 artifact_format=ArtifactFormat.JSON,
                 source_file=path.name,
                 start_artifact_line=1,
+            )
+        )
+
+
+def test_malformed_otlp_before_first_record_is_an_artifact_input_error(tmp_path):
+    path = tmp_path / "malformed-otlp.json"
+    path.write_text('{"resourceLogs":[{"scopeLogs":[', encoding="utf-8")
+
+    with pytest.raises(ArtifactInputError, match="OpenTelemetry"):
+        list(
+            stream_artifact_events(
+                file_path=str(path),
+                artifact_format=ArtifactFormat.OPENTELEMETRY,
+                source_file=path.name,
             )
         )
 

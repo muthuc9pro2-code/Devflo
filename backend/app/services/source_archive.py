@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import zipfile
+import zlib
 from pathlib import Path
 
 from app.core.processing_config import (
@@ -30,6 +31,10 @@ _GITHUB_URL = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?
 
 class SourceInputError(ValueError):
     pass
+
+
+class SourceSubsystemError(RuntimeError):
+    """A failure contained within optional source acquisition/indexing."""
 
 def validate_github_url(url: str) -> str:
     match = _GITHUB_URL.match((url or "").strip())
@@ -65,16 +70,21 @@ def validate_source_zip(path: Path) -> None:
 def _extract_zip(path: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     root = dest.resolve()
-    with zipfile.ZipFile(path) as zf:
-        for member, relative in _safe_members(zf):
-            if member.is_dir() or not relative or relative == ".":
-                continue
-            target = (dest / relative).resolve()
-            if root not in target.parents:
-                raise SourceInputError(f"Unsafe path in source ZIP: {member.filename}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(member) as source, open(target, "wb") as destination:
-                shutil.copyfileobj(source, destination)
+    try:
+        with zipfile.ZipFile(path) as zf:
+            for member, relative in _safe_members(zf):
+                if member.is_dir() or not relative or relative == ".":
+                    continue
+                target = (dest / relative).resolve()
+                if root not in target.parents:
+                    raise SourceInputError(f"Unsafe path in source ZIP: {member.filename}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as source, open(target, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError, zlib.error) as error:
+        raise SourceInputError(
+            "Uploaded source ZIP is corrupt, encrypted, or uses unsupported compression"
+        ) from error
 
 def _validate_cloned_source_tree(root: Path) -> None:
     """Applies the same MAX_SOURCE_FILES / MAX_SOURCE_TOTAL_BYTES contract

@@ -1,12 +1,13 @@
 from datetime import UTC, datetime
 import logging
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.crud.user import create_user, get_user_by_email, authenticate_user, get_user_by_username
 from app.db.database import get_db
-from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse, ForgotPasswordRequest, ResetPasswordRequest
+from app.schemas.user import UserRegister, UserLogin, UserResponse, LoginResponse, RegisterResponse, ForgotPasswordRequest, ResetPasswordRequest, VerifyEmailRequest
 from app.core.security import (
     create_email_verification_token,
     decode_email_verification_token,
@@ -122,7 +123,14 @@ def register(
             detail="Username already taken"
         )
 
-    created_user = create_user(db, user)
+    try:
+        created_user = create_user(db, user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Registration conflict",
+        ) from None
     verification_token = create_email_verification_token(created_user.email)
     _send_verification_email_or_503(created_user.email, verification_token)
     _set_verification_handoff_cookie(
@@ -139,12 +147,11 @@ def register(
 
 @router.post("/verify-email")
 def verify_email(
-    response: Response,
-    token: str = Query(min_length=1, max_length=4096),
+    request: VerifyEmailRequest,
     db: Session = Depends(get_db),
 ):
     try:
-        payload = decode_email_verification_token(token)
+        payload = decode_email_verification_token(request.token)
     except (jwt.PyJWTError, ValueError):
         raise HTTPException(
             status_code=400,
@@ -430,6 +437,8 @@ def logout(response: Response):
 
 @router.get("/me", response_model=UserResponse)
 def get_me(
+    response: Response,
     current_user: User = Depends(get_current_verified_user)
 ):
+    response.headers["Cache-Control"] = "no-store"
     return current_user

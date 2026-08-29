@@ -17,6 +17,16 @@ from app.services.image_text_extractor import extract_text_from_image_with_confi
 from app.services.ocr_normalizer import normalize_ocr_text
 logger = logging.getLogger(__name__)
 
+
+class ArtifactInputError(ValueError):
+    """One diagnostic artifact cannot be parsed safely.
+
+    This exception is reserved for input/format failures discovered inside a
+    parser boundary.  The artifact task converts it to an artifact-local
+    processing error; persistence, database, and deterministic-engine failures
+    must not be wrapped in it.
+    """
+
 if ijson.backend != "yajl2_c":
     logger.warning(
         "ijson is using the %r backend instead of the C-accelerated "
@@ -684,10 +694,12 @@ def _stream_json_document(*, file_path: str, artifact_format: ArtifactFormat, so
                 )
                 emitted = True
                 yield ArtifactEvent(event=event, end_offset=0, artifact_line_number=local_record, global_end_line_number=global_line, batch_size_bytes=max(retained_size_bytes, 1))
-    except ijson.JSONError:
+    except ijson.JSONError as error:
         has_structured_checkpoint = skip_records > 0 and start_offset == 0
         if has_structured_checkpoint:
-            raise
+            raise ArtifactInputError(
+                "Structured diagnostic could not be resumed safely"
+            ) from error
         if emitted:
             logger.warning(
                 'Malformed/truncated JSON document %s after %s record(s) '

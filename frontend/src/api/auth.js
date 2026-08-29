@@ -35,8 +35,9 @@ export function getMe() {
 }
 
 export function verifyEmail(token) {
-  return request(`/auth/verify-email?token=${encodeURIComponent(token)}`, {
+  return request('/auth/verify-email', {
     method: 'POST',
+    body: JSON.stringify({ token }),
   })
 }
 

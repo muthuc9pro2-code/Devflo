@@ -332,6 +332,28 @@ def test_prepared_source_still_correlates_stack_frames(tmp_path, monkeypatch):
     assert matches[0]["relative_path"] == "app/main.py"
 
 
+def test_source_context_read_failure_keeps_match_without_snippet(tmp_path, monkeypatch):
+    from app.services.log_praser import ParsedEvent, StackFrame
+    from app.services.source_index import correlate_event
+
+    _fake_git_clone(monkeypatch)
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+    index = prepare_source("github", "https://github.com/acme/project", 506)
+
+    # The file was indexed successfully but became unreadable/unavailable
+    # before optional snippet enrichment.  The diagnostic match itself and
+    # investigation must survive without context text.
+    (index.root / "app" / "main.py").unlink()
+    event = ParsedEvent(line_number=1, raw_line="ERROR failure", module=None)
+    event.stack_frames = [StackFrame(file="app/main.py", line=1, function="run")]
+
+    matches = correlate_event(event, index)
+
+    assert len(matches) == 1
+    assert matches[0]["relative_path"] == "app/main.py"
+    assert matches[0]["snippet"] is None
+
+
 # --- 16/17/18: finalize-time cleanup ----------------------------------------
 
 

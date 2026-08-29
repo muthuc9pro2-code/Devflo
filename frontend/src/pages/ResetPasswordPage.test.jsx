@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   logout: vi.fn(),
   navigate: vi.fn(),
   resetPassword: vi.fn(),
+  search: '',
 }))
 
 vi.mock('../api/auth', () => ({ resetPassword: mocks.resetPassword }))
@@ -12,7 +13,7 @@ vi.mock('../context/useAuth', () => ({
   useAuth: () => ({ logout: mocks.logout }),
 }))
 vi.mock('../router/useRouter', () => ({
-  useRouter: () => ({ search: '?token=reset-token', navigate: mocks.navigate }),
+  useRouter: () => ({ search: mocks.search, navigate: mocks.navigate }),
 }))
 
 import ResetPasswordPage from './ResetPasswordPage'
@@ -43,6 +44,8 @@ describe('ResetPasswordPage success state', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.clearAllMocks()
+    mocks.search = ''
+    window.history.replaceState({}, '', '/reset-password#token=reset-token')
     FakeBroadcastChannel.instances = []
     window.BroadcastChannel = FakeBroadcastChannel
     mocks.resetPassword.mockResolvedValue({ message: 'Password reset successfully' })
@@ -61,13 +64,19 @@ describe('ResetPasswordPage success state', () => {
     expect(screen.getByRole('heading', { name: 'Devflo' })).toBeTruthy()
     expect(screen.getByText('Password reset successfully.')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Back to sign in' })).toBeTruthy()
-    expect(mocks.navigate).toHaveBeenCalledTimes(1)
-    expect(mocks.navigate).toHaveBeenCalledWith('/reset-password', { replace: true })
+    expect(mocks.resetPassword).toHaveBeenCalledWith({
+      token: 'reset-token',
+      newPassword: 'new-password',
+    })
+    expect(window.location.pathname).toBe('/reset-password')
+    expect(window.location.search).toBe('')
+    expect(window.location.hash).toBe('')
+    expect(mocks.navigate).not.toHaveBeenCalled()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(60_000)
     })
-    expect(mocks.navigate).toHaveBeenCalledTimes(1)
+    expect(mocks.navigate).not.toHaveBeenCalled()
   })
 
   it('clears stale auth state before manually navigating to reset-success login', async () => {
@@ -122,6 +131,22 @@ describe('ResetPasswordPage success state', () => {
     await submitPasswordReset()
 
     expect(screen.getByText('Password reset successfully.')).toBeTruthy()
-    expect(mocks.navigate).toHaveBeenCalledWith('/reset-password', { replace: true })
+    expect(mocks.navigate).not.toHaveBeenCalled()
+  })
+
+  it('supports and immediately scrubs a legacy query-token link', async () => {
+    mocks.search = '?token=legacy-reset-token'
+    window.history.replaceState({}, '', '/reset-password?token=legacy-reset-token')
+
+    render(<ResetPasswordPage />)
+    await submitPasswordReset()
+
+    expect(mocks.resetPassword).toHaveBeenCalledWith({
+      token: 'legacy-reset-token',
+      newPassword: 'new-password',
+    })
+    expect(window.location.pathname).toBe('/reset-password')
+    expect(window.location.search).toBe('')
+    expect(window.location.hash).toBe('')
   })
 })

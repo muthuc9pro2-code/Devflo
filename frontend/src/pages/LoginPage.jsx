@@ -9,9 +9,8 @@ export default function LoginPage() {
   const [form, setForm] = useState({ email: '', password: '' })
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  // Set by ResetPasswordPage's navigate('/login?reset=success') - the same
-  // search-param convention VerifyEmailPage's ?token= already uses to pass
-  // page-local state through the URL, rather than a new global mechanism.
+  // Set only after the user's explicit reset-success action. Email bearer
+  // credentials use fragments instead and are scrubbed before API submission.
   const [resetSuccess, setResetSuccess] = useState(
     () => new URLSearchParams(search).get('reset') === 'success',
   )
