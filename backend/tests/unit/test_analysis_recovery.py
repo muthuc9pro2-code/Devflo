@@ -241,7 +241,7 @@ def test_process_artifact_bumps_heartbeat_after_each_persisted_batch(monkeypatch
     artifact_path = tmp_path / "a.log"
     artifact_path.write_text("2026-01-01 10:00:00 ERROR service=a boom\n")
     artifact = _artifact(
-        db, analysis, status="pending", saved_file_path=str(artifact_path),
+        db, analysis, status="processing", saved_file_path=str(artifact_path),
         size_bytes=artifact_path.stat().st_size, original_filename="a.log",
     )
 
@@ -491,7 +491,7 @@ def test_image_artifact_processed_bytes_stays_zero_until_full_completion(monkeyp
     image_path = tmp_path / "shot.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
     artifact = _artifact(
-        db, analysis, status="pending", detected_format=None,
+        db, analysis, status="processing", detected_format=None,
         saved_file_path=str(image_path), size_bytes=image_path.stat().st_size,
     )
     monkeypatch.setattr(

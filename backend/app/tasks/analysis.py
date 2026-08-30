@@ -6,7 +6,7 @@ from time import perf_counter
 from time import time as wall_time
 from celery import chain, chord, group
 from celery.exceptions import Retry
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session
 from app.core.celery_app import celery_app
 from app.core.processing_config import (
@@ -48,7 +48,10 @@ from app.services.source_archive import (
     prepare_source,
 )
 from app.services.source_index import correlate_event
-from app.services.investigation_router import choose_investigation_path, InvestigationPath
+from app.services.investigation_router import (
+    choose_investigation_path,
+    InvestigationPath,
+)
 from app.services.correlation_engine import prepare_correlation, run_correlation
 from app.services.investigation_context import (
     build_artifact_outcome_payload,
@@ -74,7 +77,6 @@ from app.services.gemini_service import (
     generate_investigation_explanation,
 )
 
-
 logger = logging.getLogger(__name__)
 
 _GLOBAL_LINE_NUMBER_STRIDE = 10**9
@@ -86,11 +88,13 @@ def _safe_rollback(db: Session) -> None:
     except Exception:
         logger.warning("db.rollback() failed after a prior exception", exc_info=True)
 
+
 def _is_analysis_cancelled(db: Session, analysis_id: int) -> bool:
     return (
         db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
         == "cancelled"
     )
+
 
 def _finalizer_owns_generation(db: Session, analysis_id: int, generation: int) -> bool:
     """Fresh, CURRENT ownership re-check for a finalize-stage boundary
@@ -299,9 +303,7 @@ def _bump_processing_heartbeat(analysis_id: int, generation: int) -> None:
         heartbeat_db.commit()
     except Exception:
         _safe_rollback(heartbeat_db)
-        logger.debug(
-            "Analysis %s | heartbeat write failed", analysis_id, exc_info=True
-        )
+        logger.debug("Analysis %s | heartbeat write failed", analysis_id, exc_info=True)
     finally:
         heartbeat_db.close()
 
@@ -435,17 +437,23 @@ def process_analysis(analysis_id: int):
         artifact_ids = [
             row.id
             for row in all_artifacts
-           
-            if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
+            if row.status
+            not in ("unsupported", "duplicate", "resource_limited", "processing_error")
         ]
 
         finalize_only = all(
-            row.status in ("completed", "unsupported", "duplicate", "resource_limited", "processing_error")
+            row.status
+            in (
+                "completed",
+                "unsupported",
+                "duplicate",
+                "resource_limited",
+                "processing_error",
+            )
             for row in all_artifacts
         )
         needs_source_prep = bool(analysis.source_kind) and not finalize_only
 
-      
         if _is_analysis_cancelled(db, analysis_id):
             logger.info(
                 "Analysis %s | cancelled before dispatch; not dispatching",
@@ -477,7 +485,8 @@ def process_analysis(analysis_id: int):
             for artifact_id in artifact_ids
         )
         workflow = chord(
-            artifact_group, _finalize_analysis_task.s(analysis_id, generation, dispatch_start)
+            artifact_group,
+            _finalize_analysis_task.s(analysis_id, generation, dispatch_start),
         )
         if needs_source_prep:
             workflow = chain(_prepare_source_task.si(analysis_id, generation), workflow)
@@ -558,7 +567,10 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
             )
             return 0
 
-        if analysis.status != "processing" or analysis.processing_generation != generation:
+        if (
+            analysis.status != "processing"
+            or analysis.processing_generation != generation
+        ):
             logger.info(
                 "Analysis %s | generation %s superseded (status=%s, "
                 "current generation=%s); skipping artifact %s",
@@ -573,54 +585,58 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
         if artifact.status in ("completed", "resource_limited", "processing_error"):
             return 0
 
-        # Atomic artifact claim, combined with the PARENT Analysis's
-        # generation authority in the SAME UPDATE statement - not two
-        # separate checks with a window between them. The earlier plain
-        # read of analysis.status/processing_generation above is only a
-        # fast-path optimization (skip even attempting a claim that is
-        # already hopeless); it is NOT what makes this safe, since a
-        # cancellation/recovery commit could land in the gap between that
-        # read and this claim. The EXISTS subquery is evaluated as part of
-        # this one atomic UPDATE, so a duplicate/stale invocation whose
-        # parent generation is invalidated (by cancellation, failure, or
-        # recovery demoting/advancing the generation) between its own
-        # earlier read and this statement still loses the claim here -
-        # there is no separate window left to race into. Two concurrent
-        # invocations for the same artifact (broker redelivery, or a
-        # recovery redispatch racing a still-live original) can therefore
-        # never both start streaming/parsing the same byte range - the
-        # loser's UPDATE affects zero rows and it returns without touching
-        # Evidence or the checkpoint at all. No lock is held here across
-        # file reads/parsing/OCR below - the UPDATE's own row lock is
-        # released at this transaction's commit, immediately after.
-        claim = db.execute(
-            update(AnalysisArtifact)
-            .where(
-                AnalysisArtifact.id == artifact_id,
-                AnalysisArtifact.analysis_id == analysis_id,
-                AnalysisArtifact.status == "pending",
-                exists().where(
-                    Analysis.id == analysis_id,
-                    Analysis.status == "processing",
-                    Analysis.processing_generation == generation,
-                ),
-            )
-            .values(status="processing")
-            .execution_options(synchronize_session=False)
+        # Claim under one short parent-first transaction.
+        #
+        # Lock order:
+        #   Analysis -> AnalysisArtifact
+        #
+        # No ORM state is dirty before these locking reads, so SQLAlchemy
+        # cannot autoflush an Artifact UPDATE ahead of the parent lock.
+        current = (
+            db.query(Analysis)
+            .filter(Analysis.id == analysis_id)
+            .with_for_update()
+            .first()
         )
-        db.commit()
-        if claim.rowcount != 1:
+
+        if (
+            current is None
+            or current.status != "processing"
+            or current.processing_generation != generation
+        ):
+            db.rollback()
             logger.info(
-                "Analysis %s | artifact %s not claimed (status=%s); another "
-                "execution already owns it, or generation %s no longer "
-                "has parent authority",
+                "Analysis %s | generation %s no longer owns artifact %s; skipping",
                 analysis_id,
-                artifact_id,
-                artifact.status,
                 generation,
+                artifact_id,
             )
             return 0
-        db.refresh(artifact)
+
+        claimed_artifact = (
+            db.query(AnalysisArtifact)
+            .filter(
+                AnalysisArtifact.id == artifact_id,
+                AnalysisArtifact.analysis_id == analysis_id,
+            )
+            .with_for_update()
+            .first()
+        )
+
+        if claimed_artifact is None or claimed_artifact.status != "pending":
+            db.rollback()
+            logger.info(
+                "Analysis %s | artifact %s not claimable (status=%s); skipping",
+                analysis_id,
+                artifact_id,
+                getattr(claimed_artifact, "status", None),
+            )
+            return 0
+
+        claimed_artifact.status = "processing"
+        db.commit()
+
+        artifact = claimed_artifact
 
         _bump_processing_heartbeat(analysis_id, generation)
 
@@ -758,7 +774,10 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
             logger.warning("Analysis %s not found for source prep", analysis_id)
             return
 
-        if analysis.status != "processing" or analysis.processing_generation != generation:
+        if (
+            analysis.status != "processing"
+            or analysis.processing_generation != generation
+        ):
             logger.info(
                 "Analysis %s | generation %s superseded (status=%s, current "
                 "generation=%s); skipping source preparation",
@@ -778,8 +797,7 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
             return
         if analysis.source_status == "ready":
             logger.info(
-                "Analysis %s | optional source already ready; nothing to "
-                "prepare",
+                "Analysis %s | optional source already ready; nothing to " "prepare",
                 analysis_id,
             )
             return
@@ -824,13 +842,16 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
                 logger.info(
                     "Analysis %s | generation %s superseded (status=%s) "
                     "before source preparation could be claimed",
-                    analysis_id, generation, current_status,
+                    analysis_id,
+                    generation,
+                    current_status,
                 )
                 return
             if current_source_status in ("ready", "unavailable"):
                 logger.info(
                     "Analysis %s | source already %s; nothing to prepare",
-                    analysis_id, current_source_status,
+                    analysis_id,
+                    current_source_status,
                 )
                 return
             # current_source_status == "preparing": a duplicate/redelivered
@@ -841,8 +862,11 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
             logger.info(
                 "Analysis %s | source preparation for generation %s already "
                 "owned; retrying in %ss (attempt %s/%s)",
-                analysis_id, generation, _SOURCE_PREPARING_RETRY_DELAY_SECONDS,
-                self.request.retries + 1, _SOURCE_PREPARING_RETRY_MAX,
+                analysis_id,
+                generation,
+                _SOURCE_PREPARING_RETRY_DELAY_SECONDS,
+                self.request.retries + 1,
+                _SOURCE_PREPARING_RETRY_MAX,
             )
             raise self.retry(countdown=_SOURCE_PREPARING_RETRY_DELAY_SECONDS)
         db.refresh(analysis)
@@ -881,7 +905,8 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
             logger.info(
                 "Analysis %s | generation %s superseded before source could "
                 "be marked ready; leaving the published tree in place",
-                analysis_id, generation,
+                analysis_id,
+                generation,
             )
             _invalidate_source_index_cache(analysis_id)
             return
@@ -947,7 +972,11 @@ _FINALIZE_RETRY_DELAY_SECONDS = 15
 
 @celery_app.task(bind=True, max_retries=_FINALIZE_RETRY_MAX)
 def _finalize_analysis_task(
-    self, results, analysis_id: int, generation: int, dispatch_start: float | None = None
+    self,
+    results,
+    analysis_id: int,
+    generation: int,
+    dispatch_start: float | None = None,
 ) -> None:
     """Chord callback for process_analysis: Celery only invokes this after
     every task in the artifact group has completed successfully. As a
@@ -973,7 +1002,10 @@ def _finalize_analysis_task(
             logger.warning("Analysis %s not found at finalize time", analysis_id)
             return
 
-        if analysis.status != "processing" or analysis.processing_generation != generation:
+        if (
+            analysis.status != "processing"
+            or analysis.processing_generation != generation
+        ):
             logger.info(
                 "Analysis %s | generation %s superseded (status=%s, current "
                 "generation=%s); skipping finalize",
@@ -1142,7 +1174,7 @@ def _finalize_analysis_task(
             return
 
         if evidence_count == 0:
-           
+
             zero_evidence_artifacts = (
                 db.query(AnalysisArtifact)
                 .filter(AnalysisArtifact.analysis_id == analysis_id)
@@ -1169,18 +1201,22 @@ def _finalize_analysis_task(
                     logger.info(
                         "Analysis %s | generation %s ownership lost before "
                         "Gemini (fallback); stopping finalize",
-                        analysis_id, generation,
+                        analysis_id,
+                        generation,
                     )
                     return
                 final_ai_analysis: dict | None
                 try:
-                    gemini_result = generate_investigation_explanation(fallback_llm_context)
+                    gemini_result = generate_investigation_explanation(
+                        fallback_llm_context
+                    )
 
                     if not _finalizer_owns_generation(db, analysis_id, generation):
                         logger.info(
                             "Analysis %s | generation %s ownership lost after "
                             "Gemini (fallback); discarding result, stopping finalize",
-                            analysis_id, generation,
+                            analysis_id,
+                            generation,
                         )
                         return
                     fallback_payload["ai_analysis"] = gemini_result.model_dump()
@@ -1203,19 +1239,25 @@ def _finalize_analysis_task(
                     logger.info(
                         "Analysis %s | generation %s ownership lost before final "
                         "persistence (fallback); discarding result, stopping finalize",
-                        analysis_id, generation,
+                        analysis_id,
+                        generation,
                     )
                     return
                 if not _finalize_commit_if_processing(
-                    db, analysis, generation=generation,
-                    result_snapshot=fallback_payload, ai_analysis=final_ai_analysis,
+                    db,
+                    analysis,
+                    generation=generation,
+                    result_snapshot=fallback_payload,
+                    ai_analysis=final_ai_analysis,
                     processed_bytes=final_processed_bytes,
                     last_processed_line=final_last_processed_line,
                     stage="fallback",
                 ):
                     return
                 _cleanup_completed_diagnostic_files(db, analysis_id)
-                _cleanup_prepared_source_after_completion(analysis_id, analysis.source_kind)
+                _cleanup_prepared_source_after_completion(
+                    analysis_id, analysis.source_kind
+                )
 
                 logger.info(
                     "Analysis %s | zero structured evidence, %s artifact(s) "
@@ -1240,8 +1282,11 @@ def _finalize_analysis_task(
             if source_outcome is not None:
                 zero_evidence_payload["source"] = source_outcome
             if not _finalize_commit_if_processing(
-                db, analysis, generation=generation,
-                result_snapshot=zero_evidence_payload, ai_analysis=None,
+                db,
+                analysis,
+                generation=generation,
+                result_snapshot=zero_evidence_payload,
+                ai_analysis=None,
                 processed_bytes=final_processed_bytes,
                 last_processed_line=final_last_processed_line,
                 stage="zero-evidence",
@@ -1275,7 +1320,8 @@ def _finalize_analysis_task(
             logger.info(
                 "Analysis %s | generation %s ownership lost before identity "
                 "persistence; stopping finalize",
-                analysis_id, generation,
+                analysis_id,
+                generation,
             )
             return
 
@@ -1286,7 +1332,8 @@ def _finalize_analysis_task(
             logger.info(
                 "Analysis %s | generation %s ownership lost during identity "
                 "persistence; stopping finalize",
-                analysis_id, generation,
+                analysis_id,
+                generation,
             )
             return
         logger.info("Analysis %s | evidence identities resolved", analysis_id)
@@ -1300,7 +1347,8 @@ def _finalize_analysis_task(
             logger.info(
                 "Analysis %s | generation %s ownership lost after identity "
                 "persistence; stopping finalize",
-                analysis_id, generation,
+                analysis_id,
+                generation,
             )
             return
 
@@ -1377,7 +1425,8 @@ def _finalize_analysis_task(
             supplemental_artifacts = [
                 artifact
                 for artifact in artifact_outcomes
-                if artifact.fallback_context and artifact.id not in artifact_ids_with_evidence
+                if artifact.fallback_context
+                and artifact.id not in artifact_ids_with_evidence
             ]
 
             correlation_payload = build_correlation_payload(
@@ -1416,7 +1465,8 @@ def _finalize_analysis_task(
                 logger.info(
                     "Analysis %s | generation %s ownership lost before Gemini "
                     "(correlated); stopping finalize",
-                    analysis_id, generation,
+                    analysis_id,
+                    generation,
                 )
                 return
             final_ai_analysis: dict | None
@@ -1427,7 +1477,8 @@ def _finalize_analysis_task(
                     logger.info(
                         "Analysis %s | generation %s ownership lost after Gemini "
                         "(correlated); discarding result, stopping finalize",
-                        analysis_id, generation,
+                        analysis_id,
+                        generation,
                     )
                     return
                 correlation_payload["ai_analysis"] = gemini_result.model_dump()
@@ -1449,12 +1500,16 @@ def _finalize_analysis_task(
                 logger.info(
                     "Analysis %s | generation %s ownership lost before final "
                     "persistence (correlated); discarding result, stopping finalize",
-                    analysis_id, generation,
+                    analysis_id,
+                    generation,
                 )
                 return
             if not _finalize_commit_if_processing(
-                db, analysis, generation=generation,
-                result_snapshot=correlation_payload, ai_analysis=final_ai_analysis,
+                db,
+                analysis,
+                generation=generation,
+                result_snapshot=correlation_payload,
+                ai_analysis=final_ai_analysis,
                 processed_bytes=final_processed_bytes,
                 last_processed_line=final_last_processed_line,
                 stage="correlated",
@@ -1468,13 +1523,12 @@ def _finalize_analysis_task(
                 _true_total_seconds(),
             )
 
-           
             publish_investigation_result(
                 analysis_id,
                 correlation_payload,
             )
         else:
-           
+
             simple_artifacts = (
                 db.query(
                     AnalysisArtifact.id,
@@ -1490,7 +1544,6 @@ def _finalize_analysis_task(
                 .all()
             )
 
-            
             simple_artifact_ids_with_evidence = set(evidence_counts_by_artifact.keys())
             simple_supplemental_artifacts = [
                 artifact
@@ -1522,7 +1575,8 @@ def _finalize_analysis_task(
                 logger.info(
                     "Analysis %s | generation %s ownership lost before Gemini "
                     "(simple); stopping finalize",
-                    analysis_id, generation,
+                    analysis_id,
+                    generation,
                 )
                 return
             final_ai_analysis: dict | None
@@ -1533,7 +1587,8 @@ def _finalize_analysis_task(
                     logger.info(
                         "Analysis %s | generation %s ownership lost after Gemini "
                         "(simple); discarding result, stopping finalize",
-                        analysis_id, generation,
+                        analysis_id,
+                        generation,
                     )
                     return
                 simple_payload["ai_analysis"] = gemini_result.model_dump()
@@ -1556,12 +1611,16 @@ def _finalize_analysis_task(
                 logger.info(
                     "Analysis %s | generation %s ownership lost before final "
                     "persistence (simple); discarding result, stopping finalize",
-                    analysis_id, generation,
+                    analysis_id,
+                    generation,
                 )
                 return
             if not _finalize_commit_if_processing(
-                db, analysis, generation=generation,
-                result_snapshot=simple_payload, ai_analysis=final_ai_analysis,
+                db,
+                analysis,
+                generation=generation,
+                result_snapshot=simple_payload,
+                ai_analysis=final_ai_analysis,
                 processed_bytes=final_processed_bytes,
                 last_processed_line=final_last_processed_line,
                 stage="simple",
@@ -1609,43 +1668,40 @@ def _capture_small_text_artifact_fallback(saved_file_path: str) -> dict | None:
 
 
 def _artifact_mutation_authorized(
-    db: Session, analysis_id: int, artifact_id: int, generation: int
+    db: Session,
+    analysis_id: int,
+    artifact_id: int,
+    generation: int,
 ) -> bool:
-    """Fresh, CURRENT authorization check immediately before a durable
-    artifact-metadata mutation (size_bytes/detected_format/
-    fallback_context/status) that lives OUTSIDE the already-fenced
-    Evidence/checkpoint batch transaction (_persist_artifact_batch) -
-    never relies on an earlier ORM read, which can go stale by the time
-    the mutation actually commits (a filesystem stat, source-index
-    preparation, or OCR/parsing may have taken real time in between).
+    """Authorize one short artifact metadata mutation.
 
-    Required lock order: the authoritative Analysis row first, then the
-    AnalysisArtifact row - both locking reads (SELECT ... FOR UPDATE), so
-    both always see the latest COMMITTED data regardless of this
-    transaction's own snapshot. The caller commits or rolls back
-    immediately after (this function never commits itself), releasing
-    both locks right away - never held across the file I/O/OCR/parsing
-    this guards.
-
-    Requires the artifact to still be "processing" (this execution's own
-    earlier claim), not merely present: a stale-recovery demotion can flip
-    it back to "pending" out from under an old, still-running worker, and
-    that must be caught here exactly like a parent-generation loss is."""
+    Callers must invoke this BEFORE changing the Artifact ORM object.
+    The transaction locks Analysis first, then Artifact, and the caller
+    immediately mutates + commits while those locks are still held.
+    """
     current = (
-        db.query(Analysis.status, Analysis.processing_generation)
+        db.query(
+            Analysis.status,
+            Analysis.processing_generation,
+        )
         .filter(Analysis.id == analysis_id)
         .with_for_update()
         .first()
     )
+
     if current is None or current[0] != "processing" or current[1] != generation:
         return False
 
     artifact_status = (
         db.query(AnalysisArtifact.status)
-        .filter(AnalysisArtifact.id == artifact_id)
+        .filter(
+            AnalysisArtifact.id == artifact_id,
+            AnalysisArtifact.analysis_id == analysis_id,
+        )
         .with_for_update()
         .scalar()
     )
+
     return artifact_status == "processing"
 
 
@@ -1675,26 +1731,39 @@ def _process_artifact(
         and artifact.processed_bytes > 0
     )
 
+    new_size = artifact.size_bytes
+
     if initial_size != artifact.size_bytes:
         if not is_migrated_artifact:
             raise RuntimeError(
                 f"Artifact {artifact.id} changed after upload; refusing unsafe resume"
             )
-        artifact.size_bytes = initial_size
+        new_size = initial_size
 
     artifact_format = (
         ArtifactFormat.GENERIC if is_migrated_checkpoint else _artifact_format(artifact)
     )
-    artifact.detected_format = artifact_format.value
-    artifact.status = "processing"
-    if not _artifact_mutation_authorized(db, analysis.id, artifact.id, generation):
+
+    # Authorize FIRST, mutate SECOND.
+    if not _artifact_mutation_authorized(
+        db,
+        analysis.id,
+        artifact.id,
+        generation,
+    ):
         db.rollback()
         logger.info(
             "Analysis %s | artifact %s | generation %s ownership lost before "
             "setup commit; stopping",
-            analysis.id, artifact.id, generation,
+            analysis.id,
+            artifact.id,
+            generation,
         )
         return 0
+
+    artifact.size_bytes = new_size
+    artifact.detected_format = artifact_format.value
+    artifact.status = "processing"
     db.commit()
 
     parsed_count = 0
@@ -1708,15 +1777,23 @@ def _process_artifact(
         )
         fallback_context = capture_ocr_fallback_context(extracted_text, ocr_confidence)
         if fallback_context is not None:
-            artifact.fallback_context = fallback_context
-            if not _artifact_mutation_authorized(db, analysis.id, artifact.id, generation):
+            if not _artifact_mutation_authorized(
+                db,
+                analysis.id,
+                artifact.id,
+                generation,
+            ):
                 db.rollback()
                 logger.info(
                     "Analysis %s | artifact %s | generation %s ownership lost "
                     "before OCR fallback-context commit; stopping",
-                    analysis.id, artifact.id, generation,
+                    analysis.id,
+                    artifact.id,
+                    generation,
                 )
                 return parsed_count
+
+            artifact.fallback_context = fallback_context
             db.commit()
         records = stream_image_events_from_text(
             extracted_text=extracted_text,
@@ -1730,15 +1807,23 @@ def _process_artifact(
                 artifact.saved_file_path
             )
             if fallback_context is not None:
-                artifact.fallback_context = fallback_context
-                if not _artifact_mutation_authorized(db, analysis.id, artifact.id, generation):
+                if not _artifact_mutation_authorized(
+                    db,
+                    analysis.id,
+                    artifact.id,
+                    generation,
+                ):
                     db.rollback()
                     logger.info(
                         "Analysis %s | artifact %s | generation %s ownership lost "
                         "before fallback-context commit; stopping",
-                        analysis.id, artifact.id, generation,
+                        analysis.id,
+                        artifact.id,
+                        generation,
                     )
                     return parsed_count
+
+                artifact.fallback_context = fallback_context
                 db.commit()
         records = stream_artifact_events(
             file_path=artifact.saved_file_path,
@@ -1774,7 +1859,7 @@ def _process_artifact(
         # continue normally without repeated failures or source work.
         if getattr(analysis, "source_status", None) == "unavailable":
             source_index = None
-       
+
         _bump_processing_heartbeat(analysis.id, generation)
         if (
             artifact.processed_bytes - last_progress_query_offset >= progress_query_step
@@ -1787,7 +1872,6 @@ def _process_artifact(
             )
             last_progress_query_offset = artifact.processed_bytes
 
-   
     if artifact.processed_bytes > last_progress_query_offset:
         _publish_ingestion_progress(
             db=db,
@@ -1992,16 +2076,12 @@ def _persist_artifact_batch(
         # persistence itself, which proceeds unconditionally below either
         # way.
         current_source_status = (
-            db.query(Analysis.source_status)
-            .filter(Analysis.id == analysis.id)
-            .scalar()
+            db.query(Analysis.source_status).filter(Analysis.id == analysis.id).scalar()
         )
         if current_source_status == "unavailable":
             source_index = None
 
-    source_matching_succeeded = _correlate_source_events(
-        important_events, source_index
-    )
+    source_matching_succeeded = _correlate_source_events(important_events, source_index)
     _assign_batch_fingerprints(important_events)
 
     # Cancel/generation-vs-Evidence-commit race fence. A plain unlocked
@@ -2066,28 +2146,53 @@ def _persist_artifact_batch(
     db.commit()
 
     if not source_matching_succeeded:
-        # A separate, short transaction - deliberately not part of the
-        # fenced Evidence/checkpoint commit above (see that comment).  Two
-        # concurrent artifact tasks each reaching this after their own
-        # independent commit just each write the same value in their own
-        # turn; neither holds a lock the other is waiting on, so this
-        # cannot deadlock the way sharing one transaction would.
-        analysis.source_status = "unavailable"
-        analysis.source_failure_reason = (
+        # Keep this separate from the Evidence/checkpoint transaction, but
+        # generation-fence the source-state mutation itself.
+        #
+        # If cancellation, failure, or recovery has already superseded G,
+        # this UPDATE matches zero rows and the stale worker cannot disable
+        # source enrichment for the newer execution.
+        reason = (
             "Source matching became unavailable; diagnostic evidence was "
             "retained without source enrichment."
         )
-        _source_index_process_cache.pop((analysis.id, generation), None)
+
+        db.execute(
+            update(Analysis)
+            .where(
+                Analysis.id == analysis.id,
+                Analysis.status == "processing",
+                Analysis.processing_generation == generation,
+            )
+            .values(
+                source_status="unavailable",
+                source_failure_reason=reason,
+            )
+            .execution_options(synchronize_session=False)
+        )
         db.commit()
+
+        _source_index_process_cache.pop((analysis.id, generation), None)
+
+        # expire_on_commit=False is used by this worker session, so force
+        # the already-loaded Analysis object's source fields to refresh
+        # before the caller looks at them again.
+        db.expire(
+            analysis,
+            [
+                "source_status",
+                "source_failure_reason",
+            ],
+        )
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
-        "Analysis %s | artifact=%s | processed batch | events=%s | important=%s",
-        analysis.id,
-        artifact.id,
-        len(batch),
-        len(important_events),
-    )
+            "Analysis %s | artifact=%s | processed batch | events=%s | important=%s",
+            analysis.id,
+            artifact.id,
+            len(batch),
+            len(important_events),
+        )
     return len(batch)
 
 
@@ -2096,9 +2201,7 @@ def _correlate_source_events(events, source_index) -> bool:
         return True
 
     try:
-        matches_by_event = [
-            correlate_event(event, source_index) for event in events
-        ]
+        matches_by_event = [correlate_event(event, source_index) for event in events]
     except Exception:
         logger.warning(
             "Optional source matching failed; retaining diagnostic evidence "
@@ -2471,7 +2574,6 @@ def _record_controlled_artifact_failure(
     publish_artifact_outcome(analysis_id, payload)
 
 
-
 _UPLOAD_ROOT = Path("uploads").resolve()
 
 
@@ -2612,13 +2714,17 @@ def cancel_analysis_and_cleanup(db: Session, analysis_id: int) -> str | None:
     "completed"/"failed"/not-found; this only guards the rare race where
     status changed between that read and this call).
     """
-    previous_status = db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
+    previous_status = (
+        db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
+    )
     if previous_status not in ("pending", "processing"):
         return None
 
     claim = db.execute(
         update(Analysis)
-        .where(Analysis.id == analysis_id, Analysis.status.in_(("pending", "processing")))
+        .where(
+            Analysis.id == analysis_id, Analysis.status.in_(("pending", "processing"))
+        )
         .values(status="cancelled")
         .execution_options(synchronize_session=False)
     )
@@ -2741,7 +2847,10 @@ def _mark_analysis_failed(
     stale-analysis recovery/checkpoint resume.
     """
     try:
-        conditions = [Analysis.id == analysis_id, Analysis.status.in_(("pending", "processing"))]
+        conditions = [
+            Analysis.id == analysis_id,
+            Analysis.status.in_(("pending", "processing")),
+        ]
         if generation is not None:
             conditions.append(Analysis.processing_generation == generation)
         claim = db.execute(
@@ -2904,7 +3013,8 @@ def reconstruct_current_investigation_result(
     legacy_supplemental_artifacts = [
         artifact
         for artifact in artifacts
-        if artifact.fallback_context and artifact.id not in legacy_evidence_counts_by_artifact
+        if artifact.fallback_context
+        and artifact.id not in legacy_evidence_counts_by_artifact
     ]
 
     correlation_preparation = prepare_correlation(evidence_rows)
@@ -2979,7 +3089,14 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
     )
 
     ingestion_done = bool(rows) and all(
-        row.status in ("unsupported", "duplicate", "completed", "resource_limited", "processing_error")
+        row.status
+        in (
+            "unsupported",
+            "duplicate",
+            "completed",
+            "resource_limited",
+            "processing_error",
+        )
         for row in rows
     )
 
@@ -2987,16 +3104,20 @@ def compute_current_analysis_state(db: Session, analysis: Analysis) -> dict:
         progress = 99
     else:
         dispatchable = [
-            row for row in rows
-            if row.status not in ("unsupported", "duplicate", "resource_limited", "processing_error")
+            row
+            for row in rows
+            if row.status
+            not in ("unsupported", "duplicate", "resource_limited", "processing_error")
         ]
         total_bytes = sum(row.size_bytes for row in dispatchable)
         processed_bytes = sum(row.processed_bytes for row in dispatchable)
-        progress = _ingestion_percentage(processed_bytes, total_bytes) if total_bytes else 0
+        progress = (
+            _ingestion_percentage(processed_bytes, total_bytes) if total_bytes else 0
+        )
 
     return {
         "analysis_id": analysis.id,
-        "status": analysis.status, 
+        "status": analysis.status,
         "progress": progress,
         "artifacts": _known_terminal_artifact_outcomes(db, analysis.id, rows),
     }
@@ -3008,7 +3129,8 @@ def _known_terminal_artifact_outcomes(
     terminal = [
         artifact
         for artifact in artifacts
-        if artifact.status in (
+        if artifact.status
+        in (
             "unsupported",
             "duplicate",
             "completed",
@@ -3025,7 +3147,9 @@ def _known_terminal_artifact_outcomes(
         .group_by(Evidence.artifact_id)
         .all()
     )
-    filename_by_artifact_id = {artifact.id: artifact.original_filename for artifact in artifacts}
+    filename_by_artifact_id = {
+        artifact.id: artifact.original_filename for artifact in artifacts
+    }
 
     return [
         build_artifact_outcome_payload(
@@ -3086,7 +3210,9 @@ def _has_active_processing_artifact(analysis_id_column):
     its own claim wins, which can be well before any child task actually
     gets a worker slot under worker_concurrency=2."""
     return analysis_id_column.in_(
-        select(AnalysisArtifact.analysis_id).where(AnalysisArtifact.status == "processing")
+        select(AnalysisArtifact.analysis_id).where(
+            AnalysisArtifact.status == "processing"
+        )
     )
 
 
@@ -3123,7 +3249,9 @@ def _claim_stale_pending(db: Session, stale_filter, claimed_at: datetime) -> lis
     return claimed_ids
 
 
-def _claim_and_demote_stale_processing(db: Session, stale_filter, claimed_at: datetime) -> list[int]:
+def _claim_and_demote_stale_processing(
+    db: Session, stale_filter, claimed_at: datetime
+) -> list[int]:
     """Select-then-atomically-claim a stale PROCESSING analysis. Unlike the
     pending case, this must fence the old execution BEFORE any replacement
     workflow can start: the claim demotes status back to "pending" (so a
@@ -3325,9 +3453,8 @@ def recover_stale_analyses() -> int:
         )
         pending_stale = and_(
             Analysis.status == "pending",
-            func.coalesce(
-                Analysis.processing_heartbeat_at, Analysis.created_at
-            ) < queue_cutoff,
+            func.coalesce(Analysis.processing_heartbeat_at, Analysis.created_at)
+            < queue_cutoff,
         )
 
         processing_fast_claimed = _claim_and_demote_stale_processing(
@@ -3371,4 +3498,8 @@ def recover_stale_analyses() -> int:
         )
         process_analysis.delay(analysis_id)
 
-    return len(processing_fast_claimed) + len(processing_queue_claimed) + len(pending_claimed)
+    return (
+        len(processing_fast_claimed)
+        + len(processing_queue_claimed)
+        + len(pending_claimed)
+    )
