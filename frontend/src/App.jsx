@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AuthProvider } from './context/AuthContext'
 import { useAuth } from './context/useAuth'
 import { CriticalOperationProvider } from './context/CriticalOperationContext'
@@ -41,16 +41,30 @@ function Routes() {
   // a retry loop nor a busy-poll, just a single refreshSession() call
   // gated by this one transition, which itself can only ever fire once
   // per upload (locked can only go true->false once per upload cycle).
-  const [revalidatingAfterUpload, setRevalidatingAfterUpload] = useState(false)
-  const wasLockedRef = useRef(locked)
-  useEffect(() => {
-    const wasLocked = wasLockedRef.current
-    wasLockedRef.current = locked
-    if (wasLocked && !locked && unavailable) {
-      setRevalidatingAfterUpload(true)
-      refreshSession().finally(() => setRevalidatingAfterUpload(false))
+  // Keep a React-state snapshot of the previous lock value. This uses the
+  // same guarded render-time state-adjustment pattern already used above for
+  // frozenPathname: when locked changes, React immediately rerenders this
+  // component before committing, so the first unlocked render can never
+  // expose a stale 503 takeover.
+  const [previousLocked, setPreviousLocked] = useState(locked)
+  const [
+    postUploadRevalidationPending,
+    setPostUploadRevalidationPending,
+  ] = useState(false)
+  if (previousLocked !== locked) {
+    if (previousLocked && !locked && unavailable) {
+      setPostUploadRevalidationPending(true)
     }
-  }, [locked, unavailable, refreshSession])
+    setPreviousLocked(locked)
+  }
+  useEffect(() => {
+    if (!postUploadRevalidationPending) {
+      return
+    }
+    refreshSession().finally(() => {
+      setPostUploadRevalidationPending(false)
+    })
+  }, [postUploadRevalidationPending, refreshSession])
 
   // `locked` can only ever be true once AppShell (and the
   // NewInvestigationPage inside it) is already mounted and has called
@@ -63,13 +77,21 @@ function Routes() {
     return <AppShell pathname={effectivePathname} navigate={navigate} />
   }
 
+  // A locked -> unlocked transition with a deferred 503 first enters this
+  // state during render itself, before React commits anything. AppShell
+  // therefore remains mounted while refreshSession() determines whether the
+  // outage signal is still real.
+  if (postUploadRevalidationPending) {
+    return <AppShell pathname={pathname} navigate={navigate} />
+  }
+
   // A confirmed backend 503 (core DB/service unavailable) overrides every
   // other route - History, current Analysis state, and auth verification
   // are all unusable without the DB, so nothing else here can be trusted.
   // Deferred while the one bounded post-upload revalidation above is
   // still in flight, so a stale outage flag from during the upload cannot
   // paint this over a backend that has already recovered.
-  if (unavailable && !revalidatingAfterUpload) {
+  if (unavailable) {
     return <ServiceUnavailablePage onRetry={refreshSession} />
   }
 

@@ -141,6 +141,66 @@ describe('App - critical-operation-locked takeovers', () => {
     expect(mocks.refreshSession).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps AppShell mounted while post-upload 503 revalidation is still pending', async () => {
+    let resolveRefresh
+    mocks.refreshSession.mockReturnValue(
+      new Promise((resolve) => {
+        resolveRefresh = resolve
+      }),
+    )
+
+    const { rerender } = await renderApp()
+    beginUpload()
+
+    authState.unavailable = true
+    await act(async () => {
+      rerender(<App />)
+    })
+    expect(
+      screen.getByText('New investigation stub'),
+    ).toBeTruthy()
+
+    fireEvent.click(
+      screen.getByRole(
+        'button',
+        { name: 'Simulate upload end' },
+      ),
+    )
+    await act(async () => {
+      rerender(<App />)
+    })
+
+    // refreshSession has started but has NOT resolved. The stale 503 must
+    // not get even one committed render that unmounts AppShell first.
+    expect(
+      mocks.refreshSession,
+    ).toHaveBeenCalledTimes(1)
+    expect(
+      screen.getByText('New investigation stub'),
+    ).toBeTruthy()
+    expect(
+      screen.queryByText(
+        'Service unavailable stub',
+      ),
+    ).toBeNull()
+
+    authState.unavailable = false
+    await act(async () => {
+      resolveRefresh()
+      await Promise.resolve()
+      rerender(<App />)
+    })
+
+    expect(
+      screen.getByText('New investigation stub'),
+    ).toBeTruthy()
+    expect(
+      screen.queryByText(
+        'Service unavailable stub',
+      ),
+    ).toBeNull()
+  })
+
   it('a stale 503 from during the upload is cleared by ONE revalidation if the backend already recovered', async () => {
     const { rerender } = await renderApp()
     beginUpload()

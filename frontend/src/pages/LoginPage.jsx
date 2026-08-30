@@ -5,7 +5,7 @@ import { ApiError } from '../api/client'
 
 export default function LoginPage() {
   const { login } = useAuth()
-  const { search, navigate } = useRouter()
+  const { pathname, search, navigate } = useRouter()
   const [form, setForm] = useState({ email: '', password: '' })
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -27,7 +27,10 @@ export default function LoginPage() {
     setSubmitting(true)
     try {
       await login(form)
-      navigate('/new', { replace: true })
+      const destination = /^\/investigation\/\d+\/?$/.test(pathname)
+        ? pathname
+        : '/new'
+      navigate(destination, { replace: true })
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
