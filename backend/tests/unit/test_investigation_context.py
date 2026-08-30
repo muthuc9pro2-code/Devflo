@@ -502,3 +502,49 @@ def test_select_primary_component_ties_are_broken_by_earliest_line_not_list_orde
 
     assert forward is component_early
     assert reversed_order is component_early
+
+def test_select_primary_component_exact_line_ties_use_complete_stable_node_key():
+    """A tie on artifact count, node count, and earliest line must still
+    be independent of component-list order."""
+    from types import SimpleNamespace
+
+    def _node(
+        artifact_id,
+        first_line_number,
+        fingerprint,
+    ):
+        return SimpleNamespace(
+            artifact_id=artifact_id,
+            first_line_number=first_line_number,
+            fingerprint=fingerprint,
+            correlation_key=f"ck-{fingerprint}",
+            source_file=f"{fingerprint}.log",
+        )
+
+    component_a = SimpleNamespace(
+        nodes=[
+            _node(1, 100, "a"),
+            _node(1, 200, "z"),
+        ],
+    )
+
+    component_b = SimpleNamespace(
+        nodes=[
+            _node(2, 100, "b"),
+            _node(2, 250, "y"),
+        ],
+    )
+
+    assert (
+        _select_primary_component(
+            [component_a, component_b]
+        )
+        is component_a
+    )
+
+    assert (
+        _select_primary_component(
+            [component_b, component_a]
+        )
+        is component_a
+    )

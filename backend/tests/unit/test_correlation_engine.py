@@ -566,6 +566,196 @@ def test_build_correlation_components_node_order_is_deterministic_regardless_of_
         node.first_line_number for node in nodes
     )
 
+def test_rank_root_causes_exact_line_tie_uses_complete_stable_node_key(
+    monkeypatch,
+):
+    """Equal score AND equal first_line_number must not fall back to
+    component.nodes order."""
+    monkeypatch.setattr(
+        correlation_engine_module,
+        "root_cause_score",
+        lambda *a, **k: 0.5,
+    )
+
+    node_a = CorrelationNode(
+        id="evidence-a",
+        service="svc",
+        fingerprint="a",
+        first_seen=None,
+        last_seen=None,
+        first_line_number=50,
+        correlation_key="ck-a",
+        source_file="a.log",
+    )
+
+    node_b = CorrelationNode(
+        id="evidence-b",
+        service="svc",
+        fingerprint="b",
+        first_seen=None,
+        last_seen=None,
+        first_line_number=50,
+        correlation_key="ck-b",
+        source_file="b.log",
+    )
+
+    forward = CorrelationComponent(
+        nodes=[node_a, node_b],
+        edges=[],
+        associations=[],
+    )
+
+    reversed_order = CorrelationComponent(
+        nodes=[node_b, node_a],
+        edges=[],
+        associations=[],
+    )
+
+    assert (
+        rank_root_causes(
+            forward,
+            {},
+        )[0].node_id
+        == "evidence-a"
+    )
+
+    assert (
+        rank_root_causes(
+            reversed_order,
+            {},
+        )[0].node_id
+        == "evidence-a"
+    )
+
+
+def test_enforce_dag_exact_score_and_line_ties_are_input_order_invariant():
+    """Equal-score/equal-line cycle resolution must use logical endpoint
+    keys, not incoming edge-list order."""
+    from app.services.correlation_engine import (
+        CorrelationEdge,
+        enforce_dag,
+    )
+
+    evidence = {
+        1: _evidence(
+            1,
+            fingerprint="a",
+            first_line_number=50,
+        ),
+        2: _evidence(
+            2,
+            fingerprint="b",
+            first_line_number=50,
+        ),
+        3: _evidence(
+            3,
+            fingerprint="c",
+            first_line_number=50,
+        ),
+    }
+
+    edges = [
+        CorrelationEdge(
+            source_id="evidence-1",
+            target_id="evidence-2",
+            score=0.9,
+            delta_ms=0.0,
+            relationship_type="explicit_parent_child",
+        ),
+        CorrelationEdge(
+            source_id="evidence-2",
+            target_id="evidence-3",
+            score=0.9,
+            delta_ms=0.0,
+            relationship_type="explicit_parent_child",
+        ),
+        CorrelationEdge(
+            source_id="evidence-3",
+            target_id="evidence-1",
+            score=0.9,
+            delta_ms=0.0,
+            relationship_type="explicit_parent_child",
+        ),
+    ]
+
+    def signature(
+        candidate_edges,
+    ):
+        return [
+            (
+                edge.source_id,
+                edge.target_id,
+            )
+            for edge in enforce_dag(
+                candidate_edges,
+                evidence,
+            )
+        ]
+
+    baseline = signature(edges)
+
+    assert (
+        signature(
+            list(reversed(edges))
+        )
+        == baseline
+    )
+
+
+def test_component_list_order_exact_line_ties_is_input_order_invariant():
+    """Disconnected tied-line components must be emitted in complete
+    stable-node-key order, not incoming node order."""
+    node_b = CorrelationNode(
+        id="evidence-b",
+        service="svc",
+        fingerprint="b",
+        first_seen=None,
+        last_seen=None,
+        first_line_number=50,
+        correlation_key="ck-b",
+        source_file="b.log",
+    )
+
+    node_a = CorrelationNode(
+        id="evidence-a",
+        service="svc",
+        fingerprint="a",
+        first_seen=None,
+        last_seen=None,
+        first_line_number=50,
+        correlation_key="ck-a",
+        source_file="a.log",
+    )
+
+    forward = build_correlation_components(
+        [node_b, node_a],
+        edges=[],
+        associations=[],
+    )
+
+    reversed_order = (
+        build_correlation_components(
+            [node_a, node_b],
+            edges=[],
+            associations=[],
+        )
+    )
+
+    assert [
+        component.nodes[0].fingerprint
+        for component in forward
+    ] == [
+        "a",
+        "b",
+    ]
+
+    assert [
+        component.nodes[0].fingerprint
+        for component in reversed_order
+    ] == [
+        "a",
+        "b",
+    ]
 
 def test_equal_timestamp_same_request_id_is_associated_not_causal():
     """Same requirement as the trace_id case above, for request_id -

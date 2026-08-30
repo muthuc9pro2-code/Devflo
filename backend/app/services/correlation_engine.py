@@ -36,12 +36,17 @@ def _stable_evidence_key(evidence: Evidence) -> tuple:
 
 
 def _stable_node_key(node: "CorrelationNode") -> tuple:
-    """The same stable/logical tie-break convention as _stable_evidence_key,
-    for a CorrelationNode (which does not carry correlation_key)."""
+    """The same complete logical tie-break convention as
+    _stable_evidence_key, including correlation_key for exact line ties."""
+    first_line_number = getattr(node, "first_line_number", None)
+
     return (
-        node.first_line_number if node.first_line_number is not None else float("inf"),
-        node.fingerprint or "",
-        node.source_file or "",
+        first_line_number
+        if first_line_number is not None
+        else float("inf"),
+        getattr(node, "fingerprint", None) or "",
+        getattr(node, "correlation_key", None) or "",
+        getattr(node, "source_file", None) or "",
     )
 
 class CorrelationSignal(str, Enum):
@@ -86,6 +91,7 @@ class CorrelationNode:
     # on. Exists so payload/context consumers can show and explain which
     # uploaded artifact a piece of evidence came from.
     artifact_id: int | None = None
+    correlation_key: str | None = None
     trace_id: str | None = None
     request_id: str | None = None
     span_id: str | None = None
@@ -1036,6 +1042,7 @@ def build_correlation_nodes(
                 occurrence_count=evidence.occurrence_count,
                 evidence_ids=[evidence.id],
                 artifact_id=evidence.artifact_id,
+                correlation_key=evidence.correlation_key,
                 trace_id=evidence.trace_id,
                 request_id=evidence.request_id,
                 span_id=evidence.span_id,
@@ -1093,7 +1100,7 @@ def build_correlation_components(
     visited: set[str] = set()
     components: list[CorrelationComponent] = []
 
-    for node in nodes:
+    for node in sorted(nodes, key=_stable_node_key):
         if node.id in visited:
             continue
 
@@ -1153,6 +1160,12 @@ def build_correlation_components(
             )
         )
 
+    components.sort(
+        key=lambda component: _stable_node_key(component.nodes[0])
+        if component.nodes
+        else (float("inf"), "", "", ""),
+    )
+
     return components
 
 def would_create_cycle(
@@ -1184,32 +1197,27 @@ def _is_time_ordered(edge: CorrelationEdge) -> bool:
     return edge.delta_ms is not None and edge.delta_ms > 0.0
 
 
-def _edge_endpoint_line_number(
-    node_id: str, evidence_by_id: dict[int, Evidence] | None
-) -> float:
-    """Resolves a CorrelationEdge endpoint (an "evidence-<id>" string) back
-    to its underlying Evidence.first_line_number - a value-stable
-    tie-break key, unlike the id embedded in node_id itself, which
-    reflects commit-race order across concurrently-processing artifact
-    workers rather than anything about the underlying data. Falls back to
-    +inf (sorts last) when no lookup was supplied or the id cannot be
-    resolved, so callers that omit evidence_by_id keep their exact prior
-    behavior."""
-    if not evidence_by_id:
-        return float("inf")
+def _edge_endpoint_stable_key(
+    node_id: str,
+    evidence_by_id: dict[int, Evidence],
+) -> tuple:
+    """Resolve an edge endpoint to the complete logical Evidence key."""
     try:
         evidence_id = int(node_id.rsplit("-", 1)[-1])
     except (ValueError, IndexError):
-        return float("inf")
+        return (float("inf"), "", "", "")
+
     evidence = evidence_by_id.get(evidence_id)
-    if evidence is None or evidence.first_line_number is None:
-        return float("inf")
-    return float(evidence.first_line_number)
+
+    if evidence is None:
+        return (float("inf"), "", "", "")
+
+    return _stable_evidence_key(evidence)
 
 
 def enforce_dag(
     edges: list[CorrelationEdge],
-    evidence_by_id: dict[int, Evidence] | None = None,
+    evidence_by_id: dict[int, Evidence],
 ) -> list[CorrelationEdge]:
     """A directed cycle needs at least one edge that does NOT strictly
     advance in time: a chain of strictly-increasing timestamps can never
@@ -1236,33 +1244,61 @@ def enforce_dag(
     that turned out to conflict with it - time-ordered edges are now
     always preferred there, which is at least as defensible as pure score.
     """
-    # Tie-broken by the edge's endpoints' first_line_number (never left
-    # implicit, which would silently fall back to `edges`' own incoming
-    # order) so two edges with an identical score sort the same way
-    # regardless of run-to-run scheduling/id-assignment differences.
-    def _edge_tie_break_key(edge: CorrelationEdge) -> tuple[float, float, float]:
+    # Highest relationship score wins first. Exact score ties are resolved
+    # by the COMPLETE stable logical keys of both endpoints, then immutable
+    # edge content - never by incoming edge-list order or Evidence.id.
+    def _edge_priority_key(edge: CorrelationEdge) -> tuple:
         return (
-            edge.score,
-            -_edge_endpoint_line_number(edge.source_id, evidence_by_id),
-            -_edge_endpoint_line_number(edge.target_id, evidence_by_id),
+            -edge.score,
+            _edge_endpoint_stable_key(
+                edge.source_id,
+                evidence_by_id,
+            ),
+            _edge_endpoint_stable_key(
+                edge.target_id,
+                evidence_by_id,
+            ),
+            edge.relationship_type or "",
+            tuple(
+                sorted(
+                    signal.value
+                    for signal in edge.signals
+                )
+            ),
+            (
+                edge.delta_ms
+                if edge.delta_ms is not None
+                else float("inf")
+            ),
         )
 
     time_ordered = sorted(
-        (edge for edge in edges if _is_time_ordered(edge)),
-        key=_edge_tie_break_key,
-        reverse=True,
+        (
+            edge
+            for edge in edges
+            if _is_time_ordered(edge)
+        ),
+        key=_edge_priority_key,
     )
+
     remaining = sorted(
-        (edge for edge in edges if not _is_time_ordered(edge)),
-        key=_edge_tie_break_key,
-        reverse=True,
+        (
+            edge
+            for edge in edges
+            if not _is_time_ordered(edge)
+        ),
+        key=_edge_priority_key,
     )
 
     adjacency: dict[str, set[str]] = {}
     dag_edges: list[CorrelationEdge] = []
 
     for edge in time_ordered:
-        adjacency.setdefault(edge.source_id, set()).add(edge.target_id)
+        adjacency.setdefault(
+            edge.source_id,
+            set(),
+        ).add(edge.target_id)
+
         dag_edges.append(edge)
 
     for edge in remaining:
@@ -1555,22 +1591,20 @@ def rank_root_causes(
         for node in component.nodes
     ]
 
-    # Explicit tie-break by first_line_number (never left implicit, which
-    # would silently inherit component.nodes' own order - itself already
-    # made deterministic in build_correlation_components, but only an
-    # accident of this function relying on stable sort rather than a
-    # documented guarantee): root_cause_score can and does tie exactly
-    # (e.g. two nodes with identical graph-stats/role/severity inputs), so
-    # without this the "root cause" shown to the user could depend on
-    # component-construction order rather than an explicit, reviewable
-    # rule.
-    node_by_id = {node.id: node for node in component.nodes}
+    # Highest score wins; exact score ties use the complete stable logical
+    # node key. Stable sort/input order is never itself a semantic rule.
+    node_by_id = {
+        node.id: node
+        for node in component.nodes
+    }
+
     candidates.sort(
         key=lambda candidate: (
-            candidate.score,
-            -(node_by_id[candidate.node_id].first_line_number or 0),
-        ),
-        reverse=True,
+            -candidate.score,
+            _stable_node_key(
+                node_by_id[candidate.node_id]
+            ),
+        )
     )
 
     return candidates

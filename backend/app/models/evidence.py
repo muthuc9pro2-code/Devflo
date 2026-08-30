@@ -41,10 +41,11 @@ class Evidence(Base):
             "id",
         ),
         Index(
-            "ix_evidence_analysis_first_line_number_id",
+            "ix_evidence_analysis_first_line_logical",
             "analysis_id",
             "first_line_number",
-            "id",
+            "fingerprint",
+            "correlation_key",
         ),
         Index(
             "ix_evidence_artifact_analysis",

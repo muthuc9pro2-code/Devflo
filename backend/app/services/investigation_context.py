@@ -15,7 +15,11 @@ from app.core.processing_config import (
     SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
 )
 from app.models.evidence import Evidence
-from app.services.correlation_engine import CorrelationRun, _stable_evidence_key
+from app.services.correlation_engine import (
+    CorrelationRun,
+    _stable_evidence_key,
+    _stable_node_key,
+)
 from app.services.timeline_processor import build_component_timeline
 
 # Zero retained evidence only proves Devflo did not extract meaningful
@@ -58,6 +62,7 @@ _SIMPLE_LLM_SEVERITY_RANK = {
 }
 _DATETIME_MIN_UTC = datetime.min.replace(tzinfo=timezone.utc)
 
+
 def _normalized_evidence_time(value: datetime | None) -> datetime:
     if value is None:
         return _DATETIME_MIN_UTC
@@ -91,9 +96,7 @@ def _simple_llm_priority_key(evidence: Evidence) -> tuple:
     The stable evidence key, not evidence.id, closes the tie: see
     _evidence_chronological_key."""
     has_source_match = bool(evidence.source_matches)
-    severity_rank = _SIMPLE_LLM_SEVERITY_RANK.get(
-        (evidence.severity or "").upper(), 0
-    )
+    severity_rank = _SIMPLE_LLM_SEVERITY_RANK.get((evidence.severity or "").upper(), 0)
     first_seen = evidence.first_seen
     if first_seen is not None and first_seen.tzinfo is None:
         first_seen = first_seen.replace(tzinfo=timezone.utc)
@@ -150,10 +153,7 @@ def select_bounded_evidence(
     for rows in by_artifact.values():
         rows.sort(key=_simple_llm_priority_key)
 
-    queues = {
-        artifact_id: iter(rows)
-        for artifact_id, rows in by_artifact.items()
-    }
+    queues = {artifact_id: iter(rows) for artifact_id, rows in by_artifact.items()}
     active_artifact_ids = sorted(by_artifact.keys())
 
     selected: list[Evidence] = []
@@ -185,7 +185,13 @@ def select_bounded_evidence(
     return selected
 
 
-_SEVERITY_PRIORITY_RANK = {"CRITICAL": 4, "FATAL": 4, "ERROR": 3, "WARNING": 2, "WARN": 2}
+_SEVERITY_PRIORITY_RANK = {
+    "CRITICAL": 4,
+    "FATAL": 4,
+    "ERROR": 3,
+    "WARNING": 2,
+    "WARN": 2,
+}
 _BOUNDED_EVIDENCE_SCAN_BATCH_SIZE = 2000
 
 
@@ -205,8 +211,12 @@ def _bounded_evidence_priority(
     if evidence.span_id is not None or evidence.parent_span_id is not None:
         score += 5.0  # actual parent-span participant (potential)
 
-    is_trace_bridge = evidence.trace_id is not None and evidence.trace_id in bridging_trace_ids
-    is_request_bridge = evidence.request_id is not None and evidence.request_id in bridging_request_ids
+    is_trace_bridge = (
+        evidence.trace_id is not None and evidence.trace_id in bridging_trace_ids
+    )
+    is_request_bridge = (
+        evidence.request_id is not None and evidence.request_id in bridging_request_ids
+    )
     has_real_resolved_identity = (
         evidence.resolved_identity is not None
         and evidence.identity_match_type != "unresolved"
@@ -215,13 +225,19 @@ def _bounded_evidence_priority(
 
     if is_trace_bridge or is_request_bridge:
         score += 4.0  # cross-artifact identity bridge evidence
-    elif evidence.trace_id is not None or evidence.request_id is not None or has_real_resolved_identity:
+    elif (
+        evidence.trace_id is not None
+        or evidence.request_id is not None
+        or has_real_resolved_identity
+    ):
         score += 3.0  # trace/request/identity-bearing evidence
 
     score += _SEVERITY_PRIORITY_RANK.get((evidence.severity or "").upper(), 0)
     if evidence.source_matches:
         score += 2.0  # source-code matched evidence
-    fingerprint_count = fingerprint_counts.get(evidence.fingerprint, 1) if evidence.fingerprint else 1
+    fingerprint_count = (
+        fingerprint_counts.get(evidence.fingerprint, 1) if evidence.fingerprint else 1
+    )
     score += 1.0 / fingerprint_count  # rare/unique fingerprints score higher
     return score
 
@@ -304,14 +320,30 @@ def select_bounded_evidence_from_db(
     boundary_reserve = min(50, max(max_records // 20, 1))
     boundary_rows = (
         db.query(Evidence)
-        .filter(Evidence.analysis_id == analysis_id, Evidence.first_seen.isnot(None))
-        .order_by(Evidence.first_seen.asc(), Evidence.first_line_number.asc())
+        .filter(
+            Evidence.analysis_id == analysis_id,
+            Evidence.first_seen.isnot(None),
+        )
+        .order_by(
+            Evidence.first_seen.asc(),
+            Evidence.first_line_number.asc(),
+            Evidence.fingerprint.asc(),
+            Evidence.correlation_key.asc(),
+        )
         .limit(boundary_reserve)
         .all()
     ) + (
         db.query(Evidence)
-        .filter(Evidence.analysis_id == analysis_id, Evidence.first_seen.isnot(None))
-        .order_by(Evidence.first_seen.desc(), Evidence.first_line_number.desc())
+        .filter(
+            Evidence.analysis_id == analysis_id,
+            Evidence.first_seen.isnot(None),
+        )
+        .order_by(
+            Evidence.first_seen.desc(),
+            Evidence.first_line_number.desc(),
+            Evidence.fingerprint.desc(),
+            Evidence.correlation_key.desc(),
+        )
         .limit(boundary_reserve)
         .all()
     )
@@ -321,46 +353,57 @@ def select_bounded_evidence_from_db(
     heap: list[tuple[float, int, Evidence]] = []
     selected_count_by_artifact: dict[int, int] = {}
     tiebreak_counter = 0
-    # Compound keyset cursor (first_line_number, id) - not a bare
-    # `id > last_id` cursor. first_line_number is derived once at upload
-    # time from artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that
-    # artifact's own line number, so it identifies the same logical event
-    # the same way regardless of which order concurrently-processing
-    # artifact workers happened to commit Evidence rows in - unlike a bare
-    # id-ordered scan, this makes the SCAN ORDER itself (and therefore the
-    # diversity penalty's incremental selected_count_by_artifact
-    # accumulation, and tiebreak_counter's own value, both of which are
-    # order-dependent by design) invariant to Evidence.id/commit order for
-    # two runs over the same logical data. `id` remains in the tuple only
-    # to keep the cursor strictly advancing (and rows unambiguously
-    # ordered) on the rare exact first_line_number tie - never itself a
-    # semantic priority signal.
+    # Stable logical keyset cursor. Evidence.id is intentionally absent:
+    # artifact workers persist concurrently, so the auto-increment id reflects
+    # commit race order. first_line_number is the upload-position-derived global
+    # line key; when it ties, fingerprint + correlation_key close the tie. The
+    # Evidence uniqueness invariant makes this cursor strictly advancing without
+    # OFFSET or unbounded materialization.
     last_first_line_number = -1
-    last_id = 0
+    last_fingerprint = ""
+    last_correlation_key = ""
 
     while True:
         batch = (
             db.query(Evidence)
             .filter(
                 Evidence.analysis_id == analysis_id,
-                tuple_(Evidence.first_line_number, Evidence.id)
-                > tuple_(last_first_line_number, last_id),
+                tuple_(
+                    Evidence.first_line_number,
+                    Evidence.fingerprint,
+                    Evidence.correlation_key,
+                )
+                > tuple_(
+                    last_first_line_number,
+                    last_fingerprint,
+                    last_correlation_key,
+                ),
             )
-            .order_by(Evidence.first_line_number, Evidence.id)
+            .order_by(
+                Evidence.first_line_number,
+                Evidence.fingerprint,
+                Evidence.correlation_key,
+            )
             .limit(batch_size)
             .all()
         )
+
         if not batch:
             break
-        last_first_line_number = batch[-1].first_line_number
-        last_id = batch[-1].id
+
+        last_row = batch[-1]
+        last_first_line_number = last_row.first_line_number
+        last_fingerprint = last_row.fingerprint
+        last_correlation_key = last_row.correlation_key
 
         for row in batch:
             if row.id in reserved_by_id:
                 continue
             if remaining_budget <= 0:
                 continue
-            diversity_penalty = 0.02 * selected_count_by_artifact.get(row.artifact_id, 0)
+            diversity_penalty = 0.02 * selected_count_by_artifact.get(
+                row.artifact_id, 0
+            )
             score = (
                 _bounded_evidence_priority(
                     row,
@@ -465,57 +508,56 @@ def _artifacts_outcome_list(
     ]
 
 
-def _select_primary_component(components: list[Any]) -> Any | None:
+def _select_primary_component(
+    components: list[Any],
+) -> Any | None:
     """The single PRIMARY correlated incident - the component with the
     most distinct artifacts represented (a genuine cross-artifact
     incident), falling back to whichever component has the most nodes when
     no component spans more than one artifact (e.g. correlation triggered
-    only by a same-artifact burst) - deterministic, ties broken by
-    component order. A component of a single node establishes nothing, so
-    if even the largest component is a singleton, there is no primary
-    incident at all (None) - every artifact with real evidence is equally
-    "not part of anything larger". Shared by _artifact_relationship_statuses
-    (frontend not_linked/partially_linked/linked labeling) and
-    build_llm_context (only the primary
-    component's substantive content ever reaches Gemini's primary
-    reasoning) so the two can never define "primary" differently.
+    only by a same-artifact burst) - deterministic, exact structural ties
+    broken by the component's complete stable logical origin key. A
+    component of a single node establishes nothing, so if even the largest
+    component is a singleton, there is no primary incident at all (None) -
+    every artifact with real evidence is equally "not part of anything
+    larger". Shared by _artifact_relationship_statuses and
+    build_llm_context so the two can never define "primary" differently.
     """
     if not components:
         return None
 
-    def _component_key(component: Any) -> tuple[int, int, int]:
+    def _component_key(
+        component: Any,
+    ) -> tuple:
         artifact_ids = {
             node.artifact_id for node in component.nodes if node.artifact_id is not None
         }
-        # Tie-broken by the component's own earliest first_line_number
-        # (never left as bare component-list order, which max() would
-        # otherwise use as its implicit first-occurrence-wins rule) -
-        # first_line_number is derived once at upload time from
-        # artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that
-        # artifact's own line number, so the SAME logical incident is
-        # always identified as "primary" regardless of the order
-        # components happened to be built/returned in this run.
-        # Negated so smaller (earlier) values win under max()'s
-        # largest-key-wins semantics.
-        earliest_line = min(
-            (
-                node.first_line_number
-                for node in component.nodes
-                if node.first_line_number is not None
+
+        stable_origin = min(
+            (_stable_node_key(node) for node in component.nodes),
+            default=(
+                float("inf"),
+                "",
+                "",
+                "",
             ),
-            default=None,
-        )
-        return (
-            len(artifact_ids),
-            len(component.nodes),
-            -earliest_line if earliest_line is not None else float("-inf"),
         )
 
-    primary = max(components, key=_component_key)
+        return (
+            -len(artifact_ids),
+            -len(component.nodes),
+            stable_origin,
+        )
+
+    primary = min(
+        components,
+        key=_component_key,
+    )
+
     if len(primary.nodes) <= 1:
         return None
-    return primary
 
+    return primary
 
 def _artifact_relationship_statuses(
     components: list[Any],
@@ -584,10 +626,7 @@ def build_correlation_payload(
     evidence_rows alone would understate them. When omitted, falls back to
     counting evidence_rows itself (existing direct callers/tests unchanged).
     """
-    evidence_by_id = {
-        evidence.id: evidence
-        for evidence in evidence_rows
-    }
+    evidence_by_id = {evidence.id: evidence for evidence in evidence_rows}
     real_evidence_counts_by_artifact = (
         evidence_counts_by_artifact
         if evidence_counts_by_artifact is not None
@@ -605,7 +644,9 @@ def build_correlation_payload(
                 primary_entry = (index, component)
                 break
 
-    for component_index, component in ([primary_entry] if primary_entry is not None else []):
+    for component_index, component in (
+        [primary_entry] if primary_entry is not None else []
+    ):
         root_candidates = correlation_run.root_causes.get(
             component_index,
             [],
@@ -665,10 +706,7 @@ def build_correlation_payload(
                     "source_matches": node.source_matches,
                     "representative_line": node.representative_line,
                     "diagnostic_attributes": node.diagnostic_attributes,
-                    "evidence": [
-                        _evidence_payload(item)
-                        for item in evidence
-                    ],
+                    "evidence": [_evidence_payload(item) for item in evidence],
                 }
             )
 
@@ -709,10 +747,7 @@ def build_correlation_payload(
                             else None
                         ),
                         "delta_ms": edge.delta_ms,
-                        "signals": [
-                            signal.value
-                            for signal in edge.signals
-                        ],
+                        "signals": [signal.value for signal in edge.signals],
                     }
                     for edge in component.edges
                 ],
@@ -722,17 +757,16 @@ def build_correlation_payload(
                         "node_b": association.target_id,
                         "correlation_strength": round(association.score, 4),
                         "delta_ms": association.delta_ms,
-                        "signals": [
-                            signal.value
-                            for signal in association.signals
-                        ],
+                        "signals": [signal.value for signal in association.signals],
                     }
                     for association in component.associations
                 ],
             }
         )
 
-    real_total = total_evidence_count if total_evidence_count is not None else len(evidence_rows)
+    real_total = (
+        total_evidence_count if total_evidence_count is not None else len(evidence_rows)
+    )
 
     payload: dict[str, Any] = {
         "analysis_id": correlation_run.result.analysis_id,
@@ -820,8 +854,7 @@ def build_simple_payload(
         "evidence_count": real_total_evidence_count,
         "evidence_artifact_count": len(real_evidence_counts_by_artifact),
         "evidence": [
-            _evidence_payload(evidence)
-            for evidence in included_evidence_rows
+            _evidence_payload(evidence) for evidence in included_evidence_rows
         ],
     }
 
@@ -869,7 +902,9 @@ def build_zero_evidence_payload(
     return payload
 
 
-def _bounded_fallback_context_list(fallback_artifacts: list[Any]) -> list[dict[str, Any]]:
+def _bounded_fallback_context_list(
+    fallback_artifacts: list[Any],
+) -> list[dict[str, Any]]:
     """Deterministic (stable upload-provenance order: artifact.position,
     the order artifacts were uploaded in - never artifact.id, an
     auto-increment persistence identifier, as semantic ordering), bounded
@@ -975,12 +1010,10 @@ def build_simple_llm_context(
     artifacts: list[Any] | None = None,
     supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
-    
+
     real_total_evidence_count = (
-    total_evidence_count
-    if total_evidence_count is not None
-    else len(evidence_rows)
-)
+        total_evidence_count if total_evidence_count is not None else len(evidence_rows)
+    )
 
     real_evidence_counts_by_artifact = (
         evidence_counts_by_artifact
@@ -990,10 +1023,7 @@ def build_simple_llm_context(
 
     selected_evidence = select_bounded_evidence(evidence_rows)
 
-    truncated = (
-        len(selected_evidence)
-        < real_total_evidence_count
-    )
+    truncated = len(selected_evidence) < real_total_evidence_count
 
     instruction = (
         "Explain the available diagnostic evidence and suggest "
@@ -1013,10 +1043,7 @@ def build_simple_llm_context(
         "instruction": instruction,
         "evidence_count_total": real_total_evidence_count,
         "evidence_count_included": len(selected_evidence),
-        "evidence": [
-            _evidence_payload(evidence)
-            for evidence in selected_evidence
-        ],
+        "evidence": [_evidence_payload(evidence) for evidence in selected_evidence],
     }
 
     if artifacts is not None:
@@ -1040,6 +1067,7 @@ def build_simple_llm_context(
         )
 
     return context
+
 
 def _context_size_bytes(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":"), default=str).encode("utf-8"))
@@ -1078,9 +1106,7 @@ def build_llm_context(
     supplemental_artifacts: list[Any] | None = None,
 ) -> dict[str, Any]:
     real_total_evidence_count = (
-        total_evidence_count
-        if total_evidence_count is not None
-        else len(evidence_rows)
+        total_evidence_count if total_evidence_count is not None else len(evidence_rows)
     )
 
     real_evidence_counts_by_artifact = (
@@ -1091,23 +1117,15 @@ def build_llm_context(
 
     working_evidence_count = len(evidence_rows)
 
-    working_set_truncated = (
-        real_total_evidence_count
-        > working_evidence_count
-    )
-    evidence_by_id = {
-        evidence.id: evidence
-        for evidence in evidence_rows
-    }
+    working_set_truncated = real_total_evidence_count > working_evidence_count
+    evidence_by_id = {evidence.id: evidence for evidence in evidence_rows}
 
     components: list[dict[str, Any]] = []
     excluded_isolated_component_count = 0
 
     primary_component = _select_primary_component(correlation_run.result.components)
 
-    for component_index, component in enumerate(
-        correlation_run.result.components
-    ):
+    for component_index, component in enumerate(correlation_run.result.components):
         if component is not primary_component:
             excluded_isolated_component_count += 1
             continue
@@ -1120,10 +1138,7 @@ def build_llm_context(
             candidate for candidate in top_ranked_candidates if candidate.role == "root"
         ]
 
-        selected_node_ids = {
-            candidate.node_id
-            for candidate in top_ranked_candidates
-        }
+        selected_node_ids = {candidate.node_id for candidate in top_ranked_candidates}
 
         selected_evidence_ids: set[int] = set()
 
@@ -1175,10 +1190,7 @@ def build_llm_context(
                             else None
                         ),
                         "delta_ms": edge.delta_ms,
-                        "signals": [
-                            signal.value
-                            for signal in edge.signals
-                        ],
+                        "signals": [signal.value for signal in edge.signals],
                     }
                     for edge in component.edges
                 ],
@@ -1188,10 +1200,7 @@ def build_llm_context(
                         "node_b": association.target_id,
                         "correlation_strength": round(association.score, 4),
                         "delta_ms": association.delta_ms,
-                        "signals": [
-                            signal.value
-                            for signal in association.signals
-                        ],
+                        "signals": [signal.value for signal in association.signals],
                     }
                     for association in component.associations
                 ],
@@ -1199,7 +1208,9 @@ def build_llm_context(
                     _evidence_payload(evidence_by_id[evidence_id])
                     for evidence_id in sorted(
                         (eid for eid in selected_evidence_ids if eid in evidence_by_id),
-                        key=lambda eid: evidence_by_id[eid].first_line_number,
+                        key=lambda eid: _stable_evidence_key(
+                            evidence_by_id[eid]
+                        ),
                     )
                 ],
             }
@@ -1211,7 +1222,10 @@ def build_llm_context(
     included_bytes = 0
     for component_dict in components:
         size = _context_size_bytes(component_dict)
-        if included_components and included_bytes + size > CORRELATED_GEMINI_CONTEXT_MAX_BYTES:
+        if (
+            included_components
+            and included_bytes + size > CORRELATED_GEMINI_CONTEXT_MAX_BYTES
+        ):
             break
         included_components.append(component_dict)
         included_bytes += size
@@ -1248,12 +1262,8 @@ def build_llm_context(
     }
 
     if total_evidence_count is not None:
-        context["evidence_count_total"] = (
-            real_total_evidence_count
-        )
-        context["evidence_count_in_working_set"] = (
-            working_evidence_count
-        )
+        context["evidence_count_total"] = real_total_evidence_count
+        context["evidence_count_in_working_set"] = working_evidence_count
 
     if working_set_truncated:
         context["evidence_working_set_truncated"] = True
@@ -1265,9 +1275,9 @@ def build_llm_context(
         context["causal_language_instruction"] = (
             "has_directed_relationships is false: none of the components "
             "below contain an explicit_parent_child or inferred_propagation edge, only "
-            "associations. Do not use causal/directional wording (\"caused\", "
-            "\"led to\", \"resulted in\", \"propagated to\", \"cascaded "
-            "into\", or equivalents) anywhere in this response, even if the "
+            'associations. Do not use causal/directional wording ("caused", '
+            '"led to", "resulted in", "propagated to", "cascaded '
+            'into", or equivalents) anywhere in this response, even if the '
             "co-occurring evidence looks intuitively causal. Describe "
             "relationships as coinciding/associated/observed-alongside, and "
             "state plainly that direction was not established."
@@ -1344,7 +1354,9 @@ def _enforce_correlated_context_byte_budget(context: dict[str, Any]) -> None:
         return
 
     context["context_truncated"] = True
-    component = context.get("components", [None])[0] if context.get("components") else None
+    component = (
+        context.get("components", [None])[0] if context.get("components") else None
+    )
 
     if component is not None:
         associations = list(component.get("associations", []))
@@ -1398,7 +1410,6 @@ def _enforce_correlated_context_byte_budget(context: dict[str, Any]) -> None:
         )
 
 
-
 def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
     return {
         "id": evidence.id,
@@ -1420,14 +1431,10 @@ def _evidence_payload(evidence: Evidence) -> dict[str, Any]:
         "occurrence_count": evidence.occurrence_count,
         "source_matches": evidence.source_matches,
         "first_seen": (
-            evidence.first_seen.isoformat()
-            if evidence.first_seen is not None
-            else None
+            evidence.first_seen.isoformat() if evidence.first_seen is not None else None
         ),
         "last_seen": (
-            evidence.last_seen.isoformat()
-            if evidence.last_seen is not None
-            else None
+            evidence.last_seen.isoformat() if evidence.last_seen is not None else None
         ),
         "trace_id": evidence.trace_id,
         "request_id": evidence.request_id,
@@ -1468,7 +1475,8 @@ def build_artifact_outcome_payload(
             "source_format": artifact.detected_format,
             "evidence_count": 0,
             "status": status,
-            "message": failure_reason or (
+            "message": failure_reason
+            or (
                 "Artifact exceeded a supported processing limit."
                 if status == "resource_limited"
                 else "Artifact could not be analyzed."
@@ -1555,7 +1563,7 @@ def build_source_outcome_payload(
     )
 
     return {
-        "status": status,  
+        "status": status,
         "match_count": match_count,
         "failure_reason": getattr(analysis, "source_failure_reason", None),
     }

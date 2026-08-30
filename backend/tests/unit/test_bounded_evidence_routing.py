@@ -472,7 +472,12 @@ def test_legacy_reconstruction_simple_path_is_bounded_too(monkeypatch):
 # --- Bounded selection is invariant to Evidence.id/commit order -----------
 
 
-def _seed_reshuffled_evidence(session_factory, insertion_order):
+def _seed_reshuffled_evidence(
+    session_factory,
+    insertion_order,
+    *,
+    tie_first_line=False,
+):
     """Builds ONE analysis with 3 artifacts (positions 0/1/2), 8 logically
     identical (same severity, no distinguishing signals) events per
     artifact - 24 total - inserted/committed in `insertion_order` (a list
@@ -511,7 +516,10 @@ def _seed_reshuffled_evidence(session_factory, insertion_order):
 
     base = datetime.now(timezone.utc)
     for position, local_line in insertion_order:
-        first_line_number = position * stride + local_line
+        first_line_number = (
+            position * stride
+            + (1 if tie_first_line else local_line)
+        )
         # Committed ONE ROW AT A TIME, in insertion_order - Evidence.id
         # values are therefore assigned in exactly this (shuffled) order,
         # never in first_line_number order, for either call this helper
@@ -583,3 +591,86 @@ def test_bounded_selection_over_5000_is_invariant_to_evidence_id_and_commit_orde
     # The SAME logical selected set - never dependent on which Evidence.id
     # values happened to be assigned, nor on physical commit order.
     assert keys_a == keys_b
+
+def test_bounded_selection_tied_first_lines_is_invariant_to_evidence_id_and_commit_order():
+    """Exact first_line_number ties must paginate and select by the stable
+    logical Evidence key, never by Evidence.id. A tiny batch_size forces tied
+    rows across multiple real keyset pages so this proves the cursor itself."""
+    session_factory = _db_with_schema()
+
+    all_keys = [
+        (position, local_line)
+        for position in (0, 1, 2)
+        for local_line in range(1, 9)
+    ]
+
+    import random
+
+    forward_order = list(all_keys)
+    shuffled_order = list(all_keys)
+
+    random.Random(4321).shuffle(
+        shuffled_order
+    )
+
+    assert forward_order != shuffled_order
+
+    analysis_id_a = _seed_reshuffled_evidence(
+        session_factory,
+        forward_order,
+        tie_first_line=True,
+    )
+
+    analysis_id_b = _seed_reshuffled_evidence(
+        session_factory,
+        shuffled_order,
+        tie_first_line=True,
+    )
+
+    db = session_factory()
+
+    try:
+        rows_a, total_a = (
+            select_bounded_evidence_from_db(
+                db,
+                analysis_id=analysis_id_a,
+                max_records=10,
+                max_context_bytes=10_000_000,
+                batch_size=3,
+            )
+        )
+
+        rows_b, total_b = (
+            select_bounded_evidence_from_db(
+                db,
+                analysis_id=analysis_id_b,
+                max_records=10,
+                max_context_bytes=10_000_000,
+                batch_size=3,
+            )
+        )
+    finally:
+        db.close()
+
+    assert total_a == total_b == 24
+    assert len(rows_a) == len(rows_b) == 10
+
+    logical_a = sorted(
+        (
+            row.first_line_number,
+            row.fingerprint,
+            row.correlation_key,
+        )
+        for row in rows_a
+    )
+
+    logical_b = sorted(
+        (
+            row.first_line_number,
+            row.fingerprint,
+            row.correlation_key,
+        )
+        for row in rows_b
+    )
+
+    assert logical_a == logical_b
