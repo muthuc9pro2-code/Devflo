@@ -552,16 +552,104 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
     """
     db = sessionLocal(expire_on_commit=False)
     try:
+        # Claim under one short parent-first transaction. Do not preload full
+        # ORM objects before the locking reads: SQLAlchemy's identity map can
+        # otherwise hand a SELECT ... FOR UPDATE query an already-loaded
+        # Analysis/AnalysisArtifact instance whose attributes still reflect
+        # the earlier read. The row lock would be current, but the Python
+        # status value used to authorize the claim could be stale. Column
+        # queries avoid that identity-map reuse entirely.
+        #
+        # Lock/mutation order:
+        #   Analysis -> AnalysisArtifact -> mutate Artifact -> commit
+        current = (
+            db.query(Analysis.status, Analysis.processing_generation)
+            .filter(Analysis.id == analysis_id)
+            .with_for_update()
+            .first()
+        )
+
+        if current is None:
+            db.rollback()
+            logger.warning(
+                "Analysis %s not found while claiming artifact %s; skipping",
+                analysis_id,
+                artifact_id,
+            )
+            return 0
+
+        current_status, current_generation = current
+        if current_status != "processing" or current_generation != generation:
+            db.rollback()
+            logger.info(
+                "Analysis %s | generation %s no longer owns artifact %s "
+                "(status=%s, current generation=%s); skipping",
+                analysis_id,
+                generation,
+                artifact_id,
+                current_status,
+                current_generation,
+            )
+            return 0
+
+        artifact_status = (
+            db.query(AnalysisArtifact.status)
+            .filter(
+                AnalysisArtifact.id == artifact_id,
+                AnalysisArtifact.analysis_id == analysis_id,
+            )
+            .with_for_update()
+            .scalar()
+        )
+
+        if artifact_status != "pending":
+            db.rollback()
+            logger.info(
+                "Analysis %s | artifact %s not claimable (status=%s); skipping",
+                analysis_id,
+                artifact_id,
+                artifact_status,
+            )
+            return 0
+
+        claim = db.execute(
+            update(AnalysisArtifact)
+            .where(
+                AnalysisArtifact.id == artifact_id,
+                AnalysisArtifact.analysis_id == analysis_id,
+                AnalysisArtifact.status == "pending",
+            )
+            .values(status="processing")
+            .execution_options(synchronize_session=False)
+        )
+        if claim.rowcount != 1:
+            db.rollback()
+            logger.info(
+                "Analysis %s | artifact %s claim lost; skipping",
+                analysis_id,
+                artifact_id,
+            )
+            return 0
+        db.commit()
+
+        # Load the working ORM objects only AFTER the claim commit, so the
+        # Session cannot reuse stale pre-claim identity-map state. Re-check
+        # the parent before source loading/parsing because cancellation or
+        # recovery may legitimately win immediately after the short claim.
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
         artifact = (
             db.query(AnalysisArtifact)
-            .filter(AnalysisArtifact.id == artifact_id)
+            .filter(
+                AnalysisArtifact.id == artifact_id,
+                AnalysisArtifact.analysis_id == analysis_id,
+            )
             .first()
         )
 
         if analysis is None or artifact is None:
+            db.rollback()
             logger.warning(
-                "Analysis %s | artifact %s not found; skipping",
+                "Analysis %s | artifact %s disappeared after claim; skipping",
                 analysis_id,
                 artifact_id,
             )
@@ -570,73 +658,17 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
         if (
             analysis.status != "processing"
             or analysis.processing_generation != generation
-        ):
-            logger.info(
-                "Analysis %s | generation %s superseded (status=%s, "
-                "current generation=%s); skipping artifact %s",
-                analysis_id,
-                generation,
-                analysis.status,
-                analysis.processing_generation,
-                artifact_id,
-            )
-            return 0
-
-        if artifact.status in ("completed", "resource_limited", "processing_error"):
-            return 0
-
-        # Claim under one short parent-first transaction.
-        #
-        # Lock order:
-        #   Analysis -> AnalysisArtifact
-        #
-        # No ORM state is dirty before these locking reads, so SQLAlchemy
-        # cannot autoflush an Artifact UPDATE ahead of the parent lock.
-        current = (
-            db.query(Analysis)
-            .filter(Analysis.id == analysis_id)
-            .with_for_update()
-            .first()
-        )
-
-        if (
-            current is None
-            or current.status != "processing"
-            or current.processing_generation != generation
+            or artifact.status != "processing"
         ):
             db.rollback()
             logger.info(
-                "Analysis %s | generation %s no longer owns artifact %s; skipping",
+                "Analysis %s | generation %s lost ownership after claiming "
+                "artifact %s; skipping before source/parsing",
                 analysis_id,
                 generation,
                 artifact_id,
             )
             return 0
-
-        claimed_artifact = (
-            db.query(AnalysisArtifact)
-            .filter(
-                AnalysisArtifact.id == artifact_id,
-                AnalysisArtifact.analysis_id == analysis_id,
-            )
-            .with_for_update()
-            .first()
-        )
-
-        if claimed_artifact is None or claimed_artifact.status != "pending":
-            db.rollback()
-            logger.info(
-                "Analysis %s | artifact %s not claimable (status=%s); skipping",
-                analysis_id,
-                artifact_id,
-                getattr(claimed_artifact, "status", None),
-            )
-            return 0
-
-        claimed_artifact.status = "processing"
-        db.commit()
-
-        artifact = claimed_artifact
 
         _bump_processing_heartbeat(analysis_id, generation)
 

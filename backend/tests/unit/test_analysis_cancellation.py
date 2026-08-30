@@ -539,16 +539,32 @@ def test_process_artifact_task_returns_immediately_for_cancelled_analysis(monkey
     alice = _user(db)
     analysis = _analysis(db, alice, status="cancelled")
     artifact = _artifact(db, analysis, status="pending")
+
+    analysis_id = analysis.id
+    artifact_id = artifact.id
+
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     monkeypatch.setattr(
-        analysis_task, "_process_artifact",
-        lambda **k: (_ for _ in ()).throw(AssertionError("must never parse a cancelled artifact")),
+        analysis_task,
+        "_process_artifact",
+        lambda **k: (_ for _ in ()).throw(
+            AssertionError("must never parse a cancelled artifact")
+        ),
     )
 
-    result = analysis_task._process_artifact_task.run(analysis.id, artifact.id, 0)
+    result = analysis_task._process_artifact_task.run(
+        analysis_id,
+        artifact_id,
+        0,
+    )
 
     assert result == 0
-    assert db.query(Evidence).filter(Evidence.analysis_id == analysis.id).count() == 0
+    assert (
+        db.query(Evidence)
+        .filter(Evidence.analysis_id == analysis_id)
+        .count()
+        == 0
+    )
 
 
 def test_prepare_source_task_skips_when_already_cancelled(monkeypatch):

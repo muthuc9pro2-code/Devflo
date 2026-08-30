@@ -264,18 +264,21 @@ def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
         id=101,
         analysis_id=9,
         position=0,
-        status="pending",
+        status="processing",
     )
 
-    # The first two normal reads at task entry.
+    # The authoritative claim reads current scalar/column state under
+    # parent-first row locks, then loads the working ORM objects only after
+    # the claim commit.
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
+        "processing",
+        1,
+    )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        "pending"
+    )
+    db.execute.return_value.rowcount = 1
     db.query.return_value.filter.return_value.first.side_effect = [
-        analysis,
-        artifact,
-    ]
-
-    # The authoritative parent-first claim now locks and returns the
-    # full Analysis object first, then the full AnalysisArtifact object.
-    db.query.return_value.filter.return_value.with_for_update.return_value.first.side_effect = [
         analysis,
         artifact,
     ]
@@ -311,9 +314,13 @@ def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
 
 def test_process_artifact_task_skips_an_already_completed_artifact(monkeypatch):
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="processing", processing_generation=1)
-    artifact = SimpleNamespace(id=101, status="completed")
-    db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
+        "processing",
+        1,
+    )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        "completed"
+    )
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     process_artifact = Mock()
     monkeypatch.setattr(analysis_task, "_process_artifact", process_artifact)
@@ -335,9 +342,13 @@ def test_process_artifact_task_skips_an_already_controlled_failed_artifact_on_re
     controlled, terminal failure outcome in a PRIOR run. That outcome is
     exactly as final as "completed" and must not be re-processed."""
     db = Mock()
-    analysis = SimpleNamespace(id=9, status="processing", processing_generation=1)
-    artifact = SimpleNamespace(id=101, status=terminal_status)
-    db.query.return_value.filter.return_value.first.side_effect = [analysis, artifact]
+    db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
+        "processing",
+        1,
+    )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        terminal_status
+    )
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(return_value=db))
     process_artifact = Mock()
     monkeypatch.setattr(analysis_task, "_process_artifact", process_artifact)
