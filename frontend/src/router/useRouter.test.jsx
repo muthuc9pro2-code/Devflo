@@ -207,6 +207,133 @@ describe('useRouter', () => {
     expect(goSpy).toHaveBeenCalledWith(1)
   })
 
+  it('queues an upload-success navigation until an in-flight Back correction reaches the locked entry', () => {
+    const pushStateSpy = vi.spyOn(
+      window.history,
+      'pushState',
+    )
+    const goSpy = vi
+      .spyOn(window.history, 'go')
+      .mockImplementation(() => {})
+
+    const { result, rerender } = renderHook(
+      ({ locked }) => useRouter(locked),
+      {
+        initialProps: {
+          locked: false,
+        },
+      },
+    )
+
+    /*
+     * Build:
+     *
+     * index 0 = initial
+     * index 1 = /investigation/7
+     * index 2 = /new
+     *
+     * Upload will lock at index 2.
+     */
+    act(() => {
+      result.current.navigate(
+        '/investigation/7',
+      )
+      result.current.navigate('/new')
+    })
+
+    expect(
+      window.history.state[HISTORY_INDEX_KEY],
+    ).toBe(2)
+
+    rerender({
+      locked: true,
+    })
+
+    /*
+     * User presses Back.
+     *
+     * The real browser has already moved to index 1 before popstate fires.
+     * Router schedules history.go(+1), but our mock deliberately does NOT
+     * complete that traversal yet.
+     */
+    act(() => {
+      simulatePopState(
+        '/investigation/7',
+        1,
+      )
+    })
+
+    expect(goSpy).toHaveBeenCalledWith(1)
+    // React still exposes the protected route.
+    expect(result.current.pathname).toBe(
+      '/new',
+    )
+
+    const pushesBeforeHandoff =
+      pushStateSpy.mock.calls.length
+
+    /*
+     * THIS is the race Item 11 previously missed.
+     *
+     * Upload succeeds before history.go(+1) has completed.
+     */
+    act(() => {
+      result.current.navigate(
+        '/investigation/42',
+      )
+    })
+
+    /*
+     * /investigation/42 must NOT have been pushState()'d from temporary
+     * history index 1. It must still be queued.
+     */
+    expect(
+      pushStateSpy.mock.calls.length,
+    ).toBe(pushesBeforeHandoff)
+    expect(result.current.pathname).toBe(
+      '/new',
+    )
+
+    /*
+     * Upload releases its critical-operation lock before the corrective
+     * traversal has completed.
+     *
+     * Pending correction ownership must survive this.
+     */
+    rerender({
+      locked: false,
+    })
+
+    /*
+     * Now model the popstate fired when the asynchronous history.go(+1)
+     * finally returns the browser to the ORIGINAL locked entry:
+     *
+     * index 2 = /new
+     */
+    act(() => {
+      simulatePopState(
+        '/new',
+        2,
+      )
+    })
+
+    /*
+     * Only NOW may the queued upload-success handoff push index 3.
+     */
+    expect(
+      pushStateSpy.mock.calls.length,
+    ).toBe(pushesBeforeHandoff + 1)
+    expect(
+      window.location.pathname,
+    ).toBe('/investigation/42')
+    expect(
+      result.current.pathname,
+    ).toBe('/investigation/42')
+    expect(
+      window.history.state[HISTORY_INDEX_KEY],
+    ).toBe(3)
+  })
+
   it('resumes normal Back/Forward state updates once no longer blocked', () => {
     const goSpy = vi
       .spyOn(window.history, 'go')
@@ -236,6 +363,13 @@ describe('useRouter', () => {
 
     expect(result.current.pathname).toBe('/new')
     expect(goSpy).toHaveBeenCalledWith(1)
+
+    // history.go() is asynchronous. Model the corrective popstate that returns
+    // the browser to the locked /new entry before checking normal unlocked
+    // Back/Forward behavior.
+    act(() => {
+      simulatePopState('/new', 2)
+    })
 
     rerender({
       locked: false,
