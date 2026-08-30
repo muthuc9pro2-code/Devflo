@@ -676,3 +676,271 @@ def test_cancellation_filesystem_cleanup_error_never_changes_the_cancelled_statu
     assert result == "processing"
     db.expire_all()
     assert db.query(Analysis).filter(Analysis.id == analysis_id).first().status == "cancelled"
+
+
+# --- Final proof pass: real threaded/barrier lifecycle interleavings -------
+
+
+def _threaded_file_session_factory(tmp_path):
+    """Independent connections/sessions that can be used from real threads.
+    A file-backed SQLite DB is intentional here: in-memory SQLite's default
+    pooling can collapse supposedly-independent same-thread sessions onto one
+    connection and cannot faithfully stage the barriers these tests require.
+    """
+    database_path = tmp_path / "lifecycle-interleavings.sqlite3"
+    engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def test_source_generation_lost_during_private_preparation_cannot_publish(
+    tmp_path, monkeypatch,
+):
+    """G1 starts real private source preparation. While its clone is paused,
+    an independent DB session advances the Analysis to G2. When G1 resumes,
+    the production publication guard must reject it before ANY canonical
+    source mutation or .ready marker can occur."""
+    import threading
+    from app.services import source_archive
+
+    session_factory = _threaded_file_session_factory(tmp_path)
+    monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    seed_db = session_factory()
+    alice = _user(seed_db)
+    analysis = _analysis(
+        seed_db, alice, status="processing", processing_generation=1,
+        source_kind="github", source_reference="https://github.com/acme/project",
+        source_status="preparing",
+    )
+    analysis_id = analysis.id
+    seed_db.close()
+
+    clone_started = threading.Event()
+    allow_clone_finish = threading.Event()
+    worker_errors = []
+    worker_results = []
+
+    def fake_clone(_url, destination):
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "g1.py").write_text("print('g1')\n", encoding="utf-8")
+        clone_started.set()
+        if not allow_clone_finish.wait(timeout=5):
+            raise AssertionError("test barrier timed out waiting to resume G1")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+
+    def run_generation_1():
+        try:
+            result = source_archive.prepare_source(
+                "github",
+                "https://github.com/acme/project",
+                analysis_id,
+                1,
+                publish_callback=lambda publisher: (
+                    analysis_task._publish_source_for_current_generation(
+                        analysis_id, 1, publisher,
+                    )
+                ),
+            )
+            worker_results.append(result)
+        except BaseException as error:
+            # Surface background-thread failures to the real pytest thread.
+            worker_errors.append(error)
+
+    worker = threading.Thread(target=run_generation_1)
+    worker.start()
+
+    assert clone_started.wait(timeout=5), (
+        "G1 never reached private preparation barrier"
+    )
+
+    # A genuinely independent recovery/new execution becomes owner while G1
+    # is still doing private filesystem work.
+    generation_2_db = session_factory()
+    generation_2_db.query(Analysis).filter(Analysis.id == analysis_id).update(
+        {"processing_generation": 2, "source_status": "preparing"},
+        synchronize_session=False,
+    )
+    generation_2_db.commit()
+    generation_2_db.close()
+
+    allow_clone_finish.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "G1 worker did not finish"
+    assert worker_errors == []
+    assert worker_results == [None]
+
+    canonical = tmp_path / "sources" / str(analysis_id)
+    marker = source_archive._ready_marker(canonical)
+    # G1's complete PRIVATE preparation is harmless. It lost DB ownership
+    # before publication, so nothing canonical exists.
+    assert not canonical.exists()
+    assert not marker.exists()
+
+    verify_db = session_factory()
+    current = verify_db.query(Analysis).filter(Analysis.id == analysis_id).one()
+    assert current.status == "processing"
+    assert current.processing_generation == 2
+    assert current.source_status == "preparing"
+    verify_db.close()
+
+
+def test_g2_published_without_ready_marker_cannot_be_touched_by_stale_g1(
+    tmp_path, monkeypatch,
+):
+    """The exact dangerous source-publication interleaving.
+
+    G2 owns the DB generation and reaches the tiny filesystem window where
+    its complete private tree has been atomically renamed to canonical but
+    .ready has not yet been written. While G2 is paused there, stale G1 does
+    a full private preparation using its own thread/session and attempts the
+    REAL production publication callback. G1 must be rejected by the DB
+    generation fence BEFORE its publisher runs, so G2's canonical no-ready
+    tree remains untouched. G2 can then finish marker + durable DB ready
+    publication normally.
+    """
+    import threading
+    from app.services import source_archive
+
+    session_factory = _threaded_file_session_factory(tmp_path)
+    monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    seed_db = session_factory()
+    alice = _user(seed_db)
+    analysis = _analysis(
+        seed_db, alice, status="processing", processing_generation=2,
+        source_kind="github", source_reference="https://github.com/acme/project",
+        source_status="preparing",
+    )
+    analysis_id = analysis.id
+    seed_db.close()
+
+    canonical = tmp_path / "sources" / str(analysis_id)
+    marker = source_archive._ready_marker(canonical)
+
+    g2_canonical_without_ready = threading.Event()
+    allow_g2_finish = threading.Event()
+    thread_errors = []
+    g2_results = []
+    g1_results = []
+
+    def fake_clone(_url, destination):
+        destination.mkdir(parents=True, exist_ok=True)
+        generation_label = "g2" if ".tmp-2-" in destination.name else "g1"
+        (destination / f"{generation_label}.py").write_text(
+            f"print('{generation_label}')\n", encoding="utf-8",
+        )
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+
+    real_replace = source_archive.os.replace
+
+    def gated_replace(source, destination):
+        result = real_replace(source, destination)
+        source_path = source_archive.Path(source)
+        destination_path = source_archive.Path(destination)
+        if destination_path == canonical and ".tmp-2-" in source_path.name:
+            # EXACT dangerous window:
+            #
+            # G2 canonical tree exists, but manifest/.ready publication has
+            # not completed.
+            assert canonical.exists()
+            assert (canonical / "g2.py").exists()
+            assert not marker.exists()
+            g2_canonical_without_ready.set()
+            if not allow_g2_finish.wait(timeout=5):
+                raise AssertionError("test barrier timed out waiting to resume G2")
+        return result
+
+    monkeypatch.setattr(source_archive.os, "replace", gated_replace)
+
+    def run_generation_2():
+        try:
+            result = source_archive.prepare_source(
+                "github",
+                "https://github.com/acme/project",
+                analysis_id,
+                2,
+                publish_callback=lambda publisher: (
+                    analysis_task._publish_source_for_current_generation(
+                        analysis_id, 2, publisher,
+                    )
+                ),
+            )
+            g2_results.append(result)
+        except BaseException as error:
+            thread_errors.append(error)
+
+    def run_stale_generation_1():
+        try:
+            result = source_archive.prepare_source(
+                "github",
+                "https://github.com/acme/project",
+                analysis_id,
+                1,
+                publish_callback=lambda publisher: (
+                    analysis_task._publish_source_for_current_generation(
+                        analysis_id, 1, publisher,
+                    )
+                ),
+            )
+            g1_results.append(result)
+        except BaseException as error:
+            thread_errors.append(error)
+
+    g2_thread = threading.Thread(target=run_generation_2)
+    g2_thread.start()
+
+    assert g2_canonical_without_ready.wait(timeout=5), (
+        "G2 never reached canonical-without-ready publication barrier"
+    )
+
+    # G1 now genuinely runs WHILE G2 is paused in canonical/no-ready state.
+    #
+    # G1 may clone/index into its own private temp directory. What it MUST
+    # NOT do is invoke its canonical publisher.
+    g1_thread = threading.Thread(target=run_stale_generation_1)
+    g1_thread.start()
+    g1_thread.join(timeout=5)
+
+    assert not g1_thread.is_alive(), "stale G1 did not finish"
+    assert thread_errors == []
+    assert g1_results == [None]
+
+    # While G2 is STILL paused: canonical must remain exactly G2.
+    assert canonical.exists()
+    assert (canonical / "g2.py").exists()
+    assert not (canonical / "g1.py").exists()
+    # Still deliberately in the pre-marker crash window.
+    assert not marker.exists()
+
+    # Now allow current generation G2 to complete publication.
+    allow_g2_finish.set()
+    g2_thread.join(timeout=5)
+
+    assert not g2_thread.is_alive(), "G2 did not finish"
+    assert thread_errors == []
+    assert len(g2_results) == 1
+    assert g2_results[0] is not None
+    assert marker.exists()
+    assert (canonical / "g2.py").exists()
+    assert not (canonical / "g1.py").exists()
+
+    verify_db = session_factory()
+    current = verify_db.query(Analysis).filter(Analysis.id == analysis_id).one()
+    assert current.status == "processing"
+    assert current.processing_generation == 2
+    assert current.source_status == "ready"
+    verify_db.close()
+
+    # Neither generation may leak its private staging directories after
+    # returning.
+    assert list((tmp_path / "sources").glob(f"{analysis_id}.tmp-1-*")) == []
+    assert list((tmp_path / "sources").glob(f"{analysis_id}.tmp-2-*")) == []

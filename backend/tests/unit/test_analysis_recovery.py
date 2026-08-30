@@ -1582,3 +1582,300 @@ def test_finalize_bumps_heartbeat_after_gemini_resolves(monkeypatch):
     assert reloaded.status == "completed"
     assert reloaded.processing_heartbeat_at is not None
     db2.close()
+
+
+# --- Final proof pass: explicit artifact-format recovery matrix ------------
+
+
+def test_recovery_matrix_explicitly_accounts_for_every_artifact_format():
+    from app.services.artifact_detector import ArtifactFormat
+
+    resumable = {
+        "generic",
+        "json",
+        "stack_trace",
+        "web_server",
+        "container",
+        "database",
+        "cloud_gateway",
+        "ci_cd",
+        "browser",
+        "message_broker",
+        "serverless",
+        "syslog",
+        "opentelemetry",
+    }
+    assert {item.value for item in ArtifactFormat} == resumable | {
+        "image",
+        "unsupported",
+    }
+
+
+@pytest.mark.parametrize(
+    "artifact_format",
+    [
+        "generic",
+        "json",
+        "stack_trace",
+        "web_server",
+        "container",
+        "database",
+        "cloud_gateway",
+        "ci_cd",
+        "browser",
+        "message_broker",
+        "serverless",
+        "syslog",
+        "opentelemetry",
+    ],
+)
+def test_recovery_matrix_preserves_committed_checkpoint_and_evidence_for_every_resumable_format(
+    monkeypatch,
+    artifact_format,
+):
+    """Every supported non-image diagnostic format resumes from durable
+    state. Recovery releases only the in-flight artifact claim; it must not
+    erase already-committed Evidence, line progress, byte/record checkpoint,
+    or bounded fallback context. Structured document formats legitimately use
+    a record checkpoint with processed_bytes == 0, so the fixture mirrors that
+    rather than inventing a byte offset they do not persist."""
+    db = _session()
+    alice = _user(db)
+    analysis = _stale_analysis(
+        db,
+        alice,
+        age_seconds=301,
+    )
+    structured_record_formats = {
+        "json",
+        "browser",
+        "opentelemetry",
+    }
+    checkpoint_bytes = (
+        0
+        if artifact_format in structured_record_formats
+        else 321
+    )
+    artifact = _artifact(
+        db,
+        analysis,
+        status="processing",
+        detected_format=artifact_format,
+        processed_bytes=checkpoint_bytes,
+        last_processed_line=7,
+        fallback_context="committed fallback context",
+    )
+    db.add(
+        Evidence(
+            analysis_id=analysis.id,
+            artifact_id=artifact.id,
+            correlation_key=f"recovery-{artifact_format}",
+            fingerprint=f"fp-{artifact_format}",
+            source_format=artifact_format,
+            first_line_number=7,
+            last_line_number=7,
+            severity="ERROR",
+            representative_line="committed evidence",
+        )
+    )
+    db.commit()
+    analysis_id = analysis.id
+    artifact_id = artifact.id
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        lambda **_kwargs: db,
+    )
+    monkeypatch.setattr(
+        analysis_task.process_analysis,
+        "delay",
+        lambda _aid: None,
+    )
+
+    claimed_count = (
+        analysis_task.recover_stale_analyses.run()
+    )
+
+    assert claimed_count == 1
+    db.expire_all()
+    recovered_analysis = (
+        db.query(Analysis)
+        .filter(Analysis.id == analysis_id)
+        .one()
+    )
+    recovered_artifact = (
+        db.query(AnalysisArtifact)
+        .filter(AnalysisArtifact.id == artifact_id)
+        .one()
+    )
+    assert recovered_analysis.status == "pending"
+    assert recovered_artifact.status == "pending"
+    assert (
+        recovered_artifact.detected_format
+        == artifact_format
+    )
+    assert (
+        recovered_artifact.processed_bytes
+        == checkpoint_bytes
+    )
+    assert (
+        recovered_artifact.last_processed_line
+        == 7
+    )
+    assert (
+        recovered_artifact.fallback_context
+        == "committed fallback context"
+    )
+    assert (
+        db.query(Evidence)
+        .filter(Evidence.artifact_id == artifact_id)
+        .count()
+        == 1
+    )
+
+
+def test_recovery_matrix_image_is_restart_only_and_clears_partial_state(
+    monkeypatch,
+):
+    """IMAGE is the one supported format that is intentionally not
+    resumable: OCR checkpoints are logical extracted-text positions, not byte
+    offsets into the encoded image. Recovery must therefore cleanly restart
+    it and remove partial Evidence/fallback state."""
+    db = _session()
+    alice = _user(db)
+    analysis = _stale_analysis(
+        db,
+        alice,
+        age_seconds=301,
+    )
+    artifact = _artifact(
+        db,
+        analysis,
+        status="processing",
+        detected_format="image",
+        processed_bytes=9,
+        last_processed_line=9,
+        fallback_context="partial OCR fallback",
+    )
+    db.add(
+        Evidence(
+            analysis_id=analysis.id,
+            artifact_id=artifact.id,
+            correlation_key="image-partial",
+            fingerprint="image-partial",
+            source_format="image",
+            first_line_number=1,
+            last_line_number=1,
+            severity="ERROR",
+        )
+    )
+    db.commit()
+    artifact_id = artifact.id
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        lambda **_kwargs: db,
+    )
+    monkeypatch.setattr(
+        analysis_task.process_analysis,
+        "delay",
+        lambda _aid: None,
+    )
+
+    assert (
+        analysis_task.recover_stale_analyses.run()
+        == 1
+    )
+    db.expire_all()
+    recovered = (
+        db.query(AnalysisArtifact)
+        .filter(AnalysisArtifact.id == artifact_id)
+        .one()
+    )
+    assert recovered.status == "pending"
+    assert recovered.detected_format == "image"
+    assert recovered.processed_bytes == 0
+    assert recovered.last_processed_line == 0
+    assert recovered.fallback_context is None
+    assert (
+        db.query(Evidence)
+        .filter(Evidence.artifact_id == artifact_id)
+        .count()
+        == 0
+    )
+
+
+def test_recovery_matrix_unsupported_artifact_remains_terminal(
+    monkeypatch,
+):
+    """UNSUPPORTED is a detected format but never resumable work. Recovery
+    must leave its terminal artifact outcome untouched while recovering a
+    genuinely stuck sibling that makes the parent stale/recoverable."""
+    db = _session()
+    alice = _user(db)
+    analysis = _stale_analysis(
+        db,
+        alice,
+        age_seconds=301,
+    )
+    unsupported = _artifact(
+        db,
+        analysis,
+        position=0,
+        status="unsupported",
+        detected_format="unsupported",
+        processed_bytes=0,
+        last_processed_line=0,
+        fallback_context=None,
+    )
+    stuck = _artifact(
+        db,
+        analysis,
+        position=1,
+        status="processing",
+        detected_format="generic",
+        processed_bytes=100,
+        last_processed_line=5,
+    )
+    db.commit()
+    unsupported_id = unsupported.id
+    stuck_id = stuck.id
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        lambda **_kwargs: db,
+    )
+    monkeypatch.setattr(
+        analysis_task.process_analysis,
+        "delay",
+        lambda _aid: None,
+    )
+
+    assert (
+        analysis_task.recover_stale_analyses.run()
+        == 1
+    )
+    db.expire_all()
+    unsupported_after = (
+        db.query(AnalysisArtifact)
+        .filter(
+            AnalysisArtifact.id
+            == unsupported_id
+        )
+        .one()
+    )
+    stuck_after = (
+        db.query(AnalysisArtifact)
+        .filter(
+            AnalysisArtifact.id == stuck_id
+        )
+        .one()
+    )
+    assert unsupported_after.status == "unsupported"
+    assert (
+        unsupported_after.detected_format
+        == "unsupported"
+    )
+    assert stuck_after.status == "pending"
+    assert stuck_after.processed_bytes == 100
+    assert stuck_after.last_processed_line == 5

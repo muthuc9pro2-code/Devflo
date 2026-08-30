@@ -1174,3 +1174,242 @@ def test_devflo_ai_unavailable_fallback_path_preserves_deterministic_result(monk
 
     serialized = json.dumps(analysis.result_snapshot)
     assert "gemini" not in serialized.lower()
+
+
+# --- Final proof pass: explicit optional-source failure matrix -------------
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    [
+        "github",
+        "zip",
+    ],
+)
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "acquisition",
+        "index",
+        "manifest",
+    ],
+)
+def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
+    tmp_path,
+    monkeypatch,
+    source_kind,
+    failure_stage,
+):
+    """Both supported optional-source kinds must degrade identically when
+    acquisition, indexing, or manifest persistence fails: source becomes
+    unavailable, the Analysis stays processing, diagnostic Evidence still
+    persists, and finalization completes with an honest unavailable-source
+    outcome."""
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(
+        analysis_task,
+        "generate_investigation_explanation",
+        _raise_gemini_unavailable,
+    )
+    monkeypatch.setattr(
+        source_archive,
+        "SOURCE_STORAGE_ROOT",
+        str(tmp_path / "sources"),
+    )
+
+    if source_kind == "github":
+        source_reference = "https://github.com/acme/project"
+
+        def successful_acquisition(_reference, destination):
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "app.py").write_text(
+                "raise RuntimeError('source fixture')\n",
+                encoding="utf-8",
+            )
+
+        acquisition_name = "_clone_github"
+    else:
+        archive = tmp_path / "source.zip"
+        archive.write_bytes(b"placeholder: extraction is monkeypatched")
+        source_reference = str(archive)
+
+        def successful_acquisition(_reference, destination):
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "app.py").write_text(
+                "raise RuntimeError('source fixture')\n",
+                encoding="utf-8",
+            )
+
+        acquisition_name = "_extract_zip"
+
+    if failure_stage == "acquisition":
+        def failing_acquisition(_reference, _destination):
+            raise SourceInputError("controlled acquisition failure")
+
+        monkeypatch.setattr(source_archive, acquisition_name, failing_acquisition)
+    else:
+        monkeypatch.setattr(source_archive, acquisition_name, successful_acquisition)
+
+    if failure_stage == "index":
+        monkeypatch.setattr(
+            source_archive,
+            "build_index",
+            lambda _root: (_ for _ in ()).throw(
+                RuntimeError("index construction failed")
+            ),
+        )
+    elif failure_stage == "manifest":
+        monkeypatch.setattr(
+            source_archive,
+            "save_index_manifest",
+            lambda _index, _path: (_ for _ in ()).throw(
+                OSError("manifest persistence failed")
+            ),
+        )
+
+    analysis_id = _seed_user_and_analysis(
+        session_factory,
+        source_kind=source_kind,
+        source_reference=source_reference,
+    )
+
+    # Optional source failure must be contained here.
+    # It must never poison the diagnostic workflow.
+    analysis_task._prepare_source_task.run(analysis_id, 0)
+
+    db = session_factory()
+    after_source = db.query(Analysis).filter_by(id=analysis_id).one()
+    assert after_source.status == "processing"
+    assert after_source.source_status == "unavailable"
+    assert after_source.source_failure_reason
+    db.close()
+
+    diagnostic_path = _valid_generic_log(
+        tmp_path,
+        f"diagnostic-{source_kind}-{failure_stage}.log",
+        f"diagnostic survived {source_kind} {failure_stage}",
+    )
+    artifact_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename=diagnostic_path.name,
+        path=diagnostic_path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+    parsed = analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
+
+    db = session_factory()
+    assert db.query(Evidence).filter_by(artifact_id=artifact_id).count() == 1
+    assert db.query(AnalysisArtifact).filter_by(id=artifact_id).one().status == "completed"
+    db.close()
+
+    analysis_task._finalize_analysis_task.run([parsed], analysis_id, 0, None)
+
+    db = session_factory()
+    completed = db.query(Analysis).filter_by(id=analysis_id).one()
+    assert completed.status == "completed"
+    assert completed.result_snapshot["source"]["status"] == "unavailable"
+    assert completed.result_snapshot["source"]["failure_reason"]
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    [
+        "github",
+        "zip",
+    ],
+)
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "missing_ready_tree",
+        "matcher",
+    ],
+)
+def test_optional_source_post_publication_failure_matrix_retains_evidence_and_completes(
+    tmp_path,
+    monkeypatch,
+    source_kind,
+    failure_stage,
+):
+    """Failures discovered by artifact workers after source was considered
+    ready are still optional. A missing published tree or a source matcher
+    exception must disable only source enrichment, never diagnostic parsing,
+    Evidence persistence, or deterministic finalization."""
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet_sse(monkeypatch)
+    _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(
+        analysis_task,
+        "generate_investigation_explanation",
+        _raise_gemini_unavailable,
+    )
+
+    source_reference = (
+        "https://github.com/acme/project"
+        if source_kind == "github"
+        else str(tmp_path / "source.zip")
+    )
+    analysis_id = _seed_user_and_analysis(
+        session_factory,
+        source_kind=source_kind,
+        source_reference=source_reference,
+        source_status="ready",
+    )
+    diagnostic_path = _valid_generic_log(
+        tmp_path,
+        f"post-publish-{source_kind}-{failure_stage}.log",
+        f"diagnostic survived {failure_stage}",
+    )
+    artifact_id = _add_artifact(
+        session_factory,
+        analysis_id=analysis_id,
+        position=0,
+        filename=diagnostic_path.name,
+        path=diagnostic_path,
+        detected_format=ArtifactFormat.GENERIC.value,
+    )
+
+    if failure_stage == "missing_ready_tree":
+        monkeypatch.setattr(
+            analysis_task,
+            "_load_ready_source_index_for_artifact",
+            lambda _analysis, _generation: None,
+        )
+    else:
+        monkeypatch.setattr(
+            analysis_task,
+            "_load_ready_source_index_for_artifact",
+            lambda _analysis, _generation: object(),
+        )
+        monkeypatch.setattr(
+            analysis_task,
+            "correlate_event",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("source matcher failed")
+            ),
+        )
+
+    parsed = analysis_task._process_artifact_task.run(analysis_id, artifact_id, 0)
+
+    db = session_factory()
+    analysis = db.query(Analysis).filter_by(id=analysis_id).one()
+    evidence = db.query(Evidence).filter_by(artifact_id=artifact_id).one()
+    assert analysis.status == "processing"
+    assert analysis.source_status == "unavailable"
+    assert analysis.source_failure_reason
+    assert evidence.source_matches in (None, [])
+    assert db.query(AnalysisArtifact).filter_by(id=artifact_id).one().status == "completed"
+    db.close()
+
+    analysis_task._finalize_analysis_task.run([parsed], analysis_id, 0, None)
+
+    db = session_factory()
+    completed = db.query(Analysis).filter_by(id=analysis_id).one()
+    assert completed.status == "completed"
+    assert completed.result_snapshot["source"]["status"] == "unavailable"
+    db.close()
