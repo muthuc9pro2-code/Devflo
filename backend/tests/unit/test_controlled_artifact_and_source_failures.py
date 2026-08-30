@@ -579,7 +579,8 @@ def test_source_matching_failure_retains_evidence_without_source_matches(
     )
 
     monkeypatch.setattr(
-        analysis_task, "_prepare_source_index", lambda _analysis, _generation: object()
+        analysis_task, "_load_ready_source_index_for_artifact",
+        lambda _analysis, _generation: object()
     )
     monkeypatch.setattr(
         analysis_task,

@@ -50,6 +50,25 @@ export default function NewInvestigationPage({ onUploaded, onUploadingChange }) 
     }
   }, [])
 
+  // Native browser-controlled warning (refresh/close tab or window/
+  // navigate to another site) for exactly the window the diagnostic
+  // upload is actually in flight - registered/removed with uploadState
+  // itself, so it can never outlive the request it guards. No custom
+  // warning text: modern browsers ignore it and show their own generic
+  // prompt regardless, and setting one here would be dead code. Leaving
+  // this page (any way the user actually does it) is never interpreted as
+  // backend cancellation - the upload request itself is what decides
+  // success/failure, this is purely a heads-up.
+  useEffect(() => {
+    if (uploadState !== 'uploading') return undefined
+    const onBeforeUnload = (event) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [uploadState])
+
   const totalBytes = useMemo(
     () => files.reduce((total, selection) => total + selection.file.size, 0),
     [files],
@@ -206,7 +225,15 @@ export default function NewInvestigationPage({ onUploaded, onUploadingChange }) 
       // (same synchronous tick, so React batches both) means navigation
       // and unlock land in the same render - never a frame where controls
       // are enabled while this page is still the one on screen.
-      if (mountedRef.current) onUploaded(result)
+      if (mountedRef.current) {
+        onUploaded(result)
+        // Deterministically settles uploadState away from "uploading" on
+        // the success path too, rather than relying solely on this page
+        // unmounting shortly after (via the route change onUploaded just
+        // triggered) - this is what tears down the beforeunload guard
+        // (see the effect above) without depending on unmount timing.
+        setUploadState('idle')
+      }
       onUploadingChange?.(false)
     } catch (error) {
       if (mountedRef.current) {

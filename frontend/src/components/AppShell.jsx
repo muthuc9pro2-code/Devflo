@@ -15,15 +15,26 @@ function MenuIcon() {
   )
 }
 
+// The ONE status-reconciliation rule, shared by every path that could
+// otherwise drift apart: a terminal status (completed/failed) never
+// regresses to anything else, and "processing" never regresses back to
+// "pending" (a redelivered/out-of-order live event, or a History page
+// fetched before the live event landed). Both reconcileHistoryItem
+// (merging a freshly-fetched History page against what's already
+// displayed) and handleStatusChange (a live SSE/status event) compute the
+// accepted status through this SAME function, so liveStatusRef can never
+// again hold a raw, unreconciled status while the displayed item holds
+// the correctly-reconciled one (see handleStatusChange below).
+function reconcileStatus(existingStatus, incomingStatus) {
+  if (existingStatus === 'completed' || existingStatus === 'failed') return existingStatus
+  if (existingStatus === 'processing' && incomingStatus === 'pending') return existingStatus
+  return incomingStatus
+}
+
 function reconcileHistoryItem(incoming, existing) {
   if (!existing) return incoming
-  if (existing.status === 'completed' || existing.status === 'failed') {
-    return incoming.status === existing.status ? incoming : existing
-  }
-  if (existing.status === 'processing' && incoming.status === 'pending') {
-    return { ...incoming, status: 'processing' }
-  }
-  return incoming
+  const status = reconcileStatus(existing.status, incoming.status)
+  return status === incoming.status ? incoming : { ...incoming, status }
 }
 
 export default function AppShell({ pathname, navigate }) {
@@ -198,10 +209,19 @@ export default function AppShell({ pathname, navigate }) {
     // (e.g. keyboard activation of a nominally disabled control), an
     // in-flight diagnostic upload must never be abandoned mid-request.
     if (uploadNavigationLocked) return
+    if (to === '/new' && isNewRoute) {
+      // Already on /new - remounting NewInvestigationPage here (via the
+      // newInvestigationKey bump below) would silently erase whatever the
+      // user already has in progress (selected files, folder selection,
+      // source ZIP, GitHub URL). Only close the mobile drawer if it
+      // happens to be open; otherwise this is a genuine no-op.
+      setDrawerOpen(false)
+      return
+    }
     setDrawerOpen(false)
     if (to === '/new') setNewInvestigationKey((value) => value + 1)
     navigate(to)
-  }, [navigate, uploadNavigationLocked])
+  }, [navigate, uploadNavigationLocked, isNewRoute])
 
   const handleUploaded = useCallback((analysis) => {
     navigate(`/investigation/${analysis.id}`)
@@ -212,13 +232,24 @@ export default function AppShell({ pathname, navigate }) {
   }, [loadHistory])
 
   const handleStatusChange = useCallback((changedAnalysisId, status) => {
-    liveStatusRef.current.set(Number(changedAnalysisId), status)
-    setHistory((current) => current.map((item) => {
-      if (Number(item.analysis_id) !== Number(changedAnalysisId)) return item
-      if (item.status === 'completed' || item.status === 'failed') return item
-      if (item.status === 'processing' && status === 'pending') return item
-      return { ...item, status }
-    }))
+    const id = Number(changedAnalysisId)
+    setHistory((current) => {
+      const index = current.findIndex((item) => Number(item.analysis_id) === id)
+      // The SAME reconciliation reconcileHistoryItem uses - computed
+      // ONCE, then written to BOTH the displayed history state and
+      // liveStatusRef, so the two can never disagree (previously,
+      // liveStatusRef stored the raw incoming status even when the
+      // paired history update rejected it, e.g. displayed stays
+      // "processing" while an incoming "pending" got remembered as the
+      // live status anyway).
+      const accepted = index === -1 ? status : reconcileStatus(current[index].status, status)
+      liveStatusRef.current.set(id, accepted)
+
+      if (index === -1 || accepted === current[index].status) return current
+      const next = [...current]
+      next[index] = { ...next[index], status: accepted }
+      return next
+    })
   }, [])
 
   // Deliberately distinct from handleStatusChange above: a cancelled

@@ -12,6 +12,38 @@ from time import perf_counter
 
 logger = logging.getLogger(__name__)
 
+
+def _stable_evidence_key(evidence: Evidence) -> tuple:
+    """Composite stable/logical tie-break key for an Evidence row -
+    deterministic across runs, commit order, and worker scheduling; NEVER
+    Evidence.id or input/insertion order. first_line_number (derived once
+    at upload time from artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
+    plus that artifact's own line number) dominates; fingerprint/
+    correlation_key/source_file narrow the - already rare - residual tie
+    further with deterministic empty-string normalization for None. Two
+    rows tying on every one of these are, for any practical purpose,
+    indistinguishable content: which one a caller treats as "first" has no
+    semantic meaning either way, so this is as far as tie-breaking needs
+    to go. Evidence.id may still be used as a plain identifier elsewhere
+    (persistence lookups, node ids) - just never as a semantic ordering
+    signal, which is exactly what this replaces at every call site below."""
+    return (
+        evidence.first_line_number,
+        evidence.fingerprint or "",
+        evidence.correlation_key or "",
+        evidence.source_file or "",
+    )
+
+
+def _stable_node_key(node: "CorrelationNode") -> tuple:
+    """The same stable/logical tie-break convention as _stable_evidence_key,
+    for a CorrelationNode (which does not carry correlation_key)."""
+    return (
+        node.first_line_number if node.first_line_number is not None else float("inf"),
+        node.fingerprint or "",
+        node.source_file or "",
+    )
+
 class CorrelationSignal(str, Enum):
     PARENT_SPAN = "parent_span"
     SPAN_ID = "span_id"
@@ -432,41 +464,50 @@ def find_parent_span_candidate(
     child: Evidence,
     indexes: CorrelationIndexes,
 ) -> Evidence | None:
+    """If multiple rows sharing this span_id are all compatible parents
+    (a real possibility - span_id collisions are rare but not impossible),
+    the winner must not depend on indexes.span_ids' own list order (itself
+    downstream of DB query/commit-race order across concurrently-
+    processing artifact workers). first_line_number - the stable logical
+    key, derived once at upload time from
+    artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that artifact's
+    own line number - both closes that non-determinism and matches the
+    natural reading of "parent": whichever compatible candidate occurred
+    earliest."""
     if child.parent_span_id is None:
         return None
 
     candidates = indexes.span_ids.get(child.parent_span_id, [])
 
-    for parent in candidates:
-        if parent.id == child.id:
-            continue
-        if match_parent_span(parent, child) is not None:
-            return parent
+    compatible = [
+        parent
+        for parent in candidates
+        if parent.id != child.id and match_parent_span(parent, child) is not None
+    ]
+    if not compatible:
+        return None
 
-    return None
+    return min(compatible, key=_stable_evidence_key)
 
 _IDENTITY_GROUP_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _identity_group_sort_key(evidence: Evidence):
-    """Stable (first_seen, first_line_number) ordering for a shared-identity
-    group - deterministic regardless of naive/aware timestamps or input
-    list order, and regardless of whether first_seen is even known (falls
-    back to the earliest possible sentinel, then first_line_number).
+    """Stable (first_seen, *_stable_evidence_key) ordering for a
+    shared-identity group - deterministic regardless of naive/aware
+    timestamps or input list order, and regardless of whether first_seen
+    is even known (falls back to the earliest possible sentinel, then the
+    stable evidence key).
 
-    first_line_number - not evidence.id - is the tie-break: artifacts are
+    The stable key - never evidence.id - is the tie-break: artifacts are
     processed by independent, concurrently-racing Celery workers
     (app.tasks.analysis's per-artifact group/chord), so the DB-assigned
     autoincrement id an Evidence row happens to get reflects commit-race
-    order, not anything about the underlying diagnostic data.
-    first_line_number is instead derived once, at upload time, from
-    artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that artifact's own
-    line number - the same input always yields the same value, regardless
-    of which worker processes which artifact first or how fast each runs."""
+    order, not anything about the underlying diagnostic data."""
     first_seen = evidence.first_seen
     if first_seen is not None and first_seen.tzinfo is None:
         first_seen = first_seen.replace(tzinfo=timezone.utc)
-    return (first_seen or _IDENTITY_GROUP_MIN_TIMESTAMP, evidence.first_line_number)
+    return (first_seen or _IDENTITY_GROUP_MIN_TIMESTAMP, *_stable_evidence_key(evidence))
 
 
 def iter_identity_candidate_pairs(indexes: CorrelationIndexes):
@@ -670,7 +711,7 @@ def iter_temporal_candidates(
             for evidence in evidence_rows
             if evidence.first_seen is not None
         ),
-        key=lambda evidence: (evidence.first_seen, evidence.first_line_number),
+        key=lambda evidence: (evidence.first_seen, *_stable_evidence_key(evidence)),
     )
 
     left = 0
@@ -835,20 +876,32 @@ def _canonical_pair_order(
     is bookkeeping for a stable, reproducible score/delta_ms, never itself
     a claim of direction (see _has_strict_time_direction, which is what
     actually decides inferred_propagation-vs-association). Falls back to
-    first_line_number - never evidence.id, which reflects commit-race
-    order across concurrently-processing artifact workers, not anything
-    about the underlying data - when timestamps tie or are missing, so the
-    SAME unordered pair always canonicalizes to the SAME order regardless
-    of which iteration direction - or which shuffled input order -
-    encounters it first; required for correlation to stay invariant to
-    evidence input order.
+    the stable evidence key - never evidence.id, which reflects
+    commit-race order across concurrently-processing artifact workers, not
+    anything about the underlying data - when timestamps tie or are
+    missing, so the SAME unordered pair always canonicalizes to the SAME
+    order regardless of which iteration direction - or which shuffled
+    input order - encounters it first; required for correlation to stay
+    invariant to evidence input order. The stable key's leading
+    first_line_number component can only tie for two rows from the exact
+    same artifact and exact same source line, in which case
+    (fingerprint, correlation_key) - the rest of the key - is already
+    guaranteed distinct by Evidence's own DB uniqueness constraint
+    (analysis_id, artifact_id, fingerprint, correlation_key), so this key
+    is effectively a total order over real Evidence rows: the "else"
+    branch below is symmetric in practice, never actually reached on a
+    genuine tie between two distinct rows.
     """
     left_ts, right_ts = left.first_seen, right.first_seen
 
     if left_ts is not None and right_ts is not None and left_ts != right_ts:
         return (left, right) if left_ts < right_ts else (right, left)
 
-    return (left, right) if left.first_line_number < right.first_line_number else (right, left)
+    return (
+        (left, right)
+        if _stable_evidence_key(left) < _stable_evidence_key(right)
+        else (right, left)
+    )
 
 def build_correlation_edges(
     evidence_rows: list[Evidence],
@@ -1075,10 +1128,7 @@ def build_correlation_components(
         # whatever order this produced.
         component_nodes = sorted(
             (node_by_id[node_id] for node_id in component_ids),
-            key=lambda node: (
-                node.first_line_number if node.first_line_number is not None else float("inf"),
-                node.id,
-            ),
+            key=_stable_node_key,
         )
 
         component_edges = [

@@ -405,6 +405,9 @@ def test_ocr_runs_at_most_once_per_uploaded_image(monkeypatch, tmp_path):
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
         "processing", 0,
     )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        "processing"
+    )
     analysis = SimpleNamespace(id=1, processed_bytes=0, last_processed_line=0)
     artifact = SimpleNamespace(
         id=1,

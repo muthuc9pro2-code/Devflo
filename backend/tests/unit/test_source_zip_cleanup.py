@@ -1,11 +1,11 @@
 """Reclaiming the original staged optional source ZIP.
 
 Successful ZIP preparation already removes the original staged archive
-(app.tasks.analysis._prepare_source_index, via _remove_staged_source_archive)
+(app.tasks.analysis._acquire_source_index, via _remove_staged_source_archive)
 once prepare_source() has copied its bytes into investigation-scoped
 storage. Two paths previously left that original archive behind on disk:
 
-  1. cancellation before _prepare_source_index() ever reaches the
+  1. cancellation before _acquire_source_index() ever reaches the
      successful-preparation archive removal;
   2. optional source preparation failure (_record_optional_source_failure),
      which cleaned the *prepared* source but never the *original staged*
@@ -290,9 +290,9 @@ def test_successful_zip_preparation_still_removes_the_staged_archive(staged_zip,
         db, alice, status="processing",
         source_kind="zip", source_reference=str(staged_zip), source_status=None,
     )
-    monkeypatch.setattr(analysis_task, "prepare_source", lambda kind, ref, aid: object())
+    monkeypatch.setattr(analysis_task, "prepare_source", lambda kind, ref, aid, gen: object())
 
-    index = analysis_task._prepare_source_index(analysis, 0)
+    index = analysis_task._acquire_source_index(analysis, 0)
 
     assert index is not None
     assert not staged_zip.exists()
@@ -307,7 +307,7 @@ def test_staged_zip_unlink_oserror_after_success_does_not_mark_source_unavailabl
     """prepare_source() itself already fully succeeded (tree + index +
     manifest durably complete) by the time _remove_staged_source_archive
     runs - an OSError from THAT purely-cosmetic cleanup step must never be
-    reinterpreted as "the source failed to prepare". _prepare_source_index
+    reinterpreted as "the source failed to prepare". _acquire_source_index
     must return the real index, not raise SourceSubsystemError."""
     db = _session()
     alice = _user(db)
@@ -321,13 +321,13 @@ def test_staged_zip_unlink_oserror_after_success_does_not_mark_source_unavailabl
     # earlier test in this file could mask what this test actually checks.
     monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
     real_index = object()
-    monkeypatch.setattr(analysis_task, "prepare_source", lambda kind, ref, aid: real_index)
+    monkeypatch.setattr(analysis_task, "prepare_source", lambda kind, ref, aid, gen: real_index)
     monkeypatch.setattr(
         analysis_task, "_remove_staged_source_archive",
         lambda ref: (_ for _ in ()).throw(OSError("permission denied")),
     )
 
-    index = analysis_task._prepare_source_index(analysis, 0)
+    index = analysis_task._acquire_source_index(analysis, 0)
 
     assert index is real_index
     assert analysis.source_status is None  # never flipped to "unavailable"
@@ -349,7 +349,7 @@ def test_source_index_cache_does_not_leak_across_generations(monkeypatch):
     )
     build_calls = []
 
-    def fake_prepare(kind, ref, aid):
+    def fake_prepare(kind, ref, aid, gen):
         index = object()
         build_calls.append(index)
         return index
@@ -357,9 +357,9 @@ def test_source_index_cache_does_not_leak_across_generations(monkeypatch):
     monkeypatch.setattr(analysis_task, "prepare_source", fake_prepare)
     monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", lambda ref: None)
 
-    generation_1_index = analysis_task._prepare_source_index(analysis, 1)
-    generation_1_index_again = analysis_task._prepare_source_index(analysis, 1)
-    generation_2_index = analysis_task._prepare_source_index(analysis, 2)
+    generation_1_index = analysis_task._acquire_source_index(analysis, 1)
+    generation_1_index_again = analysis_task._acquire_source_index(analysis, 1)
+    generation_2_index = analysis_task._acquire_source_index(analysis, 2)
 
     assert generation_1_index_again is generation_1_index  # same generation: cached
     assert generation_2_index is not generation_1_index  # new generation: rebuilt
@@ -414,3 +414,44 @@ def test_batch_persistence_stops_correlating_once_source_becomes_unavailable_els
     assert result == 1  # Evidence persistence still proceeded
     assert correlate_calls == []  # but no NEW correlation was attempted
     assert event.source_matches == []
+
+
+def test_artifact_level_source_failure_never_deletes_the_canonical_tree_a_sibling_may_be_reading(
+    tmp_path, monkeypatch,
+):
+    """Interleaving D (item 19), with a REAL prepared source tree on disk:
+    Worker A discovers a source problem at the artifact level (e.g. its
+    own matcher crashed, or - as here - a "ready" source whose canonical
+    tree turns out unreadable) while Worker B, an independent artifact
+    task for a DIFFERENT artifact in the SAME analysis, may still be
+    concurrently reading that same canonical tree. Worker A's failure
+    handling must mark source_status "unavailable" WITHOUT ever removing
+    the canonical tree itself - only a genuine terminal cleanup
+    (completed/cancelled/failed) may do that."""
+    from app.services import source_archive
+
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+    canonical_dir = tmp_path / "sources" / "1"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "app.py").write_text("print('still here')\n")
+    source_archive._ready_marker(canonical_dir).touch()
+
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(
+        db, alice, status="processing", source_kind="github",
+        source_reference="https://github.com/acme/project", source_status="ready",
+    )
+
+    handled = analysis_task._record_optional_source_failure(
+        db, analysis, SourceInputError("published source tree unexpectedly unavailable"),
+        generation=0, remove_prepared_source=False,
+    )
+
+    assert handled is True
+    assert analysis.source_status == "unavailable"
+    # The canonical tree Worker B might still be reading survives -
+    # Worker A's artifact-level failure never touched it.
+    assert canonical_dir.exists()
+    assert (canonical_dir / "app.py").exists()
+    assert source_archive._ready_marker(canonical_dir).exists()

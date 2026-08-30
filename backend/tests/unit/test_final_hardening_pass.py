@@ -513,9 +513,9 @@ def test_source_index_is_not_rebuilt_once_per_artifact(tmp_path, monkeypatch):
 
     monkeypatch.setattr("app.services.source_index.os.walk", counting_walk)
 
-    first = source_archive.prepare_source("github", "https://github.com/acme/project", 42)
-    second = source_archive.prepare_source("github", "https://github.com/acme/project", 42)
-    third = source_archive.prepare_source("github", "https://github.com/acme/project", 42)
+    first = source_archive.prepare_source("github", "https://github.com/acme/project", 42, 0)
+    second = source_archive.prepare_source("github", "https://github.com/acme/project", 42, 0)
+    third = source_archive.prepare_source("github", "https://github.com/acme/project", 42, 0)
 
     assert len(walk_calls) == 1  # only the very first build_index() walked the tree
     assert set(first.by_path) == set(second.by_path) == set(third.by_path) == {"app/main.py"}
@@ -536,8 +536,8 @@ def test_process_local_cache_skips_even_the_manifest_read(tmp_path, monkeypatch)
     analysis = SimpleNamespace(id=123, source_kind="zip", source_reference=str(tmp_path / "x.zip"))
     monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", lambda ref: None)
 
-    first = analysis_task._prepare_source_index(analysis, 0)
-    second = analysis_task._prepare_source_index(analysis, 0)
+    first = analysis_task._acquire_source_index(analysis, 0)
+    second = analysis_task._acquire_source_index(analysis, 0)
 
     assert first is second
     assert len(calls) == 1

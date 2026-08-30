@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { AuthProvider } from './context/AuthContext'
 import { useAuth } from './context/useAuth'
 import { CriticalOperationProvider } from './context/CriticalOperationContext'
@@ -13,9 +13,12 @@ import ServiceUnavailablePage from './pages/ServiceUnavailablePage'
 import AppShell from './components/AppShell'
 
 function Routes() {
-  const { pathname, navigate } = useRouter()
-  const { status, unavailable, refreshSession } = useAuth()
   const { locked } = useCriticalOperation()
+  // blockPopState=locked: a real browser Back/Forward (or a mobile OS
+  // history-back gesture) must not even change the address bar while a
+  // critical operation is in flight - see useRouter's own docstring.
+  const { pathname, navigate } = useRouter(locked)
+  const { status, unavailable, refreshSession } = useAuth()
 
   // Remembers the pathname as of the last UNLOCKED render, so a browser
   // Back/Forward navigation mid-upload changes the address bar but not
@@ -28,6 +31,26 @@ function Routes() {
     setFrozenPathname(pathname)
   }
   const effectivePathname = locked ? frozenPathname : pathname
+
+  // A 503 discovered by some OTHER request while an upload held the lock
+  // is exactly the kind of stale outage state that must not immediately
+  // paint ServiceUnavailablePage the instant the lock releases - the
+  // backend may already have recovered by then. On the specific
+  // locked->unlocked transition, while `unavailable` is (still) true, do
+  // ONE bounded revalidation instead of trusting that stale flag: neither
+  // a retry loop nor a busy-poll, just a single refreshSession() call
+  // gated by this one transition, which itself can only ever fire once
+  // per upload (locked can only go true->false once per upload cycle).
+  const [revalidatingAfterUpload, setRevalidatingAfterUpload] = useState(false)
+  const wasLockedRef = useRef(locked)
+  useEffect(() => {
+    const wasLocked = wasLockedRef.current
+    wasLockedRef.current = locked
+    if (wasLocked && !locked && unavailable) {
+      setRevalidatingAfterUpload(true)
+      refreshSession().finally(() => setRevalidatingAfterUpload(false))
+    }
+  }, [locked, unavailable, refreshSession])
 
   // `locked` can only ever be true once AppShell (and the
   // NewInvestigationPage inside it) is already mounted and has called
@@ -43,7 +66,10 @@ function Routes() {
   // A confirmed backend 503 (core DB/service unavailable) overrides every
   // other route - History, current Analysis state, and auth verification
   // are all unusable without the DB, so nothing else here can be trusted.
-  if (unavailable) {
+  // Deferred while the one bounded post-upload revalidation above is
+  // still in flight, so a stale outage flag from during the upload cannot
+  // paint this over a backend that has already recovered.
+  if (unavailable && !revalidatingAfterUpload) {
     return <ServiceUnavailablePage onRetry={refreshSession} />
   }
 

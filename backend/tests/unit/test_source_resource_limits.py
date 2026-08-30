@@ -131,7 +131,7 @@ def test_prepare_source_never_indexes_git_metadata(tmp_path, monkeypatch):
     _fake_git_clone(monkeypatch)
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
 
-    index = prepare_source("github", "https://github.com/acme/project", 501)
+    index = prepare_source("github", "https://github.com/acme/project", 501, 0)
 
     assert set(index.by_path) == {"app/main.py"}
     assert not any(path.startswith(".git/") for path in index.by_path)
@@ -205,7 +205,7 @@ def test_normal_small_cloned_tree_passes_validation_and_indexes(tmp_path, monkey
     _fake_git_clone(monkeypatch, extra_files={"app/utils.py": "def helper(): pass\n"})
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
 
-    index = prepare_source("github", "https://github.com/acme/project", 502)
+    index = prepare_source("github", "https://github.com/acme/project", 502, 0)
 
     assert set(index.by_path) == {"app/main.py", "app/utils.py"}
 
@@ -223,7 +223,7 @@ def test_failed_source_preparation_removes_prepared_dir_marker_and_manifest(tmp_
     monkeypatch.setattr(source_archive, "build_index", failing_build_index)
 
     with pytest.raises(RuntimeError, match="simulated index-build failure"):
-        prepare_source("github", "https://github.com/acme/project", 503)
+        prepare_source("github", "https://github.com/acme/project", 503, 0)
 
     dest = tmp_path / "sources" / "503"
     marker = tmp_path / "sources" / "503.ready"
@@ -253,7 +253,7 @@ def test_failed_zip_preparation_does_not_delete_the_staged_zip(tmp_path, monkeyp
     monkeypatch.setattr(source_archive, "build_index", failing_build_index)
 
     with pytest.raises(RuntimeError):
-        prepare_source("zip", str(archive), 504)
+        prepare_source("zip", str(archive), 504, 0)
 
     assert archive.exists()
 
@@ -322,7 +322,7 @@ def test_prepared_source_still_correlates_stack_frames(tmp_path, monkeypatch):
     _fake_git_clone(monkeypatch)
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
 
-    index = prepare_source("github", "https://github.com/acme/project", 505)
+    index = prepare_source("github", "https://github.com/acme/project", 505, 0)
 
     event = ParsedEvent(line_number=1, raw_line="ERROR failure", module=None)
     event.stack_frames = [StackFrame(file="app/main.py", line=1, function="run")]
@@ -338,7 +338,7 @@ def test_source_context_read_failure_keeps_match_without_snippet(tmp_path, monke
 
     _fake_git_clone(monkeypatch)
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
-    index = prepare_source("github", "https://github.com/acme/project", 506)
+    index = prepare_source("github", "https://github.com/acme/project", 506, 0)
 
     # The file was indexed successfully but became unreadable/unavailable
     # before optional snippet enrichment.  The diagnostic match itself and
@@ -591,9 +591,9 @@ def test_zip_resume_after_staged_upload_removed_still_works(tmp_path, monkeypatc
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("app/main.py", "print('hi')\n")
 
-    first = prepare_source("zip", str(archive), 506)
+    first = prepare_source("zip", str(archive), 506, 0)
     archive.unlink()  # simulates _remove_staged_source_archive already having run
 
-    second = prepare_source("zip", str(archive), 506)
+    second = prepare_source("zip", str(archive), 506, 0)
 
     assert set(first.by_path) == set(second.by_path) == {"app/main.py"}

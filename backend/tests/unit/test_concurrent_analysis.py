@@ -228,7 +228,7 @@ def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
     # doesn't close the task's own `db` out from under the rest of this
     # test, matching real production session isolation.
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
-    monkeypatch.setattr(analysis_task, "_prepare_source_index", Mock(return_value=None))
+    monkeypatch.setattr(analysis_task, "_load_ready_source_index_for_artifact", Mock(return_value=None))
 
     def boom(**_kwargs):
         raise RuntimeError("parser exploded")
@@ -308,11 +308,15 @@ def test_sequential_and_per_task_processing_produce_equivalent_evidence(monkeypa
     def _fenced_db():
         db = Mock()
         # Every generation fence (_persist_artifact_batch's per-batch check,
-        # and _process_artifact's terminal-commit check) reads
-        # (status, processing_generation) via this same query shape.
+        # _process_artifact's terminal-commit check, and
+        # _artifact_mutation_authorized's setup/fallback-context checks)
+        # reads (status, processing_generation) via this same query shape.
         db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
             "processing",
             1,
+        )
+        db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+            "processing"
         )
         return db
 

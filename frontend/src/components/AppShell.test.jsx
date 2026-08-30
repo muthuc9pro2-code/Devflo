@@ -43,7 +43,17 @@ vi.mock('../pages/NewInvestigationPage', () => ({
 }))
 
 vi.mock('../pages/AnalysisPage', () => ({
-  default: ({ analysisId }) => <div>Analysis page stub {analysisId}</div>,
+  default: ({ analysisId, onStatusChange }) => (
+    <div>
+      Analysis page stub {analysisId}
+      <button
+        type="button"
+        onClick={() => onStatusChange(analysisId, 'pending')}
+      >
+        Simulate incoming pending status
+      </button>
+    </div>
+  ),
 }))
 
 import AppShell from './AppShell'
@@ -93,10 +103,21 @@ describe('AppShell upload navigation lock', () => {
   })
 
   it('before upload starts: New investigation, History, and Logout all navigate normally', async () => {
-    await renderShell()
+    const { rerender } = await renderShell()
 
     fireEvent.click(screen.getByRole('link', { name: /log\.txt/ }))
     expect(mocks.navigate).toHaveBeenLastCalledWith('/investigation/7')
+
+    // The real app re-renders AppShell with the new pathname once its own
+    // router state updates from that navigate() call - simulate that here
+    // so the next click below is a genuine "New investigation" click from
+    // a DIFFERENT page, not a same-page re-click (which is deliberately a
+    // no-op - see the dedicated re-click test further down).
+    rerender(
+      <CriticalOperationProvider>
+        <AppShell pathname="/investigation/7" navigate={mocks.navigate} />
+      </CriticalOperationProvider>,
+    )
 
     fireEvent.click(screen.getByRole('button', { name: 'New investigation' }))
     expect(mocks.navigate).toHaveBeenLastCalledWith('/new')
@@ -181,8 +202,13 @@ describe('AppShell upload navigation lock', () => {
     const newInvestigationButton = screen.getByRole('button', { name: 'New investigation' })
     expect(newInvestigationButton.disabled).toBe(false)
 
+    // Already on /new (the failed upload never navigated away) - clicking
+    // New investigation here must be a no-op (see the dedicated re-click
+    // test below), not a remount that would erase the user's in-progress
+    // retry state. This is the real-world case that no-op exists for.
     fireEvent.click(newInvestigationButton)
-    expect(mocks.navigate).toHaveBeenLastCalledWith('/new')
+    expect(mocks.navigate).not.toHaveBeenCalled()
+    expect(screen.getByText('New investigation stub')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
     await act(async () => {})
@@ -214,5 +240,142 @@ describe('AppShell upload navigation lock', () => {
     // Closing the drawer is harmless and stays available (two controls
     // share this label: the sidebar's own close button and the scrim).
     fireEvent.click(screen.getAllByRole('button', { name: 'Close navigation' })[0])
+  })
+})
+
+describe('AppShell "New investigation" re-click while already on /new', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    mocks.getAnalysisHistory.mockResolvedValue({ items: [], next_cursor: null })
+  })
+
+  it('is a no-op: no navigate() call, and NewInvestigationPage is not remounted', async () => {
+    await renderShell('/new')
+
+    const stub = screen.getByText('New investigation stub')
+    fireEvent.click(screen.getByRole('button', { name: 'New investigation' }))
+
+    expect(mocks.navigate).not.toHaveBeenCalled()
+    // Same DOM node - proves NewInvestigationPage was never remounted
+    // (a remount would erase selected files/folder selection/source ZIP/
+    // GitHub URL/local form state, which this no-op exists to prevent).
+    expect(screen.getByText('New investigation stub')).toBe(stub)
+  })
+
+  it('still closes the mobile drawer when open, even though navigation is a no-op', async () => {
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    await renderShell('/new')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open navigation' }))
+    fireEvent.click(screen.getByRole('button', { name: 'New investigation' }))
+
+    expect(mocks.navigate).not.toHaveBeenCalled()
+    expect(document.getElementById('devflo-sidebar').className).not.toContain('open')
+  })
+
+  it('navigating to /new from a DIFFERENT page still works normally', async () => {
+    await renderShell('/investigation/7')
+
+    fireEvent.click(screen.getByRole('button', { name: 'New investigation' }))
+
+    expect(mocks.navigate).toHaveBeenLastCalledWith('/new')
+  })
+})
+
+describe('AppShell liveStatusRef contract', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+  })
+
+  it('an incoming "pending" that the display correctly rejects is not remembered as the live status either', async () => {
+    // The displayed item starts "processing"; a later History re-fetch
+    // still reporting "pending" (a real race: the server may not have
+    // caught up to a live event yet) must not regress the display -
+    // proven twice: once directly (the live event itself never regresses
+    // the display), and once indirectly through a SUBSEQUENT History
+    // merge, which is what actually exposes the bug this guards against.
+    // Before the fix, handleStatusChange wrote the RAW incoming "pending"
+    // into liveStatusRef even though the paired display update rejected
+    // it - a later loadHistory() merge would then read that raw "pending"
+    // out of liveStatusRef and, since reconcileHistoryItem only protects
+    // against a "processing" EXISTING status (not a "pending" one),
+    // accept it, regressing the display.
+    mocks.getAnalysisHistory.mockResolvedValue({
+      items: [
+        {
+          analysis_id: 7,
+          status: 'processing',
+          original_filename: 'log.txt',
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+      next_cursor: null,
+    })
+    await renderShell('/investigation/7')
+
+    expect(screen.getByText('Analyzing')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate incoming pending status' }))
+    expect(screen.getByText('Analyzing')).toBeTruthy()
+    expect(screen.queryByText('Queued')).toBeNull()
+
+    // A later History refresh reporting the SAME stale "pending" from the
+    // server must still not regress the display, because liveStatusRef
+    // itself must already hold the reconciled "processing" value, not the
+    // raw "pending" the live event carried.
+    await act(async () => {
+      window.dispatchEvent(new Event('devflo:history-refresh'))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    })
+
+    expect(screen.getByText('Analyzing')).toBeTruthy()
+    expect(screen.queryByText('Queued')).toBeNull()
+  })
+})
+
+describe('AppShell deferred service-unavailable revalidation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    mocks.getAnalysisHistory.mockResolvedValue({ items: [], next_cursor: null })
+  })
+
+  it('releasing the upload lock does not itself force a service-unavailable takeover - App.jsx owns that revalidation', async () => {
+    // AppShell itself has no opinion on `unavailable` - that takeover
+    // lives one level up, in App.jsx (see App.test.jsx's own deferred-
+    // revalidation coverage). This test only confirms AppShell's side of
+    // the contract: releasing uploadNavigationLocked via
+    // onUploadingChange(false) completes normally and controls become
+    // interactive again, which is the precondition the App.jsx-level
+    // revalidation logic depends on actually firing.
+    await renderShell('/new')
+    beginUpload()
+
+    const newInvestigationButton = screen.getByRole('button', { name: 'New investigation' })
+    expect(newInvestigationButton.disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate upload failure' }))
+    await act(async () => {})
+
+    expect(newInvestigationButton.disabled).toBe(false)
   })
 })

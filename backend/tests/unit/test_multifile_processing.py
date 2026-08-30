@@ -13,14 +13,23 @@ FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
 
 def _fenced_mock_db(generation: int = 0) -> Mock:
     """A Mock db whose generation-fence query (status, processing_generation)
-    - used by both _persist_artifact_batch's per-batch fence and
-    _process_artifact's terminal-commit fence - reports "processing" at
-    the given generation, so direct calls to these functions in this file
-    (which never touch a real Analysis row) still pass the fence."""
+    - used by _persist_artifact_batch's per-batch fence,
+    _process_artifact's terminal-commit fence, and
+    _artifact_mutation_authorized's setup/fallback-context fences -
+    reports "processing" at the given generation, so direct calls to these
+    functions in this file (which never touch a real Analysis row) still
+    pass the fence. Also configures the artifact-ownership half of
+    _artifact_mutation_authorized's two-query check (Analysis via
+    with_for_update().first(), then AnalysisArtifact via
+    with_for_update().scalar()) to report "processing" too - both queries
+    share this same Mock chain regardless of which model they're against."""
     db = Mock()
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
         "processing",
         generation,
+    )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        "processing"
     )
     return db
 
@@ -164,8 +173,8 @@ def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
     monkeypatch.setattr(analysis_task, "prepare_source", prepare)
     monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", remove)
 
-    assert analysis_task._prepare_source_index(analysis, 0) is index
-    prepare.assert_called_once_with("zip", "uploads/source.zip", 9)
+    assert analysis_task._acquire_source_index(analysis, 0) is index
+    prepare.assert_called_once_with("zip", "uploads/source.zip", 9, 0)
     remove.assert_called_once_with("uploads/source.zip")
 
 
@@ -174,7 +183,7 @@ def test_log_only_analysis_does_not_prepare_source(monkeypatch):
     monkeypatch.setattr(analysis_task, "prepare_source", prepare)
 
     assert (
-        analysis_task._prepare_source_index(
+        analysis_task._acquire_source_index(
             SimpleNamespace(id=9, source_kind=None, source_reference=None), 0
         )
         is None

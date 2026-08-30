@@ -6,7 +6,7 @@ from time import perf_counter
 from time import time as wall_time
 from celery import chain, chord, group
 from celery.exceptions import Retry
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 from app.core.celery_app import celery_app
 from app.core.processing_config import (
@@ -42,7 +42,9 @@ from app.services.image_text_extractor import (
 from app.services.source_archive import (
     SourceInputError,
     SourceSubsystemError,
+    cleanup_generation_source_temp,
     cleanup_prepared_source,
+    load_ready_source_index,
     prepare_source,
 )
 from app.services.source_index import correlate_event
@@ -90,20 +92,47 @@ def _is_analysis_cancelled(db: Session, analysis_id: int) -> bool:
         == "cancelled"
     )
 
-def _bail_if_cancelled(db: Session, analysis_id: int, stage: str) -> bool:
-    """Fresh, cheap (single indexed column) re-check at a finalize-stage
-    boundary where real time may have passed since analysis.status was
-    last read (Gemini calls in particular). Returns True (and logs) when
-    finalize must stop here WITHOUT touching Analysis/Evidence at all -
-    the cancel endpoint has already durably reset/cleared everything for
-    this analysis; stale finalization must never re-create result data or
-    resurrect cancelled -> completed."""
-    if _is_analysis_cancelled(db, analysis_id):
-        logger.info(
-            "Analysis %s | cancelled; stopping finalize at %s", analysis_id, stage
+def _finalizer_owns_generation(db: Session, analysis_id: int, generation: int) -> bool:
+    """Fresh, CURRENT ownership re-check for a finalize-stage boundary
+    where real time (a Gemini call in particular) may have passed since
+    ownership was last confirmed. A plain (non-locking) SELECT re-issued
+    inside the finalizer's own already-open transaction would not be
+    trustworthy here: MySQL's default REPEATABLE READ isolation means such
+    a SELECT can keep observing whatever snapshot was current when that
+    transaction began, silently missing a concurrent cancel/fail/newer-
+    generation commit made by a different session/connection in the
+    meantime. A locking read (SELECT ... FOR UPDATE) does not have that
+    problem - it always reads the latest COMMITTED row regardless of this
+    transaction's own snapshot - so this uses one, then immediately
+    commits (nothing is ever pending to write here) to release the row
+    lock right away, before returning: never held across the CPU/network
+    work this guards (a Gemini call in particular).
+
+    Checks OWNERSHIP, not merely "not cancelled": status=="processing"
+    AND processing_generation==G AND finalization_generation==G together
+    catch cancellation, failure, completion-elsewhere, stale-recovery
+    demotion, and a newer generation already claiming this analysis - not
+    just the cancel case alone."""
+    current = (
+        db.query(
+            Analysis.status,
+            Analysis.processing_generation,
+            Analysis.finalization_generation,
         )
-        return True
-    return False
+        .filter(Analysis.id == analysis_id)
+        .with_for_update()
+        .first()
+    )
+    db.commit()
+
+    if current is None:
+        return False
+    status, processing_generation, finalization_generation = current
+    return (
+        status == "processing"
+        and processing_generation == generation
+        and finalization_generation == generation
+    )
 
 
 def _finalize_commit_if_processing(
@@ -112,33 +141,52 @@ def _finalize_commit_if_processing(
     *,
     generation: int,
     result_snapshot: dict,
+    ai_analysis: dict | None,
+    processed_bytes: int,
+    last_processed_line: int,
     stage: str,
 ) -> bool:
-    """The final transactional fence for every completed-persistence branch
-    in _finalize_analysis_task() (fallback/zero-evidence/correlated/simple).
+    """The final, AUTHORITATIVE transactional fence for every
+    completed-persistence branch in _finalize_analysis_task()
+    (fallback/zero-evidence/correlated/simple) - the only place any of
+    this analysis's final output values ever become durable.
 
-    The ordinary _bail_if_cancelled() checkpoints above are plain unlocked
-    SELECTs - useful early exits, but each still leaves a check-then-commit
-    gap a concurrent cancel_analysis_and_cleanup() commit can land in
-    between the check and this function's own commit. This closes that gap
-    the same way _persist_artifact_batch's cancel-vs-Evidence fence already
-    does it (see its "Cancel-vs-Evidence-commit race fence" comment): a
-    locking read (SELECT ... FOR UPDATE) on this one Analysis row, which
-    either already observes a committed non-"processing" status, or blocks
-    until the cancel endpoint's own UPDATE commits/rolls back and then
-    observes its result - never a stale snapshot read. Also requires both
-    processing_generation and finalization_generation to still match this
-    exact execution - the durable finalization claim earlier in
-    _finalize_analysis_task already makes a second finalizer for the same
-    generation impossible, but this is the last line of defense in case
-    that invariant is ever violated.
+    Every value this analysis will ever expose as "completed" output
+    (result_snapshot, ai_analysis, processed_bytes, last_processed_line)
+    is passed in as a plain argument, computed and held in the caller's
+    OWN LOCAL VARIABLES throughout finalize - never set onto the `analysis`
+    ORM object early. That is deliberate: an ORM attribute set on this
+    session's `analysis` object before this point would be a DIRTY value
+    sitting in the session, and any earlier helper call that happens to
+    run its own db.commit() on this same session (persist_resolved_
+    identities used to do exactly this) would flush it durably before
+    ownership was ever (re-)confirmed here - exactly the bug this
+    signature closes structurally, not just by convention.
 
-    Returns False (after rolling back any pending ORM changes made earlier
-    in the branch, e.g. analysis.ai_analysis set after a Gemini call) if
-    cancellation (or, defensively, any other terminal transition) already
-    won by the time this runs - the caller must then return immediately
-    without persisting or publishing a completed result. Returns True only
-    after result_snapshot/status="completed" have been committed.
+    The _finalizer_owns_generation() checkpoints elsewhere are their own
+    short locking-read-then-release transactions - useful early exits, but
+    each still leaves a check-then-commit gap a concurrent
+    cancel_analysis_and_cleanup() commit can land in between the check and
+    this function's own commit.
+    This closes that gap the same way _persist_artifact_batch's
+    cancel-vs-Evidence fence already does it (see its "Cancel-vs-Evidence-
+    commit race fence" comment): a locking read (SELECT ... FOR UPDATE) on
+    this one Analysis row, which either already observes a committed
+    non-"processing" status, or blocks until the cancel endpoint's own
+    UPDATE commits/rolls back and then observes its result - never a stale
+    snapshot read. Also requires both processing_generation and
+    finalization_generation to still match this exact execution - the
+    durable finalization claim earlier in _finalize_analysis_task already
+    makes a second finalizer for the same generation impossible, but this
+    is the last line of defense in case that invariant is ever violated.
+
+    Returns False (after rolling back - nothing was ever set on `analysis`
+    to roll back in the first place, by construction) if cancellation (or,
+    defensively, any other terminal transition) already won by the time
+    this runs - the caller must then discard its locally-computed output
+    and return immediately without publishing a completed result. Returns
+    True only after every value above has been committed together with
+    status="completed".
     """
     current_status, current_processing_generation, current_finalization_generation = (
         db.query(
@@ -168,6 +216,9 @@ def _finalize_commit_if_processing(
         return False
 
     analysis.result_snapshot = result_snapshot
+    analysis.ai_analysis = ai_analysis
+    analysis.processed_bytes = processed_bytes
+    analysis.last_processed_line = last_processed_line
     analysis.status = "completed"
     db.commit()
     return True
@@ -253,6 +304,43 @@ def _bump_processing_heartbeat(analysis_id: int, generation: int) -> None:
         )
     finally:
         heartbeat_db.close()
+
+
+def _return_analysis_to_pending_after_publish_failure(
+    analysis_id: int, generation: int
+) -> bool:
+    """Fences and demotes analysis_id/generation back to "pending", the
+    same way stale-processing recovery does (see
+    _claim_and_demote_stale_processing) - used when process_analysis wins
+    its pending->processing claim but then fails to actually publish this
+    generation's only child work (the direct finalize_only dispatch, or
+    the source-prep/artifact-group/chord workflow) to the broker. Reuses
+    the exact same demotion logic recovery uses (including its IMAGE-
+    artifact restart-only reset and its source-"preparing" release) rather
+    than a parallel implementation, scoped to this one specific
+    (analysis_id, generation) pair via an ordinary equality filter instead
+    of a heartbeat-age predicate - there is nothing to age-check here, we
+    already know synchronously, right now, that this generation's
+    publication failed.
+
+    Returns True if this generation was actually fenced/demoted (i.e. a
+    newer generation or a terminal state had not already won first, which
+    is not expected here since nothing else has run yet for this
+    generation, but is still checked for the same reason every other
+    demotion path checks it)."""
+    demote_db = sessionLocal(expire_on_commit=False)
+    try:
+        stale_filter = and_(
+            Analysis.id == analysis_id,
+            Analysis.status == "processing",
+            Analysis.processing_generation == generation,
+        )
+        claimed = _claim_and_demote_stale_processing(
+            demote_db, stale_filter, datetime.now(timezone.utc)
+        )
+        return analysis_id in claimed
+    finally:
+        demote_db.close()
 
 
 @celery_app.task
@@ -375,25 +463,58 @@ def process_analysis(analysis_id: int):
 
     dispatch_start = wall_time()
 
-    if finalize_only:
-        logger.info(
-            "Analysis %s | every artifact already terminal; finalizing directly",
-            analysis_id,
+    try:
+        if finalize_only:
+            logger.info(
+                "Analysis %s | every artifact already terminal; finalizing directly",
+                analysis_id,
+            )
+            _finalize_analysis_task.delay([], analysis_id, generation, dispatch_start)
+            return
+
+        artifact_group = group(
+            _process_artifact_task.si(analysis_id, artifact_id, generation)
+            for artifact_id in artifact_ids
         )
-        _finalize_analysis_task.delay([], analysis_id, generation, dispatch_start)
+        workflow = chord(
+            artifact_group, _finalize_analysis_task.s(analysis_id, generation, dispatch_start)
+        )
+        if needs_source_prep:
+            workflow = chain(_prepare_source_task.si(analysis_id, generation), workflow)
+
+        workflow.apply_async()
+    except Exception:
+        # The pending->processing claim above already won and established
+        # generation `generation` - but publishing this generation's ONLY
+        # child work (the direct finalize_only dispatch, or the source-
+        # prep/artifact-group/chord workflow) to the broker itself just
+        # failed. Left alone, this Analysis would sit "processing" forever
+        # with zero children ever having been dispatched - nothing would
+        # ever move it forward again except manual intervention. Fence
+        # this generation and return the row to a recoverable "pending"
+        # state (the exact same mechanism stale-processing recovery uses),
+        # then make one immediate, best-effort redispatch attempt so a
+        # transient broker blip does not have to wait for the 30-minute
+        # pending "queue wait" recovery window - if that immediate retry
+        # also fails, the analysis is left safely "pending" for the
+        # existing recovery net to pick up later, exactly like a failed
+        # initial enqueue at the API layer already does.
+        logger.exception(
+            "Analysis %s | generation %s could not publish its workflow to "
+            "the broker; returning to pending for recovery",
+            analysis_id,
+            generation,
+        )
+        if _return_analysis_to_pending_after_publish_failure(analysis_id, generation):
+            try:
+                process_analysis.delay(analysis_id)
+            except Exception:
+                logger.exception(
+                    "Analysis %s | immediate republish attempt also failed; "
+                    "will be picked up by stale-analysis recovery",
+                    analysis_id,
+                )
         return
-
-    artifact_group = group(
-        _process_artifact_task.si(analysis_id, artifact_id, generation)
-        for artifact_id in artifact_ids
-    )
-    workflow = chord(
-        artifact_group, _finalize_analysis_task.s(analysis_id, generation, dispatch_start)
-    )
-    if needs_source_prep:
-        workflow = chain(_prepare_source_task.si(analysis_id, generation), workflow)
-
-    workflow.apply_async()
 
     logger.info(
         "Analysis %s | dispatched %s artifact task(s)%s (worker_concurrency=%s)",
@@ -452,39 +573,85 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
         if artifact.status in ("completed", "resource_limited", "processing_error"):
             return 0
 
-        # Atomic artifact claim: only a still-"pending" artifact can be
-        # claimed. Two concurrent invocations for the same artifact
-        # (broker redelivery, or a recovery redispatch racing a still-live
-        # original) can therefore never both start streaming/parsing the
-        # same byte range - the loser's UPDATE affects zero rows and it
-        # returns without touching Evidence or the checkpoint at all.
+        # Atomic artifact claim, combined with the PARENT Analysis's
+        # generation authority in the SAME UPDATE statement - not two
+        # separate checks with a window between them. The earlier plain
+        # read of analysis.status/processing_generation above is only a
+        # fast-path optimization (skip even attempting a claim that is
+        # already hopeless); it is NOT what makes this safe, since a
+        # cancellation/recovery commit could land in the gap between that
+        # read and this claim. The EXISTS subquery is evaluated as part of
+        # this one atomic UPDATE, so a duplicate/stale invocation whose
+        # parent generation is invalidated (by cancellation, failure, or
+        # recovery demoting/advancing the generation) between its own
+        # earlier read and this statement still loses the claim here -
+        # there is no separate window left to race into. Two concurrent
+        # invocations for the same artifact (broker redelivery, or a
+        # recovery redispatch racing a still-live original) can therefore
+        # never both start streaming/parsing the same byte range - the
+        # loser's UPDATE affects zero rows and it returns without touching
+        # Evidence or the checkpoint at all. No lock is held here across
+        # file reads/parsing/OCR below - the UPDATE's own row lock is
+        # released at this transaction's commit, immediately after.
         claim = db.execute(
             update(AnalysisArtifact)
-            .where(AnalysisArtifact.id == artifact_id, AnalysisArtifact.status == "pending")
+            .where(
+                AnalysisArtifact.id == artifact_id,
+                AnalysisArtifact.analysis_id == analysis_id,
+                AnalysisArtifact.status == "pending",
+                exists().where(
+                    Analysis.id == analysis_id,
+                    Analysis.status == "processing",
+                    Analysis.processing_generation == generation,
+                ),
+            )
             .values(status="processing")
             .execution_options(synchronize_session=False)
         )
         db.commit()
         if claim.rowcount != 1:
             logger.info(
-                "Analysis %s | artifact %s not claimed (status=%s); "
-                "another execution already owns it",
+                "Analysis %s | artifact %s not claimed (status=%s); another "
+                "execution already owns it, or generation %s no longer "
+                "has parent authority",
                 analysis_id,
                 artifact_id,
                 artifact.status,
+                generation,
             )
             return 0
         db.refresh(artifact)
 
         _bump_processing_heartbeat(analysis_id, generation)
 
-        try:
-            source_index = _prepare_source_index(analysis, generation)
-        except (SourceInputError, SourceSubsystemError) as error:
-            db.rollback()
-            if not _record_optional_source_failure(db, analysis, error, generation=generation):
-                return 0
-            source_index = None
+        # READ-ONLY: an artifact worker never acquires/re-acquires source
+        # itself (item 24) - only _prepare_source_task, the single durable
+        # source-preparation owner, may clone/extract/publish. This only
+        # ever loads an already-published canonical tree.
+        source_index = _load_ready_source_index_for_artifact(analysis, generation)
+        if (
+            source_index is None
+            and getattr(analysis, "source_kind", None)
+            and getattr(analysis, "source_status", None) == "ready"
+        ):
+            # Marked "ready" in the DB but the canonical tree/manifest is
+            # unexpectedly missing on this filesystem/worker - handled
+            # through the same optional-source failure/recovery contract
+            # as any other source problem, never as license to acquire
+            # source here.
+            _record_optional_source_failure(
+                db,
+                analysis,
+                SourceSubsystemError(
+                    "Published source tree is unexpectedly unavailable"
+                ),
+                generation=generation,
+                # A sibling artifact task for this SAME analysis may still
+                # be concurrently reading the canonical tree right now -
+                # never rmtree it from here (item 7). Only the terminal
+                # cleanup paths (completed/cancelled/failed) may remove it.
+                remove_prepared_source=False,
+            )
 
         global_line_number = artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
 
@@ -560,11 +727,29 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
         db.close()
 
 
-@celery_app.task
-def _prepare_source_task(analysis_id: int, generation: int) -> None:
+# A duplicate/redelivered _prepare_source_task invocation for the SAME
+# generation (task_acks_late + task_reject_on_worker_lost can genuinely
+# redeliver a task twice if a worker dies mid-execution without acking)
+# that finds preparation already "preparing" retries at a bounded
+# interval rather than busy-spinning - 12 x 10s = 120s, comfortably longer
+# than a typical clone/extract (GITHUB_CLONE_TIMEOUT_SECONDS=60s) without
+# holding a worker slot in a tight loop.
+_SOURCE_PREPARING_RETRY_MAX = 12
+_SOURCE_PREPARING_RETRY_DELAY_SECONDS = 10
+
+
+@celery_app.task(bind=True, max_retries=_SOURCE_PREPARING_RETRY_MAX)
+def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
     """Run source ZIP/GitHub prep+indexing exactly once, before any artifact
     task starts (see process_analysis docstring for why this cannot safely
     run concurrently with artifact processing).
+
+    Single durable ownership: acquisition (clone/extract/publish) may only
+    ever be performed by whichever invocation wins the atomic
+    source_status NULL -> "preparing" claim below, scoped to this exact
+    (analysis_id, processing_generation) pair. Artifact workers never
+    acquire source themselves (see _load_ready_source_index_for_artifact);
+    this task is the ONLY source-preparation owner in the whole system.
     """
     db = sessionLocal(expire_on_commit=False)
     try:
@@ -591,53 +776,124 @@ def _prepare_source_task(analysis_id: int, generation: int) -> None:
                 analysis_id,
             )
             return
+        if analysis.source_status == "ready":
+            logger.info(
+                "Analysis %s | optional source already ready; nothing to "
+                "prepare",
+                analysis_id,
+            )
+            return
 
         _bump_processing_heartbeat(analysis_id, generation)
 
-        source_prep_start = perf_counter()
-        _prepare_source_index(analysis, generation)
-
-        current_status, current_generation = (
-            db.query(Analysis.status, Analysis.processing_generation)
-            .filter(Analysis.id == analysis_id)
-            .first()
-        )
-        if current_status != "processing" or current_generation != generation:
-            logger.info(
-                "Analysis %s | generation %s superseded (status=%s) during "
-                "source preparation; discarding",
-                analysis_id,
-                generation,
-                current_status,
+        # Atomic ownership claim: only the ONE invocation whose UPDATE
+        # actually flips a still-NULL source_status may acquire source for
+        # this generation. source_status starts NULL for an
+        # never-yet-attempted analysis, and is reset back to NULL by
+        # stale-recovery demotion if a PRIOR, now-abandoned generation's
+        # acquisition never finished (see
+        # _claim_and_demote_stale_processing) - so a fresh generation
+        # always finds a claimable NULL, never stuck behind a dead
+        # generation's stale "preparing".
+        claim = db.execute(
+            update(Analysis)
+            .where(
+                Analysis.id == analysis_id,
+                Analysis.status == "processing",
+                Analysis.processing_generation == generation,
+                Analysis.source_status.is_(None),
             )
-            _source_index_process_cache.pop((analysis_id, generation), None)
-            try:
-                cleanup_prepared_source(analysis_id)
-            except OSError:
-                logger.warning(
-                    "Analysis %s | could not clean up source prepared for a "
-                    "since-superseded execution",
-                    analysis_id,
-                    exc_info=True,
+            .values(source_status="preparing")
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+        if claim.rowcount != 1:
+            current = (
+                db.query(
+                    Analysis.status,
+                    Analysis.processing_generation,
+                    Analysis.source_status,
                 )
+                .filter(Analysis.id == analysis_id)
+                .first()
+            )
+            current_status, current_generation, current_source_status = (
+                current if current is not None else (None, None, None)
+            )
+            if current_status != "processing" or current_generation != generation:
+                logger.info(
+                    "Analysis %s | generation %s superseded (status=%s) "
+                    "before source preparation could be claimed",
+                    analysis_id, generation, current_status,
+                )
+                return
+            if current_source_status in ("ready", "unavailable"):
+                logger.info(
+                    "Analysis %s | source already %s; nothing to prepare",
+                    analysis_id, current_source_status,
+                )
+                return
+            # current_source_status == "preparing": a duplicate/redelivered
+            # invocation for this SAME generation found preparation
+            # already owned (by itself, an earlier delivery of the exact
+            # same message). Never clone/extract/remove source here -
+            # just wait, bounded, for the owner to finish.
+            logger.info(
+                "Analysis %s | source preparation for generation %s already "
+                "owned; retrying in %ss (attempt %s/%s)",
+                analysis_id, generation, _SOURCE_PREPARING_RETRY_DELAY_SECONDS,
+                self.request.retries + 1, _SOURCE_PREPARING_RETRY_MAX,
+            )
+            raise self.retry(countdown=_SOURCE_PREPARING_RETRY_DELAY_SECONDS)
+        db.refresh(analysis)
+
+        source_prep_start = perf_counter()
+        try:
+            _acquire_source_index(analysis, generation)
+        except (SourceInputError, SourceSubsystemError) as error:
+            db.rollback()
+            _record_optional_source_failure(db, analysis, error, generation=generation)
             return
 
-        analysis.source_status = "ready"
-        analysis.source_failure_reason = None
+        # Atomic, generation-conditional publish of the "ready" transition -
+        # a fresh, CURRENT locking read decides this, never the `analysis`
+        # ORM object read (possibly minutes ago, before a slow clone/
+        # extract) at the top of this function. If a newer generation (or
+        # cancellation/failure) has since won, this UPDATE simply matches
+        # zero rows - the tree this invocation just acquired was already
+        # published into the shared canonical location by prepare_source's
+        # own atomic os.replace()+marker-recheck, so there is nothing of
+        # this invocation's own to discard, and nothing here ever deletes
+        # the canonical tree a newer generation may already be relying on.
+        claim = db.execute(
+            update(Analysis)
+            .where(
+                Analysis.id == analysis_id,
+                Analysis.status == "processing",
+                Analysis.processing_generation == generation,
+                Analysis.source_status == "preparing",
+            )
+            .values(source_status="ready", source_failure_reason=None)
+            .execution_options(synchronize_session=False)
+        )
         db.commit()
+        if claim.rowcount != 1:
+            logger.info(
+                "Analysis %s | generation %s superseded before source could "
+                "be marked ready; leaving the published tree in place",
+                analysis_id, generation,
+            )
+            _invalidate_source_index_cache(analysis_id)
+            return
+
         logger.info(
             "Analysis %s | source prep (%s) completed in %.2fs",
             analysis_id,
             analysis.source_kind,
             perf_counter() - source_prep_start,
         )
-    except (SourceInputError, SourceSubsystemError) as error:
-        db.rollback()
-        analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-        if analysis is None:
-            return
-        _record_optional_source_failure(db, analysis, error, generation=generation)
-        return
+    except Retry:
+        raise
     except Exception:
         _safe_rollback(db)
         logger.exception("Analysis %s | source preparation failed", analysis_id)
@@ -648,8 +904,45 @@ def _prepare_source_task(analysis_id: int, generation: int) -> None:
         db.close()
 
 
-_FINALIZE_RETRY_MAX = 8
-_FINALIZE_RETRY_DELAY_SECONDS = 5
+def _cleanup_prepared_source_after_completion(
+    analysis_id: int, source_kind: str | None
+) -> None:
+    """Best-effort prepared-source reclaim for a successfully-finalized
+    analysis - called ONLY after that branch's own durable completion
+    commit (_finalize_commit_if_processing) has already succeeded, never
+    before. Cleaning this up any earlier (this used to run immediately
+    after the finalization claim, before identity/correlation/Gemini had
+    even started) risked destroying source state a finalizer that then
+    crashed/lost ownership/never reached a final commit could still have
+    needed to retry cleanly. A cleanup OSError here must never turn an
+    already-durably-completed analysis into anything else."""
+    if not source_kind:
+        return
+    _invalidate_source_index_cache(analysis_id)
+    try:
+        cleanup_prepared_source(analysis_id)
+    except OSError:
+        logger.warning(
+            "Analysis %s | could not clean up prepared source after "
+            "successful completion",
+            analysis_id,
+            exc_info=True,
+        )
+
+
+# 40 x 15s = 10 minutes total - deliberately much longer than the old
+# 8 x 5s (=40s) window, which could give up on a genuinely still-running
+# (not stale/abandoned) artifact well before real Devflo ingestion
+# durations for larger uploads. Kept safely under the 30-minute pending
+# "queue wait" recovery threshold, so this retry window and stale-analysis
+# recovery's own safety net never fight over the same analysis: if a
+# finalizer is retrying here, at least one artifact for this generation is
+# still non-terminal, so recover_stale_analyses's own
+# _has_active_processing_artifact/_STALE_ANALYSIS_THRESHOLD_SECONDS check
+# (300s, itself unchanged) already independently governs whether that
+# artifact - not this retry loop - looks abandoned.
+_FINALIZE_RETRY_MAX = 40
+_FINALIZE_RETRY_DELAY_SECONDS = 15
 
 
 @celery_app.task(bind=True, max_retries=_FINALIZE_RETRY_MAX)
@@ -762,16 +1055,14 @@ def _finalize_analysis_task(
 
         _bump_processing_heartbeat(analysis_id, generation)
 
-        if analysis.source_kind:
-            _invalidate_source_index_cache(analysis_id)
-            try:
-                cleanup_prepared_source(analysis_id)
-            except OSError:
-                logger.warning(
-                    "Analysis %s | could not clean up prepared source",
-                    analysis_id,
-                    exc_info=True,
-                )
+        # Prepared-source reclaim moved OUT of here (was previously right
+        # after the finalization claim, before identity/correlation/Gemini
+        # ever ran) - it now only happens after each branch's own durable
+        # completion below. Removing it this early meant a finalizer that
+        # then failed/crashed/lost ownership before reaching a final
+        # commit would have already destroyed source state a retry or a
+        # sibling could still have needed, and unnecessarily discarded
+        # recoverable state before completion was ever durable.
 
         total_start = perf_counter()
         parsed_event_count = sum(results) if results else 0
@@ -787,17 +1078,25 @@ def _finalize_analysis_task(
             .all()
         )
         artifact_count = len(position_and_lines)
-      
+
         total_lines = sum(
             last_processed_line for _position, last_processed_line in position_and_lines
         )
-        analysis.processed_bytes = (
+        # Kept as LOCAL variables - never set onto the `analysis` ORM
+        # object - until the authoritative final-persistence transaction
+        # (_finalize_commit_if_processing) actually commits them. An
+        # early-set dirty ORM attribute would risk being flushed by any
+        # earlier helper's own db.commit() on this same session (identity
+        # persistence used to do exactly this) before ownership is
+        # reconfirmed, durably persisting output for a finalizer that may
+        # not even end up winning the final race.
+        final_processed_bytes = (
             db.query(func.sum(AnalysisArtifact.processed_bytes))
             .filter(AnalysisArtifact.analysis_id == analysis_id)
             .scalar()
             or 0
         )
-        analysis.last_processed_line = max(
+        final_last_processed_line = max(
             (
                 position * _GLOBAL_LINE_NUMBER_STRIDE + last_processed_line
                 for position, last_processed_line in position_and_lines
@@ -833,8 +1132,13 @@ def _finalize_analysis_task(
             or 0
         )
 
-       
-        if _bail_if_cancelled(db, analysis_id, "before correlation"):
+        if not _finalizer_owns_generation(db, analysis_id, generation):
+            logger.info(
+                "Analysis %s | generation %s ownership lost before correlation; "
+                "stopping finalize",
+                analysis_id,
+                generation,
+            )
             return
 
         if evidence_count == 0:
@@ -861,35 +1165,57 @@ def _finalize_analysis_task(
                     fallback_artifacts,
                     artifacts=zero_evidence_artifacts,
                 )
-                if _bail_if_cancelled(db, analysis_id, "before Gemini (fallback)"):
+                if not _finalizer_owns_generation(db, analysis_id, generation):
+                    logger.info(
+                        "Analysis %s | generation %s ownership lost before "
+                        "Gemini (fallback); stopping finalize",
+                        analysis_id, generation,
+                    )
                     return
+                final_ai_analysis: dict | None
                 try:
                     gemini_result = generate_investigation_explanation(fallback_llm_context)
-                    
-                    if _bail_if_cancelled(db, analysis_id, "after Gemini (fallback)"):
+
+                    if not _finalizer_owns_generation(db, analysis_id, generation):
+                        logger.info(
+                            "Analysis %s | generation %s ownership lost after "
+                            "Gemini (fallback); discarding result, stopping finalize",
+                            analysis_id, generation,
+                        )
                         return
                     fallback_payload["ai_analysis"] = gemini_result.model_dump()
-                   
-                    analysis.ai_analysis = fallback_payload["ai_analysis"]
+                    final_ai_analysis = fallback_payload["ai_analysis"]
                 except GeminiUnavailableError:
-                   
+
                     logger.warning(
                         "Analysis %s | Gemini explanation unavailable; "
                         "completing without an explanation",
                         analysis_id,
                     )
-                    analysis.ai_analysis = None
-               
+                    final_ai_analysis = None
+
                 _bump_processing_heartbeat(analysis_id, generation)
                 source_outcome = build_source_outcome_payload(analysis)
                 if source_outcome is not None:
                     fallback_payload["source"] = source_outcome
-               
+
+                if not _finalizer_owns_generation(db, analysis_id, generation):
+                    logger.info(
+                        "Analysis %s | generation %s ownership lost before final "
+                        "persistence (fallback); discarding result, stopping finalize",
+                        analysis_id, generation,
+                    )
+                    return
                 if not _finalize_commit_if_processing(
-                    db, analysis, generation=generation, result_snapshot=fallback_payload, stage="fallback"
+                    db, analysis, generation=generation,
+                    result_snapshot=fallback_payload, ai_analysis=final_ai_analysis,
+                    processed_bytes=final_processed_bytes,
+                    last_processed_line=final_last_processed_line,
+                    stage="fallback",
                 ):
                     return
                 _cleanup_completed_diagnostic_files(db, analysis_id)
+                _cleanup_prepared_source_after_completion(analysis_id, analysis.source_kind)
 
                 logger.info(
                     "Analysis %s | zero structured evidence, %s artifact(s) "
@@ -914,10 +1240,15 @@ def _finalize_analysis_task(
             if source_outcome is not None:
                 zero_evidence_payload["source"] = source_outcome
             if not _finalize_commit_if_processing(
-                db, analysis, generation=generation, result_snapshot=zero_evidence_payload, stage="zero-evidence"
+                db, analysis, generation=generation,
+                result_snapshot=zero_evidence_payload, ai_analysis=None,
+                processed_bytes=final_processed_bytes,
+                last_processed_line=final_last_processed_line,
+                stage="zero-evidence",
             ):
                 return
             _cleanup_completed_diagnostic_files(db, analysis_id)
+            _cleanup_prepared_source_after_completion(analysis_id, analysis.source_kind)
 
             logger.info(
                 "Analysis %s | no meaningful diagnostic evidence found",
@@ -940,14 +1271,38 @@ def _finalize_analysis_task(
 
             return
 
+        if not _finalizer_owns_generation(db, analysis_id, generation):
+            logger.info(
+                "Analysis %s | generation %s ownership lost before identity "
+                "persistence; stopping finalize",
+                analysis_id, generation,
+            )
+            return
+
         identity_start = perf_counter()
-        persist_resolved_identities(db=db, analysis_id=analysis_id)
+        if not persist_resolved_identities(
+            db=db, analysis_id=analysis_id, generation=generation
+        ):
+            logger.info(
+                "Analysis %s | generation %s ownership lost during identity "
+                "persistence; stopping finalize",
+                analysis_id, generation,
+            )
+            return
         logger.info("Analysis %s | evidence identities resolved", analysis_id)
         logger.info(
             "Analysis %s | identity resolution completed in %.2fs",
             analysis_id,
             perf_counter() - identity_start,
         )
+
+        if not _finalizer_owns_generation(db, analysis_id, generation):
+            logger.info(
+                "Analysis %s | generation %s ownership lost after identity "
+                "persistence; stopping finalize",
+                analysis_id, generation,
+            )
+            return
 
         evidence_rows, total_evidence_count = select_bounded_evidence_from_db(
             db,
@@ -1006,6 +1361,7 @@ def _finalize_analysis_task(
             artifact_outcomes = (
                 db.query(
                     AnalysisArtifact.id,
+                    AnalysisArtifact.position,
                     AnalysisArtifact.original_filename,
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
@@ -1056,34 +1412,56 @@ def _finalize_analysis_task(
                 supplemental_artifacts=supplemental_artifacts,
             )
 
-            if _bail_if_cancelled(db, analysis_id, "before Gemini (correlated)"):
+            if not _finalizer_owns_generation(db, analysis_id, generation):
+                logger.info(
+                    "Analysis %s | generation %s ownership lost before Gemini "
+                    "(correlated); stopping finalize",
+                    analysis_id, generation,
+                )
                 return
+            final_ai_analysis: dict | None
             try:
                 gemini_result = generate_investigation_explanation(llm_context)
-                
-                if _bail_if_cancelled(db, analysis_id, "after Gemini (correlated)"):
+
+                if not _finalizer_owns_generation(db, analysis_id, generation):
+                    logger.info(
+                        "Analysis %s | generation %s ownership lost after Gemini "
+                        "(correlated); discarding result, stopping finalize",
+                        analysis_id, generation,
+                    )
                     return
                 correlation_payload["ai_analysis"] = gemini_result.model_dump()
-              
-                analysis.ai_analysis = correlation_payload["ai_analysis"]
+                final_ai_analysis = correlation_payload["ai_analysis"]
             except GeminiUnavailableError:
                 logger.warning(
                     "Analysis %s | Gemini explanation unavailable; "
                     "completing without an explanation",
                     analysis_id,
                 )
-                analysis.ai_analysis = None
-            
+                final_ai_analysis = None
+
             _bump_processing_heartbeat(analysis_id, generation)
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 correlation_payload["source"] = source_outcome
-           
+
+            if not _finalizer_owns_generation(db, analysis_id, generation):
+                logger.info(
+                    "Analysis %s | generation %s ownership lost before final "
+                    "persistence (correlated); discarding result, stopping finalize",
+                    analysis_id, generation,
+                )
+                return
             if not _finalize_commit_if_processing(
-                db, analysis, generation=generation, result_snapshot=correlation_payload, stage="correlated"
+                db, analysis, generation=generation,
+                result_snapshot=correlation_payload, ai_analysis=final_ai_analysis,
+                processed_bytes=final_processed_bytes,
+                last_processed_line=final_last_processed_line,
+                stage="correlated",
             ):
                 return
             _cleanup_completed_diagnostic_files(db, analysis_id)
+            _cleanup_prepared_source_after_completion(analysis_id, analysis.source_kind)
             logger.info(
                 "Analysis %s | TOTAL processing time %.2fs",
                 analysis_id,
@@ -1100,6 +1478,7 @@ def _finalize_analysis_task(
             simple_artifacts = (
                 db.query(
                     AnalysisArtifact.id,
+                    AnalysisArtifact.position,
                     AnalysisArtifact.original_filename,
                     AnalysisArtifact.detected_format,
                     AnalysisArtifact.status,
@@ -1139,35 +1518,57 @@ def _finalize_analysis_task(
                 supplemental_artifacts=simple_supplemental_artifacts,
             )
 
-            if _bail_if_cancelled(db, analysis_id, "before Gemini (simple)"):
+            if not _finalizer_owns_generation(db, analysis_id, generation):
+                logger.info(
+                    "Analysis %s | generation %s ownership lost before Gemini "
+                    "(simple); stopping finalize",
+                    analysis_id, generation,
+                )
                 return
+            final_ai_analysis: dict | None
             try:
                 gemini_result = generate_investigation_explanation(simple_llm_context)
-               
-                if _bail_if_cancelled(db, analysis_id, "after Gemini (simple)"):
+
+                if not _finalizer_owns_generation(db, analysis_id, generation):
+                    logger.info(
+                        "Analysis %s | generation %s ownership lost after Gemini "
+                        "(simple); discarding result, stopping finalize",
+                        analysis_id, generation,
+                    )
                     return
                 simple_payload["ai_analysis"] = gemini_result.model_dump()
-               
-                analysis.ai_analysis = simple_payload["ai_analysis"]
+                final_ai_analysis = simple_payload["ai_analysis"]
             except GeminiUnavailableError:
-                
+
                 logger.warning(
                     "Analysis %s | Gemini explanation unavailable; "
                     "completing without an explanation",
                     analysis_id,
                 )
-                analysis.ai_analysis = None
+                final_ai_analysis = None
 
             _bump_processing_heartbeat(analysis_id, generation)
             source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
-           
+
+            if not _finalizer_owns_generation(db, analysis_id, generation):
+                logger.info(
+                    "Analysis %s | generation %s ownership lost before final "
+                    "persistence (simple); discarding result, stopping finalize",
+                    analysis_id, generation,
+                )
+                return
             if not _finalize_commit_if_processing(
-                db, analysis, generation=generation, result_snapshot=simple_payload, stage="simple"
+                db, analysis, generation=generation,
+                result_snapshot=simple_payload, ai_analysis=final_ai_analysis,
+                processed_bytes=final_processed_bytes,
+                last_processed_line=final_last_processed_line,
+                stage="simple",
             ):
                 return
             _cleanup_completed_diagnostic_files(db, analysis_id)
+            _cleanup_prepared_source_after_completion(analysis_id, analysis.source_kind)
             logger.info(
                 "Analysis %s | TOTAL processing time %.2fs",
                 analysis_id,
@@ -1205,6 +1606,47 @@ def _capture_small_text_artifact_fallback(saved_file_path: str) -> dict | None:
     with open(saved_file_path, "rb") as handle:
         raw = handle.read(SIMPLE_FALLBACK_MAX_TEXT_BYTES)
     return capture_text_fallback_context(raw.decode("utf-8", errors="ignore"))
+
+
+def _artifact_mutation_authorized(
+    db: Session, analysis_id: int, artifact_id: int, generation: int
+) -> bool:
+    """Fresh, CURRENT authorization check immediately before a durable
+    artifact-metadata mutation (size_bytes/detected_format/
+    fallback_context/status) that lives OUTSIDE the already-fenced
+    Evidence/checkpoint batch transaction (_persist_artifact_batch) -
+    never relies on an earlier ORM read, which can go stale by the time
+    the mutation actually commits (a filesystem stat, source-index
+    preparation, or OCR/parsing may have taken real time in between).
+
+    Required lock order: the authoritative Analysis row first, then the
+    AnalysisArtifact row - both locking reads (SELECT ... FOR UPDATE), so
+    both always see the latest COMMITTED data regardless of this
+    transaction's own snapshot. The caller commits or rolls back
+    immediately after (this function never commits itself), releasing
+    both locks right away - never held across the file I/O/OCR/parsing
+    this guards.
+
+    Requires the artifact to still be "processing" (this execution's own
+    earlier claim), not merely present: a stale-recovery demotion can flip
+    it back to "pending" out from under an old, still-running worker, and
+    that must be caught here exactly like a parent-generation loss is."""
+    current = (
+        db.query(Analysis.status, Analysis.processing_generation)
+        .filter(Analysis.id == analysis_id)
+        .with_for_update()
+        .first()
+    )
+    if current is None or current[0] != "processing" or current[1] != generation:
+        return False
+
+    artifact_status = (
+        db.query(AnalysisArtifact.status)
+        .filter(AnalysisArtifact.id == artifact_id)
+        .with_for_update()
+        .scalar()
+    )
+    return artifact_status == "processing"
 
 
 def _process_artifact(
@@ -1245,6 +1687,14 @@ def _process_artifact(
     )
     artifact.detected_format = artifact_format.value
     artifact.status = "processing"
+    if not _artifact_mutation_authorized(db, analysis.id, artifact.id, generation):
+        db.rollback()
+        logger.info(
+            "Analysis %s | artifact %s | generation %s ownership lost before "
+            "setup commit; stopping",
+            analysis.id, artifact.id, generation,
+        )
+        return 0
     db.commit()
 
     parsed_count = 0
@@ -1259,6 +1709,14 @@ def _process_artifact(
         fallback_context = capture_ocr_fallback_context(extracted_text, ocr_confidence)
         if fallback_context is not None:
             artifact.fallback_context = fallback_context
+            if not _artifact_mutation_authorized(db, analysis.id, artifact.id, generation):
+                db.rollback()
+                logger.info(
+                    "Analysis %s | artifact %s | generation %s ownership lost "
+                    "before OCR fallback-context commit; stopping",
+                    analysis.id, artifact.id, generation,
+                )
+                return parsed_count
             db.commit()
         records = stream_image_events_from_text(
             extracted_text=extracted_text,
@@ -1273,6 +1731,14 @@ def _process_artifact(
             )
             if fallback_context is not None:
                 artifact.fallback_context = fallback_context
+                if not _artifact_mutation_authorized(db, analysis.id, artifact.id, generation):
+                    db.rollback()
+                    logger.info(
+                        "Analysis %s | artifact %s | generation %s ownership lost "
+                        "before fallback-context commit; stopping",
+                        analysis.id, artifact.id, generation,
+                    )
+                    return parsed_count
                 db.commit()
         records = stream_artifact_events(
             file_path=artifact.saved_file_path,
@@ -1666,7 +2132,22 @@ def _invalidate_source_index_cache(analysis_id: int) -> None:
         del _source_index_process_cache[key]
 
 
-def _prepare_source_index(analysis: Analysis, generation: int):
+def _cache_source_index(cache_key: tuple[int, int], index) -> None:
+    if len(_source_index_process_cache) >= SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES:
+        oldest_key = next(iter(_source_index_process_cache))
+        del _source_index_process_cache[oldest_key]
+    _source_index_process_cache[cache_key] = index
+
+
+def _acquire_source_index(analysis: Analysis, generation: int):
+    """ACQUISITION-CAPABLE (may clone/extract/publish, via prepare_source).
+    Reserved for the single source-preparation owner: only ever called by
+    _prepare_source_task, and only after it has already durably won the
+    "preparing" ownership claim (source_status "preparing", scoped to this
+    exact generation) - never by an artifact worker. See
+    _load_ready_source_index_for_artifact for the read-only equivalent
+    artifact tasks must use instead (item 24 of the source-ownership
+    hardening pass)."""
     if (
         not analysis.source_kind
         or not analysis.source_reference
@@ -1684,6 +2165,7 @@ def _prepare_source_index(analysis: Analysis, generation: int):
             analysis.source_kind,
             analysis.source_reference,
             analysis.id,
+            generation,
         )
     except SourceInputError:
         raise
@@ -1713,10 +2195,36 @@ def _prepare_source_index(analysis: Analysis, generation: int):
                 exc_info=True,
             )
 
-    if len(_source_index_process_cache) >= SOURCE_INDEX_PROCESS_CACHE_MAX_ENTRIES:
-        oldest_key = next(iter(_source_index_process_cache))
-        del _source_index_process_cache[oldest_key]
-    _source_index_process_cache[cache_key] = index
+    _cache_source_index(cache_key, index)
+    return index
+
+
+def _load_ready_source_index_for_artifact(analysis: Analysis, generation: int):
+    """READ-ONLY: for artifact workers (_process_artifact_task). Never
+    clones/extracts/publishes anything - only ever loads a canonical tree
+    _prepare_source_task has ALREADY durably published for this analysis.
+    Returns None whenever source_status is not currently "ready" (never
+    attempted, still "preparing", or "unavailable") - diagnostic
+    processing must continue with source_index=None in every one of those
+    cases rather than an artifact worker becoming a second source-
+    preparation owner."""
+    if (
+        not analysis.source_kind
+        or not analysis.source_reference
+        or getattr(analysis, "source_status", None) != "ready"
+    ):
+        return None
+
+    cache_key = (analysis.id, generation)
+    cached = _source_index_process_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    index = load_ready_source_index(analysis.id)
+    if index is None:
+        return None
+
+    _cache_source_index(cache_key, index)
 
     return index
 
@@ -1727,29 +2235,36 @@ def _record_optional_source_failure(
     error: SourceInputError | SourceSubsystemError,
     *,
     generation: int,
+    remove_prepared_source: bool = True,
 ) -> bool:
     """Durably degrade only the optional source subsystem.
 
-    Returns False when cancellation, or a superseding generation, already
-    won.  Database reads/commits are deliberately outside any
-    source-specific catch so core persistence failures still propagate as
-    analysis-wide failures.
-    """
-    current_status, current_generation = (
-        db.query(Analysis.status, Analysis.processing_generation)
-        .filter(Analysis.id == analysis.id)
-        .first()
-    )
-    if current_status != "processing" or current_generation != generation:
-        logger.info(
-            "Analysis %s | generation %s superseded (status=%s); ignoring "
-            "source preparation failure",
-            analysis.id,
-            generation,
-            current_status,
-        )
-        return False
+    The generation-ownership check and the source_status "unavailable"
+    write happen together, atomically (a conditional UPDATE, never a plain
+    read followed by a later write) - never a stale ORM read deciding
+    whether this write is even allowed to happen. Returns False when
+    cancellation, a superseding generation, or a concurrent transition has
+    already won (the UPDATE simply matches zero rows in that case, and
+    nothing here is written).
 
+    `remove_prepared_source` controls whether the canonical prepared tree
+    is reclaimed immediately (item 7 of the source-ownership hardening
+    pass): True (the default) is only safe for INITIAL source-preparation
+    failure, called from _prepare_source_task before any artifact worker
+    has been released - this execution is the sole owner of whatever
+    partial/private state it just produced, so removing it immediately is
+    safe and desirable. An ARTIFACT-LEVEL failure (called from
+    _process_artifact_task, e.g. a "ready" source whose canonical tree
+    turns out to be unexpectedly missing/unreadable) must pass False:
+    sibling artifact tasks for the SAME analysis may already be
+    concurrently reading that same canonical tree, so this must only ever
+    stop NEW source matching (the source_status flip itself, which
+    _persist_artifact_batch's own per-batch check already observes at the
+    next safe batch boundary) - never rmtree a tree another
+    current-generation worker may still be using. The canonical tree is
+    only ever removed at a genuine terminal cleanup point in that case
+    (completed/cancelled/failed).
+    """
     detail = (
         str(error)
         if isinstance(error, SourceInputError)
@@ -1763,19 +2278,37 @@ def _record_optional_source_failure(
     else:
         reason = f"Source code could not be prepared: {detail}"
 
-    analysis.source_status = "unavailable"
-    analysis.source_failure_reason = reason[:500]
+    claim = db.execute(
+        update(Analysis)
+        .where(
+            Analysis.id == analysis.id,
+            Analysis.status == "processing",
+            Analysis.processing_generation == generation,
+        )
+        .values(source_status="unavailable", source_failure_reason=reason[:500])
+        .execution_options(synchronize_session=False)
+    )
     db.commit()
+    if claim.rowcount != 1:
+        logger.info(
+            "Analysis %s | generation %s superseded; ignoring source "
+            "preparation failure",
+            analysis.id,
+            generation,
+        )
+        return False
+
     _source_index_process_cache.pop((analysis.id, generation), None)
 
-    try:
-        cleanup_prepared_source(analysis.id)
-    except OSError:
-        logger.warning(
-            "Analysis %s | could not clean failed optional source preparation",
-            analysis.id,
-            exc_info=True,
-        )
+    if remove_prepared_source:
+        try:
+            cleanup_prepared_source(analysis.id)
+        except OSError:
+            logger.warning(
+                "Analysis %s | could not clean failed optional source preparation",
+                analysis.id,
+                exc_info=True,
+            )
 
     if source_kind == "zip" and analysis.source_reference:
         try:
@@ -1863,13 +2396,25 @@ def _record_controlled_artifact_failure(
     superseded execution (cancelled/failed/a new generation already won)
     must never report a controlled artifact failure for the generation it
     no longer owns.
+
+    The ownership check and the failure mutation happen in ONE atomic
+    transaction, not a check followed by a separate later commit: a
+    locking read (SELECT ... FOR UPDATE), required lock order Analysis row
+    then AnalysisArtifact row, always sees the latest COMMITTED state
+    regardless of this transaction's own snapshot, and is held only until
+    this same transaction's commit/rollback immediately below - so a
+    cancellation/failure/recovery commit that lands after this check
+    started cannot be missed, and this transaction never holds that lock
+    across the artifact-file cleanup or outcome-publish that follow.
     """
     current_status, current_generation = (
         db.query(Analysis.status, Analysis.processing_generation)
         .filter(Analysis.id == analysis_id)
+        .with_for_update()
         .first()
     )
     if current_status != "processing" or current_generation != generation:
+        db.rollback()
         logger.info(
             "Analysis %s | generation %s superseded (status=%s); not "
             "recording controlled failure for artifact %s",
@@ -1886,12 +2431,24 @@ def _record_controlled_artifact_failure(
             AnalysisArtifact.id == artifact_id,
             AnalysisArtifact.analysis_id == analysis_id,
         )
+        .with_for_update()
         .first()
     )
     if artifact is None:
+        db.rollback()
         raise RuntimeError(
             f"Artifact {artifact_id} disappeared while recording controlled failure"
         )
+    if artifact.status != "processing":
+        db.rollback()
+        logger.info(
+            "Analysis %s | artifact %s ownership lost (status=%s); not "
+            "recording controlled failure",
+            analysis_id,
+            artifact_id,
+            artifact.status,
+        )
+        return
 
     db.query(Evidence).filter(
         Evidence.analysis_id == analysis_id,
@@ -1941,17 +2498,25 @@ def _cleanup_diagnostic_artifact_file(saved_file_path: str) -> None:
 
 
 def _cleanup_completed_diagnostic_files(db: Session, analysis_id: int) -> None:
-    """Best-effort removal of every "completed" diagnostic artifact's raw
-    staged bytes for this analysis - called only AFTER the final durable
-    investigation result (result_snapshot + status="completed") is already
-    committed. From that point on, Evidence + result_snapshot are the sole
-    source of truth: nothing in finalization, reconnect, or History ever
-    re-reads a diagnostic artifact's saved_file_path (parsing, fallback
-    capture, OCR, and source correlation all already ran, once, during this
-    artifact's own ingestion pass). unsupported/duplicate artifacts already
-    had their files removed at upload time; resource_limited/
-    processing_error artifacts already had theirs removed by
-    _record_controlled_artifact_failure - only "completed" remains here.
+    """Best-effort removal of every diagnostic artifact's raw staged bytes
+    for this analysis - called only AFTER the final durable investigation
+    result (result_snapshot + status="completed") is already committed.
+    From that point on, Evidence + result_snapshot are the sole source of
+    truth: nothing in finalization, reconnect, or History ever re-reads a
+    diagnostic artifact's saved_file_path (parsing, fallback capture, OCR,
+    and source correlation all already ran, once, during this artifact's
+    own ingestion pass).
+
+    Sweeps ALL of this analysis's artifacts, not only "completed" ones:
+    unsupported/duplicate artifacts already had their files removed at
+    upload time, and resource_limited/processing_error artifacts already
+    had theirs removed by _record_controlled_artifact_failure - but either
+    of those earlier best-effort deletions could itself have failed (a
+    transient permission/IO error). This is that final retry, not new
+    lifecycle semantics: _cleanup_diagnostic_artifact_file() is already
+    idempotent (missing_ok unlink), so re-attempting an artifact whose
+    file is already gone is simply a no-op, and a missing file already
+    counts as success.
 
     Failures are logged and never raised: a failure to delete temporary
     files must never turn an already-successful, already-persisted
@@ -1963,24 +2528,21 @@ def _cleanup_completed_diagnostic_files(db: Session, analysis_id: int) -> None:
     way of needing.
     """
     try:
-        completed_paths = [
+        all_paths = [
             row[0]
             for row in db.query(AnalysisArtifact.saved_file_path)
-            .filter(
-                AnalysisArtifact.analysis_id == analysis_id,
-                AnalysisArtifact.status == "completed",
-            )
+            .filter(AnalysisArtifact.analysis_id == analysis_id)
             .all()
         ]
     except Exception:
         logger.warning(
-            "Analysis %s | could not list completed diagnostic artifacts for cleanup",
+            "Analysis %s | could not list diagnostic artifacts for cleanup",
             analysis_id,
             exc_info=True,
         )
         return
 
-    for saved_file_path in completed_paths:
+    for saved_file_path in all_paths:
         _cleanup_diagnostic_artifact_file(saved_file_path)
 
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -2581,30 +3143,54 @@ def _claim_and_demote_stale_processing(db: Session, stale_filter, claimed_at: da
     the claim's WHERE clause, so two overlapping scans can never both
     demote (and therefore never both trigger a redispatch for) the same
     analysis."""
-    candidate_ids = [
-        row[0]
-        for row in db.query(Analysis.id)
+    candidates = (
+        db.query(Analysis.id, Analysis.processing_generation, Analysis.source_status)
         .filter(stale_filter)
         .order_by(Analysis.id)
         .limit(_RECOVERY_SCAN_BATCH_LIMIT)
         .all()
-    ]
+    )
 
     claimed_ids: list[int] = []
-    for analysis_id in candidate_ids:
+    for analysis_id, stale_generation, stale_source_status in candidates:
+        # A generation demoted while its own source preparation was still
+        # "preparing" (never reached "ready") must release that claim too,
+        # so the next generation this analysis gets is not stuck waiting
+        # forever on a claim only a now-fenced, abandoned execution could
+        # ever have completed (see item 24's "SOURCE preparing ACROSS
+        # RECOVERY"). No additional source-generation column is needed:
+        # this reuses the same processing_generation-scoped demotion
+        # already happening here.
+        demotion_values = dict(
+            status="pending",
+            processing_heartbeat_at=claimed_at,
+            finalization_generation=None,
+        )
+        if stale_source_status == "preparing":
+            demotion_values["source_status"] = None
+            demotion_values["source_failure_reason"] = None
+
         result = db.execute(
             update(Analysis)
             .where(Analysis.id == analysis_id, stale_filter)
-            .values(
-                status="pending",
-                processing_heartbeat_at=claimed_at,
-                finalization_generation=None,
-            )
+            .values(**demotion_values)
             .execution_options(synchronize_session=False)
         )
         if result.rowcount != 1:
             db.rollback()
             continue
+
+        if stale_source_status == "preparing":
+            try:
+                cleanup_generation_source_temp(analysis_id, stale_generation)
+            except OSError:
+                logger.warning(
+                    "Analysis %s | could not clean up generation %s's "
+                    "abandoned source staging directory",
+                    analysis_id,
+                    stale_generation,
+                    exc_info=True,
+                )
 
         stuck_artifacts = (
             db.query(AnalysisArtifact.id, AnalysisArtifact.detected_format)

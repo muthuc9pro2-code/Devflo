@@ -12,6 +12,7 @@ being silently understated by whatever subset happened to be selected.
 (choose_investigation_path performing no DB query is tested in
 test_investigation_router.py, next to the rest of that module's tests.)
 """
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
@@ -466,3 +467,119 @@ def test_legacy_reconstruction_simple_path_is_bounded_too(monkeypatch):
     assert len(payload["evidence"]) == 2
     assert payload["evidence_truncated"] is True
     db.close()
+
+
+# --- Bounded selection is invariant to Evidence.id/commit order -----------
+
+
+def _seed_reshuffled_evidence(session_factory, insertion_order):
+    """Builds ONE analysis with 3 artifacts (positions 0/1/2), 8 logically
+    identical (same severity, no distinguishing signals) events per
+    artifact - 24 total - inserted/committed in `insertion_order` (a list
+    of (artifact_position, local_line) pairs). Every event's
+    first_line_number is derived the same deterministic way real ingestion
+    derives it (artifact.position * stride + local_line), so two calls
+    with a DIFFERENT insertion_order still produce the SAME logical set of
+    (position, local_line) keys, just with different Evidence.id values
+    and a different physical commit order - exactly the two things bare
+    Evidence.id-ordered keyset pagination used to be sensitive to."""
+    stride = 10**9
+    db = session_factory()
+    unique = uuid.uuid4().hex[:8]
+    user = User(
+        username=f"t-{unique}", email=f"t-{unique}@example.com",
+        hashed_password="x", is_verified=True,
+    )
+    db.add(user)
+    db.commit()
+    analysis = Analysis(
+        user_id=user.id, original_filename="a", saved_file_path="a", status="processing",
+    )
+    db.add(analysis)
+    db.commit()
+
+    artifact_ids = {}
+    for position in (0, 1, 2):
+        artifact = AnalysisArtifact(
+            analysis_id=analysis.id, position=position, original_filename=f"artifact-{position}.log",
+            saved_file_path=f"artifact-{position}.log", size_bytes=10, status="completed",
+            last_processed_line=8, processed_bytes=10,
+        )
+        db.add(artifact)
+        db.commit()
+        artifact_ids[position] = artifact.id
+
+    base = datetime.now(timezone.utc)
+    for position, local_line in insertion_order:
+        first_line_number = position * stride + local_line
+        # Committed ONE ROW AT A TIME, in insertion_order - Evidence.id
+        # values are therefore assigned in exactly this (shuffled) order,
+        # never in first_line_number order, for either call this helper
+        # is used with.
+        db.add(
+            Evidence(
+                analysis_id=analysis.id,
+                artifact_id=artifact_ids[position],
+                correlation_key=f"ck-{position}-{local_line}",
+                fingerprint=f"fp-{position}-{local_line}",
+                source_format="generic",
+                first_line_number=first_line_number,
+                last_line_number=first_line_number,
+                # Deliberately NOT distinguished by first_seen/severity/
+                # trace/span/identity - every event scores identically
+                # except for the diversity penalty, which is exactly the
+                # order-dependent accumulator this test exercises.
+                first_seen=base,
+                severity="ERROR",
+            )
+        )
+        db.commit()
+
+    analysis_id = analysis.id
+    db.close()
+    return analysis_id
+
+
+def test_bounded_selection_over_5000_is_invariant_to_evidence_id_and_commit_order():
+    """The exact regression required by the determinism hardening pass:
+    two analyses holding the SAME logical Evidence (same first_line_number
+    set, same content) but built via reshuffled insertion/commit order -
+    so their real Evidence.id values differ and do NOT sort into
+    first_line_number order - must select the SAME logical working set.
+    max_records is set well below the 24 total so the real keyset-
+    paginated scan/heap path (not the small-analysis fast path) is
+    exercised, matching the >5000 total_count / max_records scenario this
+    proves without needing a 5000-row fixture."""
+    session_factory = _db_with_schema()
+
+    all_keys = [(position, local_line) for position in (0, 1, 2) for local_line in range(1, 9)]
+
+    import random
+
+    forward_order = list(all_keys)
+    shuffled_order = list(all_keys)
+    random.Random(1234).shuffle(shuffled_order)
+    assert forward_order != shuffled_order  # the shuffle must actually differ
+
+    analysis_id_a = _seed_reshuffled_evidence(session_factory, forward_order)
+    analysis_id_b = _seed_reshuffled_evidence(session_factory, shuffled_order)
+
+    db = session_factory()
+    try:
+        rows_a, total_a = select_bounded_evidence_from_db(
+            db, analysis_id=analysis_id_a, max_records=10, max_context_bytes=10_000_000,
+        )
+        rows_b, total_b = select_bounded_evidence_from_db(
+            db, analysis_id=analysis_id_b, max_records=10, max_context_bytes=10_000_000,
+        )
+    finally:
+        db.close()
+
+    assert total_a == total_b == 24
+    assert len(rows_a) == len(rows_b) == 10
+
+    keys_a = sorted(row.first_line_number for row in rows_a)
+    keys_b = sorted(row.first_line_number for row in rows_b)
+    # The SAME logical selected set - never dependent on which Evidence.id
+    # values happened to be assigned, nor on physical commit order.
+    assert keys_a == keys_b

@@ -126,8 +126,8 @@ def test_prepare_source_skips_reclone_on_resume_for_github(tmp_path, monkeypatch
     monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
 
-    first = prepare_source("github", "https://github.com/acme/project", 42)
-    second = prepare_source("github", "https://github.com/acme/project", 42)
+    first = prepare_source("github", "https://github.com/acme/project", 42, 0)
+    second = prepare_source("github", "https://github.com/acme/project", 42, 0)
 
     assert len(clone_calls) == 1
     assert set(first.by_path) == set(second.by_path) == {"app/main.py"}
@@ -144,10 +144,10 @@ def test_prepare_source_skips_reextract_on_resume_for_zip_after_upload_deleted(t
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("app/main.py", "print('hi')\n")
 
-    first = prepare_source("zip", str(archive), 7)
+    first = prepare_source("zip", str(archive), 7, 0)
     archive.unlink()  # simulates _remove_staged_source_archive already having run
 
-    second = prepare_source("zip", str(archive), 7)
+    second = prepare_source("zip", str(archive), 7, 0)
 
     assert set(first.by_path) == set(second.by_path) == {"app/main.py"}
 
@@ -171,7 +171,7 @@ def test_prepare_source_discards_partial_dest_from_a_crashed_prior_attempt(tmp_p
 
     monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
 
-    index = prepare_source("github", "https://github.com/acme/project", 99)
+    index = prepare_source("github", "https://github.com/acme/project", 99, 0)
 
     assert set(index.by_path) == {"real.py"}
 
@@ -193,8 +193,8 @@ def test_source_zip_and_github_source_share_one_index_path(tmp_path, monkeypatch
         str(tmp_path / "sources"),
     )
 
-    zip_index = prepare_source("zip", str(archive), 1)
-    github_index = prepare_source("github", "https://github.com/acme/project", 2)
+    zip_index = prepare_source("zip", str(archive), 1, 0)
+    github_index = prepare_source("github", "https://github.com/acme/project", 2, 0)
 
     assert set(zip_index.by_path) == set(github_index.by_path) == {"app/main.py"}
 
@@ -221,7 +221,7 @@ def test_ready_marker_is_not_written_if_index_build_crashes(tmp_path, monkeypatc
     )
 
     with pytest.raises(RuntimeError, match="index build crashed"):
-        prepare_source("github", "https://github.com/acme/project", 55)
+        prepare_source("github", "https://github.com/acme/project", 55, 0)
 
     dest = tmp_path / "sources" / "55"
     marker = source_archive._ready_marker(dest)
@@ -250,7 +250,7 @@ def test_ready_marker_is_only_written_after_the_manifest_is_saved(tmp_path, monk
     )
 
     with pytest.raises(OSError, match="disk full"):
-        prepare_source("github", "https://github.com/acme/project", 56)
+        prepare_source("github", "https://github.com/acme/project", 56, 0)
 
     dest = tmp_path / "sources" / "56"
     marker = source_archive._ready_marker(dest)
@@ -276,13 +276,71 @@ def test_prepare_source_adopts_an_already_ready_source_without_recloning(tmp_pat
 
     monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
 
-    first = prepare_source("github", "https://github.com/acme/project", 57)
+    first = prepare_source("github", "https://github.com/acme/project", 57, 0)
     assert len(clone_calls) == 1
 
     # Simulate the exact crash window: everything prepare_source() itself
     # does (tree, index, manifest, marker) already fully happened - only
     # the CALLER's later "source_status = ready" DB commit never ran.
-    second = prepare_source("github", "https://github.com/acme/project", 57)
+    second = prepare_source("github", "https://github.com/acme/project", 57, 0)
 
     assert len(clone_calls) == 1  # never re-cloned
     assert set(first.by_path) == set(second.by_path) == {"app.py"}
+
+
+def test_old_generation_cannot_delete_or_replace_a_newer_generations_published_source(
+    tmp_path, monkeypatch,
+):
+    """Interleaving C (item 19): generation 1 pauses mid-clone; while it is
+    still "running" (simulated here by having generation 1's OWN fake
+    clone callback synchronously trigger generation 2's full prepare_source
+    call first - the real equivalent of stale-processing recovery starting
+    a new generation and that generation's own _prepare_source_task
+    completing while generation 1's task is still blocked on the network),
+    generation 2 fully clones, publishes, and marks itself ready. When
+    generation 1 finally "resumes" (its own clone callback returns), it
+    must discard its own now-stale temp work and adopt generation 2's
+    already-published canonical tree - never delete or overwrite it."""
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
+
+    generation_2_started = []
+
+    def fake_clone(url, dest):
+        if "gen1" in dest.name and not generation_2_started:
+            generation_2_started.append(True)
+            # Generation 2 fully completes (clone, publish, marker) WHILE
+            # generation 1's own clone call is still "in progress" here.
+            def fake_clone_gen2(url2, dest2):
+                dest2.mkdir(parents=True, exist_ok=True)
+                (dest2 / "gen2_real.py").write_text("print('gen2')\n")
+            monkeypatch.setattr(source_archive, "_clone_github", fake_clone_gen2)
+            prepare_source("github", "https://github.com/acme/project", 99, 2)
+            monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+
+        # Generation 1's own (now-stale) clone finally "finishes".
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "gen1_stale.py").write_text("print('gen1')\n")
+
+    monkeypatch.setattr(source_archive, "_clone_github", fake_clone)
+
+    # Generation 1 started first but is the one whose OWN clone callback
+    # is still "running" when generation 2 completes - temp_dest naming
+    # embeds the generation ("gen1"/2), so the fake above can tell them
+    # apart the same way two real concurrent workers never could (each
+    # only ever knows its own generation number).
+    gen1_index = prepare_source("github", "https://github.com/acme/project", 99, "gen1")
+
+    dest = tmp_path / "sources" / "99"
+    marker = source_archive._ready_marker(dest)
+
+    # The canonical tree is generation 2's, untouched by generation 1's
+    # later (stale) completion - generation 1 adopted it instead of
+    # overwriting it.
+    assert set(gen1_index.by_path) == {"gen2_real.py"}
+    assert marker.exists()
+    assert (dest / "gen2_real.py").exists()
+    assert not (dest / "gen1_stale.py").exists()
+    # Generation 1's own private temp directory was cleaned up, not left
+    # behind or promoted to canonical.
+    stray_temps = list((tmp_path / "sources").glob("99.tmp-*"))
+    assert stray_temps == []

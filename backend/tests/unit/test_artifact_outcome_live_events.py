@@ -148,6 +148,9 @@ def test_zero_evidence_artifact_publishes_live_outcome_after_processing(monkeypa
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
         "processing", 0,
     )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        "processing"
+    )
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = _artifact_with_source(tmp_path, "quiet.log", b"INFO nothing to see here\n")
 
@@ -173,6 +176,9 @@ def test_evidence_bearing_artifact_does_not_publish_zero_evidence_event(monkeypa
     db.query.return_value.filter.return_value.scalar.return_value = 3
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
         "processing", 0,
+    )
+    db.query.return_value.filter.return_value.with_for_update.return_value.scalar.return_value = (
+        "processing"
     )
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = _artifact_with_source(tmp_path, "loud.log", b"ERROR something failed\n")

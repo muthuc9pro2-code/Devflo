@@ -3,7 +3,7 @@ import heapq
 import json
 from datetime import datetime, timezone
 from typing import Any
-from sqlalchemy import func
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 from app.core.processing_config import (
     BOUNDED_SELECTION_MAX_AGGREGATE_GROUPS,
@@ -15,7 +15,7 @@ from app.core.processing_config import (
     SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
 )
 from app.models.evidence import Evidence
-from app.services.correlation_engine import CorrelationRun
+from app.services.correlation_engine import CorrelationRun, _stable_evidence_key
 from app.services.timeline_processor import build_component_timeline
 
 # Zero retained evidence only proves Devflo did not extract meaningful
@@ -70,28 +70,25 @@ def _normalized_evidence_time(value: datetime | None) -> datetime:
 
 def _evidence_chronological_key(
     evidence: Evidence,
-) -> tuple[datetime, int]:
-    # first_line_number - not evidence.id - is the tie-break: artifacts
-    # are processed by independent, concurrently-racing Celery workers, so
-    # the DB-assigned autoincrement id an Evidence row happens to get
-    # reflects commit-race order, not anything about the underlying
-    # diagnostic data. first_line_number is instead derived once, at
-    # upload time, from artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
-    # plus that artifact's own line number - the same input always yields
-    # the same value.
+) -> tuple:
+    # The stable evidence key - not evidence.id - is the tie-break:
+    # artifacts are processed by independent, concurrently-racing Celery
+    # workers, so the DB-assigned autoincrement id an Evidence row happens
+    # to get reflects commit-race order, not anything about the underlying
+    # diagnostic data.
     return (
         _normalized_evidence_time(evidence.first_seen),
-        evidence.first_line_number,
+        *_stable_evidence_key(evidence),
     )
 
 
 def _simple_llm_priority_key(evidence: Evidence) -> tuple:
     """Deterministic priority for SIMPLE-mode Gemini context selection -
     only already-computed signals (a real source-code match, severity,
-    occurrence_count, then a stable timestamp/first_line_number tiebreak),
-    no AI-based ranking and no second root-cause engine. Sorts ascending,
-    so stronger candidates (True/higher numbers) are negated to sort
-    first. first_line_number, not evidence.id, closes the tie: see
+    occurrence_count, then a stable timestamp/evidence-key tiebreak), no
+    AI-based ranking and no second root-cause engine. Sorts ascending, so
+    stronger candidates (True/higher numbers) are negated to sort first.
+    The stable evidence key, not evidence.id, closes the tie: see
     _evidence_chronological_key."""
     has_source_match = bool(evidence.source_matches)
     severity_rank = _SIMPLE_LLM_SEVERITY_RANK.get(
@@ -105,7 +102,7 @@ def _simple_llm_priority_key(evidence: Evidence) -> tuple:
         -severity_rank,
         -(evidence.occurrence_count or 0),
         first_seen or _DATETIME_MIN_UTC,
-        evidence.first_line_number,
+        *_stable_evidence_key(evidence),
     )
 
 
@@ -321,21 +318,41 @@ def select_bounded_evidence_from_db(
     reserved_by_id: dict[int, Evidence] = {row.id: row for row in boundary_rows}
     remaining_budget = max(max_records - len(reserved_by_id), 0)
 
-    heap: list[tuple[float, int, Evidence]] = []  
+    heap: list[tuple[float, int, Evidence]] = []
     selected_count_by_artifact: dict[int, int] = {}
     tiebreak_counter = 0
+    # Compound keyset cursor (first_line_number, id) - not a bare
+    # `id > last_id` cursor. first_line_number is derived once at upload
+    # time from artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that
+    # artifact's own line number, so it identifies the same logical event
+    # the same way regardless of which order concurrently-processing
+    # artifact workers happened to commit Evidence rows in - unlike a bare
+    # id-ordered scan, this makes the SCAN ORDER itself (and therefore the
+    # diversity penalty's incremental selected_count_by_artifact
+    # accumulation, and tiebreak_counter's own value, both of which are
+    # order-dependent by design) invariant to Evidence.id/commit order for
+    # two runs over the same logical data. `id` remains in the tuple only
+    # to keep the cursor strictly advancing (and rows unambiguously
+    # ordered) on the rare exact first_line_number tie - never itself a
+    # semantic priority signal.
+    last_first_line_number = -1
     last_id = 0
 
     while True:
         batch = (
             db.query(Evidence)
-            .filter(Evidence.analysis_id == analysis_id, Evidence.id > last_id)
-            .order_by(Evidence.id)
+            .filter(
+                Evidence.analysis_id == analysis_id,
+                tuple_(Evidence.first_line_number, Evidence.id)
+                > tuple_(last_first_line_number, last_id),
+            )
+            .order_by(Evidence.first_line_number, Evidence.id)
             .limit(batch_size)
             .all()
         )
         if not batch:
             break
+        last_first_line_number = batch[-1].first_line_number
         last_id = batch[-1].id
 
         for row in batch:
@@ -374,13 +391,13 @@ def select_bounded_evidence_from_db(
     scored_candidates: list[tuple[float, Evidence]] = [
         (float("inf"), row) for row in reserved_by_id.values()
     ] + [(score, row) for score, _tiebreak, row in heap]
-    # Tie-broken by first_line_number (never left implicit, which would
-    # silently fall back to dict/heap-internal iteration order - itself
-    # driven by Evidence.id-ordered pagination scan order, not anything
-    # about the underlying data) so an exact score tie right at the
-    # max_records truncation boundary picks the same row on every run.
+    # Tie-broken by the stable evidence key (never left implicit, which
+    # would silently fall back to dict/heap-internal iteration order -
+    # itself driven by pagination scan order, not anything about the
+    # underlying data) so an exact score tie right at the max_records
+    # truncation boundary picks the same row on every run.
     scored_candidates.sort(
-        key=lambda item: (item[0], item[1].first_line_number), reverse=True
+        key=lambda item: (item[0], *_stable_evidence_key(item[1])), reverse=True
     )
 
     selected: list[Evidence] = []
@@ -853,8 +870,10 @@ def build_zero_evidence_payload(
 
 
 def _bounded_fallback_context_list(fallback_artifacts: list[Any]) -> list[dict[str, Any]]:
-    """Deterministic (stable artifact-id order), bounded to
-    SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES across every contributing
+    """Deterministic (stable upload-provenance order: artifact.position,
+    the order artifacts were uploaded in - never artifact.id, an
+    auto-increment persistence identifier, as semantic ordering), bounded
+    to SIMPLE_FALLBACK_MAX_TOTAL_CONTEXT_BYTES across every contributing
     artifact combined - each individual artifact's own fallback_context is
     already bounded to SIMPLE_FALLBACK_MAX_TEXT_BYTES at capture time (see
     fallback_context.py); this only bounds the SUM when several small
@@ -864,7 +883,9 @@ def _bounded_fallback_context_list(fallback_artifacts: list[Any]) -> list[dict[s
     entries: list[dict[str, Any]] = []
     total_bytes = 0
 
-    for artifact in sorted(fallback_artifacts, key=lambda a: a.id):
+    for artifact in sorted(
+        fallback_artifacts, key=lambda a: (a.position, a.original_filename)
+    ):
         context = artifact.fallback_context
         if not context:
             continue
@@ -1176,8 +1197,10 @@ def build_llm_context(
                 ],
                 "root_evidence": [
                     _evidence_payload(evidence_by_id[evidence_id])
-                    for evidence_id in selected_evidence_ids
-                    if evidence_id in evidence_by_id
+                    for evidence_id in sorted(
+                        (eid for eid in selected_evidence_ids if eid in evidence_by_id),
+                        key=lambda eid: evidence_by_id[eid].first_line_number,
+                    )
                 ],
             }
         )

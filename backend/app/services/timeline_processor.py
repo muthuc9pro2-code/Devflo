@@ -4,7 +4,11 @@ finishes - never a second DB scan, never a persisted timeline subsystem.
 """
 from typing import Any
 
-from app.services.correlation_engine import CorrelationComponent, RootCauseCandidate
+from app.services.correlation_engine import (
+    CorrelationComponent,
+    RootCauseCandidate,
+    _stable_node_key,
+)
 
 
 def build_component_timeline(
@@ -21,17 +25,12 @@ def build_component_timeline(
     """
     role_by_node_id = {candidate.node_id: candidate.role for candidate in root_candidates}
 
-    # Tie-broken by first_line_number, not node.id: node.id embeds
+    # Tie-broken by the stable node key, not node.id: node.id embeds
     # Evidence.id, which reflects commit-race order across concurrently-
-    # processing artifact workers, not anything about the underlying
-    # data - first_line_number is derived once at upload time and
-    # identifies the same logical event the same way on every run.
+    # processing artifact workers, not anything about the underlying data.
     timed_nodes = sorted(
         (node for node in component.nodes if node.first_seen is not None),
-        key=lambda node: (
-            node.first_seen,
-            node.first_line_number if node.first_line_number is not None else float("inf"),
-        ),
+        key=lambda node: (node.first_seen, _stable_node_key(node)),
     )
     untimed_nodes = [node for node in component.nodes if node.first_seen is None]
 

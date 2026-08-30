@@ -941,7 +941,7 @@ def test_prepare_source_task_does_not_retry_when_source_is_already_unavailable(m
     )
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     monkeypatch.setattr(
-        analysis_task, "_prepare_source_index",
+        analysis_task, "_acquire_source_index",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retry an already-unavailable source")),
     )
 

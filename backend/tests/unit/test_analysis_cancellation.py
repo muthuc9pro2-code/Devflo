@@ -365,6 +365,41 @@ def test_cancel_and_cleanup_resets_only_abandoned_in_flight_artifacts():
     assert controlled_failure.failure_reason == "too large"
 
 
+def test_cancel_during_image_ocr_clears_partial_state_and_leaves_no_evidence():
+    """Phase-matrix case (item 30): cancellation landing while an IMAGE
+    artifact is mid-OCR. Unlike a text/JSON artifact's byte-offset
+    checkpoint, an image artifact's processed_bytes/last_processed_line
+    are never meaningful mid-run (see the restart-only OCR recovery
+    contract) - cancellation must still reset them to 0 and clear any
+    partial OCR fallback excerpt/Evidence the same way it does for any
+    other in-flight artifact, through the SAME one authoritative
+    transaction, never a special-cased path."""
+    db = _session()
+    alice = _user(db)
+    analysis = _analysis(db, alice, status="processing")
+    image_artifact = _artifact(
+        db, analysis, position=0, status="processing", detected_format="image",
+        processed_bytes=3, last_processed_line=3,
+        fallback_context={"kind": "ocr", "text": "partial OCR excerpt"},
+    )
+    db.add(Evidence(
+        analysis_id=analysis.id, artifact_id=image_artifact.id, correlation_key="k1",
+        fingerprint="fp1", first_line_number=1, last_line_number=1,
+    ))
+    db.commit()
+
+    result = cancel_analysis_and_cleanup(db, analysis.id)
+
+    assert result == "processing"
+    db.expire_all()
+    assert db.query(Analysis).filter(Analysis.id == analysis.id).first().status == "cancelled"
+    reloaded = db.query(AnalysisArtifact).filter(AnalysisArtifact.id == image_artifact.id).first()
+    assert reloaded.processed_bytes == 0
+    assert reloaded.last_processed_line == 0
+    assert reloaded.fallback_context is None
+    assert db.query(Evidence).filter(Evidence.artifact_id == image_artifact.id).count() == 0
+
+
 def test_cancel_and_cleanup_keeps_the_analysis_and_artifact_rows():
     db = _session()
     alice = _user(db)
@@ -522,7 +557,7 @@ def test_prepare_source_task_skips_when_already_cancelled(monkeypatch):
     analysis = _analysis(db, alice, status="cancelled", source_kind="github", source_status=None)
     monkeypatch.setattr(analysis_task, "sessionLocal", lambda **k: db)
     monkeypatch.setattr(
-        analysis_task, "_prepare_source_index",
+        analysis_task, "_acquire_source_index",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must never prepare source for cancelled")),
     )
 
@@ -532,9 +567,16 @@ def test_prepare_source_task_skips_when_already_cancelled(monkeypatch):
     assert reloaded.source_status is None  # never set to "ready" or "unavailable"
 
 
-def test_prepare_source_task_discards_prepared_source_when_cancelled_mid_prep(monkeypatch):
-    """Cancellation observed by the fresh re-check performed
-    right after preparation but before persisting source_status="ready"."""
+def test_prepare_source_task_does_not_touch_the_published_tree_when_cancelled_mid_prep(monkeypatch):
+    """Cancellation observed by the fresh, atomic, generation-conditional
+    "preparing" -> "ready" transition. _prepare_source_task itself must
+    NOT proactively delete the tree it just acquired here (see item 5 of
+    the source-ownership hardening pass: an old/fenced execution must
+    never be the one deleting a canonical tree, since it cannot prove
+    whether a newer generation has since started relying on it) - the
+    cancel endpoint's own cancel_analysis_and_cleanup already durably
+    reclaims prepared source for a cancelled analysis independently, once,
+    authoritatively."""
     db = _session()
     alice = _user(db)
     analysis = _analysis(db, alice, status="processing", source_kind="zip", source_status=None)
@@ -550,7 +592,7 @@ def test_prepare_source_task_discards_prepared_source_when_cancelled_mid_prep(mo
         db.query(Analysis).filter(Analysis.id == analysis_id).update({"status": "cancelled"})
         db.commit()
 
-    monkeypatch.setattr(analysis_task, "_prepare_source_index", fake_prepare)
+    monkeypatch.setattr(analysis_task, "_acquire_source_index", fake_prepare)
     cleanup_calls = []
     monkeypatch.setattr(
         analysis_task, "cleanup_prepared_source", lambda aid: cleanup_calls.append(aid)
@@ -558,9 +600,9 @@ def test_prepare_source_task_discards_prepared_source_when_cancelled_mid_prep(mo
 
     analysis_task._prepare_source_task.run(analysis_id, 0)
 
-    assert cleanup_calls == [analysis_id]
+    assert cleanup_calls == []  # left for cancel_analysis_and_cleanup, not this task
     reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-    assert reloaded.source_status is None  # never flipped to "ready"
+    assert reloaded.source_status == "preparing"  # never flipped to "ready"
 
 
 def test_prepare_source_task_does_not_mark_unavailable_for_a_cancelled_analysis(monkeypatch):
@@ -577,14 +619,14 @@ def test_prepare_source_task_does_not_mark_unavailable_for_a_cancelled_analysis(
         db.commit()
         raise SourceInputError("repository not found")
 
-    monkeypatch.setattr(analysis_task, "_prepare_source_index", fake_prepare)
+    monkeypatch.setattr(analysis_task, "_acquire_source_index", fake_prepare)
     monkeypatch.setattr(analysis_task, "cleanup_prepared_source", lambda aid: None)
 
     analysis_task._prepare_source_task.run(analysis_id, 0)
 
     reloaded = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert reloaded.status == "cancelled"
-    assert reloaded.source_status is None  # never "unavailable"
+    assert reloaded.source_status != "unavailable"  # never "unavailable"
 
 
 # --- Finalize checkpoints, Gemini-result discard, mark-failed guard -----
@@ -717,7 +759,7 @@ def test_finalize_commit_if_processing_discards_when_cancellation_wins_in_the_ga
     cancel_db.close()
 
     won = _finalize_commit_if_processing(
-        db, analysis, generation=0, result_snapshot={"investigation_path": "simple"}, stage="test",
+        db, analysis, generation=0, result_snapshot={"investigation_path": "simple"}, ai_analysis=None, processed_bytes=0, last_processed_line=0, stage="test",
     )
 
     assert won is False
@@ -742,7 +784,7 @@ def test_finalize_commit_if_processing_commits_normally_when_not_cancelled(monke
     from app.tasks.analysis import _finalize_commit_if_processing
 
     won = _finalize_commit_if_processing(
-        db, analysis, generation=0, result_snapshot={"investigation_path": "zero_evidence"}, stage="test",
+        db, analysis, generation=0, result_snapshot={"investigation_path": "zero_evidence"}, ai_analysis=None, processed_bytes=0, last_processed_line=0, stage="test",
     )
 
     assert won is True

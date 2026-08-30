@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import uuid
 import zipfile
 import zlib
 from pathlib import Path
@@ -172,9 +173,15 @@ def _analysis_source_dir(analysis_id: int) -> Path:
 def cleanup_prepared_source(analysis_id: int) -> None:
     """Idempotently removes every on-disk artifact prepare_source() may
     have produced for one analysis: the prepared source directory itself,
-    its ready marker, its index manifest, and any in-flight temp manifest
-    left by a crashed save_index_manifest(). Safe to call when none of
-    these exist. Genuine filesystem errors (e.g. a permission problem)
+    its ready marker, its index manifest, any in-flight temp manifest left
+    by a crashed save_index_manifest(), and any generation-owned temporary
+    staging directory (<id>.tmp-<generation>-<uuid>) an acquisition that
+    never reached publication may have left behind. Safe to call when none
+    of these exist. Only ever called at a genuine terminal point (this
+    analysis is durably completed/cancelled/failed - see callers), so it
+    is always safe to remove every generation's staging leftovers here,
+    not just the current one's: no generation will ever run for this
+    analysis again. Genuine filesystem errors (e.g. a permission problem)
     propagate as OSError rather than being swallowed here - callers decide
     whether a cleanup failure is fatal (prepare_source's own failure path)
     or best-effort (finalize's post-completion cleanup)."""
@@ -189,53 +196,139 @@ def cleanup_prepared_source(analysis_id: int) -> None:
     manifest_path.unlink(missing_ok=True)
     tmp_manifest_path.unlink(missing_ok=True)
 
+    for stray_temp_dir in dest.parent.glob(f"{dest.name}.tmp-*"):
+        shutil.rmtree(stray_temp_dir, ignore_errors=True)
 
-def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
-    """Acquire source into investigation-scoped storage and reuse/build its
-    index.
+
+def _load_or_rebuild_index(dest: Path, manifest_path: Path):
+    """Reconstruct a SourceIndex for an already-published, immutable ready
+    tree - reads the small JSON manifest cache when possible, otherwise
+    rebuilds by walking `dest` itself (still read-only: os.walk() never
+    modifies the tree) and refreshes the cache for the next reader. Safe
+    for ANY caller, including artifact workers that must never acquire
+    source themselves (see load_ready_source_index) - this never clones,
+    extracts, or writes anything under `dest` itself, only the sibling
+    manifest cache file (already-atomic: temp file + os.replace)."""
+    cached = load_index_manifest(manifest_path, dest)
+    if cached is not None:
+        return cached
+    index = build_index(dest)
+    save_index_manifest(index, manifest_path)
+    return index
+
+
+def load_ready_source_index(analysis_id: int):
+    """READ-ONLY: for artifact workers (see app.tasks.analysis's
+    _process_artifact_task) - never clones, extracts, or publishes
+    anything. Only ever loads a canonical tree some _prepare_source_task
+    invocation has ALREADY durably published (the .ready marker exists,
+    which is only ever written after the tree + index + manifest are all
+    complete - see prepare_source). Returns None if no ready marker
+    exists: the source has not been prepared yet, is still being prepared,
+    or was marked unavailable - in every one of those cases the caller
+    must proceed with source_index=None rather than attempting to acquire
+    source itself. This is the ONLY sanctioned way an artifact worker may
+    ever obtain a SourceIndex."""
+    dest = Path(SOURCE_STORAGE_ROOT) / str(analysis_id)
+    marker = _ready_marker(dest)
+    if not marker.exists():
+        return None
+    manifest_path = index_manifest_path(dest)
+    return _load_or_rebuild_index(dest, manifest_path)
+
+
+def cleanup_generation_source_temp(analysis_id: int, generation: int) -> None:
+    """Removes ONLY the generation-owned temporary staging directory
+    (<id>.tmp-<generation>-<uuid>) a since-abandoned generation's
+    acquisition may have left behind - never the canonical `dest`, ready
+    marker, or manifest, which this generation (by definition, since it
+    never reached "ready" - see the source_status "preparing" ownership
+    model) cannot have published. Used when stale-processing recovery
+    demotes a generation that was still "preparing" source, so a new
+    generation is not forced to wait for - or, worse, adopt - a stale,
+    never-fully-acquired directory left by the one it just fenced.
+    Best-effort: filesystem errors are swallowed here, since this is pure
+    housekeeping, never a correctness requirement (a left-behind stray
+    temp directory is eventually swept by cleanup_prepared_source's own
+    broader glob at genuine terminal cleanup)."""
+    dest = _analysis_source_dir(analysis_id)
+    for stray_temp_dir in dest.parent.glob(f"{dest.name}.tmp-{generation}-*"):
+        shutil.rmtree(stray_temp_dir, ignore_errors=True)
+
+
+def prepare_source(source_kind: str, source_reference: str, analysis_id: int, generation: int):
+    """ACQUISITION-CAPABLE: may clone/extract/publish. Reserved for the
+    single source-preparation owner (app.tasks.analysis's
+    _prepare_source_task, via its own durable "preparing" ownership claim)
+    - never called by an artifact worker, which must use
+    load_ready_source_index() instead (see item 24 of the source-ownership
+    hardening pass this docstring documents).
 
     Idempotent across a resumed process_analysis run: if this analysis's
-    source was already fully acquired by a prior invocation (ready marker
-    present), skip re-cloning/re-extracting. Without this, resuming a
-    GitHub-sourced analysis always fails outright (`git clone` refuses a
-    non-empty destination), and resuming a ZIP-sourced one fails once the
-    staged upload has been deleted after its first successful use. The
-    marker lives beside `dest`, not inside it, so it is never picked up by
-    build_index as a source file.
+    source was already fully acquired by ANY prior invocation (ready
+    marker present), skip re-cloning/re-extracting entirely and just
+    (re)load its index - without this, resuming a GitHub-sourced analysis
+    always fails outright (`git clone` refuses a non-empty destination),
+    and resuming a ZIP-sourced one fails once the staged upload has been
+    deleted after its first successful use. The marker lives beside
+    `dest`, not inside it, so it is never picked up by build_index as a
+    source file.
 
-    Index reuse: every artifact task in
-    an analysis previously called this function and got a full
-    os.walk()-based build_index() EVERY time, even though the tree never
-    changes after the first successful acquisition. A small JSON manifest
-    (index_manifest_path) persisted beside `dest` after the first real
-    build lets every subsequent call in this - or a LATER, separate worker
-    process, since Celery workers are not guaranteed to share memory -
-    reconstruct the same index by reading and parsing that manifest
-    instead of re-walking the whole tree. Never sent through a Celery
-    message (each task calls this locally); never pickled (JSON only).
+    Generation-owned temporary staging: acquisition (clone/extract) always
+    happens into a private, this-call-only temporary directory embedding
+    `generation` in its name - never directly into the canonical `dest`.
+    Only once acquisition fully succeeds is the temp directory published
+    into `dest` with one atomic os.replace() (a rename, not a copy - POSIX
+    guarantees this is atomic when both paths are on the same filesystem/
+    mount, which they always are here since both live directly under
+    SOURCE_STORAGE_ROOT). This is what makes "an old, superseded
+    generation's still-running acquisition clobbers a newer generation's
+    already-published source" impossible: an old generation can only ever
+    delete/replace its OWN temp directory (see its except-block below,
+    and the marker re-check immediately before publishing), never the
+    canonical `dest` a different, newer execution already finished
+    publishing - the marker re-check closes that window at the filesystem
+    level, and the caller's own generation-conditional DB claim/transition
+    (source_status "preparing" -> "ready", only for the exact generation
+    that is still current) closes it at the durable-state level.
     """
     dest = Path(SOURCE_STORAGE_ROOT) / str(analysis_id)
     marker = _ready_marker(dest)
     manifest_path = index_manifest_path(dest)
 
     if marker.exists():
-        cached = load_index_manifest(manifest_path, dest)
-        if cached is not None:
-            return cached
-        index = build_index(dest)
-        save_index_manifest(index, manifest_path)
-        return index
+        return _load_or_rebuild_index(dest, manifest_path)
 
-    if dest.exists():
-        shutil.rmtree(dest) 
-
+    temp_dest = dest.parent / f"{dest.name}.tmp-{generation}-{uuid.uuid4().hex}"
+    published_by_this_call = False
     try:
         if source_kind == "github":
-            _clone_github(source_reference, dest)
+            _clone_github(source_reference, temp_dest)
         elif source_kind == "zip":
-            _extract_zip(Path(source_reference), dest)
+            _extract_zip(Path(source_reference), temp_dest)
         else:
             raise SourceInputError(f"Unsupported source kind: {source_kind}")
+
+        # A different (necessarily newer, since ids/generations only ever
+        # advance) execution may have finished publishing while this one
+        # was still cloning/extracting - never overwrite an
+        # already-published canonical tree with this now-superseded copy.
+        # This is a defense-in-depth filesystem-level check alongside the
+        # caller's own DB-level generation-conditional claim/transition;
+        # either alone already makes the double-publish race exceedingly
+        # unlikely, together they close it.
+        if marker.exists():
+            shutil.rmtree(temp_dest, ignore_errors=True)
+            return _load_or_rebuild_index(dest, manifest_path)
+
+        if dest.exists():
+            # Not marked ready - a partial tree left by a crashed prior
+            # attempt (or by a since-abandoned generation that never
+            # reached publication). Never proven complete, so never
+            # trusted; always safe to discard and replace.
+            shutil.rmtree(dest)
+        os.replace(temp_dest, dest)
+        published_by_this_call = True
 
         index = build_index(dest)
         save_index_manifest(index, manifest_path)
@@ -249,6 +342,17 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int):
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
     except Exception:
-        cleanup_prepared_source(analysis_id)
+        # Always removes THIS call's own private temp directory - a no-op
+        # if it was already renamed away. If THIS call is also the one
+        # that published `dest` (the os.replace above already succeeded)
+        # and index-build/manifest-save then failed, `dest` is this call's
+        # own incomplete work, not a canonical tree any newer execution
+        # could yet be relying on - safe to remove, but only after one
+        # more marker re-check: if some other, newer execution has somehow
+        # already published in the meantime, its canonical tree must never
+        # be touched.
+        shutil.rmtree(temp_dest, ignore_errors=True)
+        if published_by_this_call and not marker.exists():
+            shutil.rmtree(dest, ignore_errors=True)
         raise
     return index

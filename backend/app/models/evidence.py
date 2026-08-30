@@ -41,6 +41,12 @@ class Evidence(Base):
             "id",
         ),
         Index(
+            "ix_evidence_analysis_first_line_number_id",
+            "analysis_id",
+            "first_line_number",
+            "id",
+        ),
+        Index(
             "ix_evidence_artifact_analysis",
             "artifact_id",
             "analysis_id",

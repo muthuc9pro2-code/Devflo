@@ -91,6 +91,7 @@ describe('App - critical-operation-locked takeovers', () => {
       removeEventListener: vi.fn(),
     })
     mocks.getAnalysisHistory.mockResolvedValue({ items: [], next_cursor: null })
+    mocks.refreshSession.mockResolvedValue(undefined)
   })
 
   it('a session expiring mid-upload does not unmount the shell until the upload finishes', async () => {
@@ -136,6 +137,37 @@ describe('App - critical-operation-locked takeovers', () => {
     })
 
     expect(screen.getByText('Service unavailable stub')).toBeTruthy()
+    // Bounded: exactly one revalidation attempt, never a retry storm.
+    expect(mocks.refreshSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('a stale 503 from during the upload is cleared by ONE revalidation if the backend already recovered', async () => {
+    const { rerender } = await renderApp()
+    beginUpload()
+
+    authState.unavailable = true
+    await act(async () => {
+      rerender(<App />)
+    })
+    expect(screen.getByText('New investigation stub')).toBeTruthy()
+
+    // The backend has actually recovered by the time the upload settles -
+    // simulate refreshSession() itself observing that and clearing the
+    // stale flag, the same way the real AuthContext.refreshSession does
+    // on a successful /auth/me call.
+    mocks.refreshSession.mockImplementation(async () => {
+      authState.unavailable = false
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate upload end' }))
+    await act(async () => {
+      rerender(<App />)
+    })
+
+    // Never shown at all - the stale outage state was cleared before this
+    // render ever had to decide whether to paint it.
+    expect(screen.queryByText('Service unavailable stub')).toBeNull()
+    expect(mocks.refreshSession).toHaveBeenCalledTimes(1)
   })
 
   it('a browser Back/Forward navigation mid-upload does not change what is on screen until the upload finishes', async () => {
