@@ -776,32 +776,124 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
 
 
 # A duplicate/redelivered _prepare_source_task invocation for the SAME
-# generation (task_acks_late + task_reject_on_worker_lost can genuinely
-# redeliver a task twice if a worker dies mid-execution without acking)
-# that finds preparation already "preparing" retries at a bounded
-# interval rather than busy-spinning - 12 x 10s = 120s, comfortably longer
-# than a typical clone/extract (GITHUB_CLONE_TIMEOUT_SECONDS=60s) without
-# holding a worker slot in a tight loop.
-_SOURCE_PREPARING_RETRY_MAX = 12
+# generation must wait for the durable source owner rather than becoming a
+# second acquisition owner. Retries are intentionally unbounded here: the
+# analysis recovery state machine, not an arbitrary 120-second retry budget,
+# decides when a genuinely abandoned generation is stale. Once recovery
+# demotes/supersedes that generation, the next retry observes the changed
+# status/generation and exits harmlessly; its stale downstream artifact tasks
+# are generation-fenced and no-op.
 _SOURCE_PREPARING_RETRY_DELAY_SECONDS = 10
 
 
-@celery_app.task(bind=True, max_retries=_SOURCE_PREPARING_RETRY_MAX)
-def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
-    """Run source ZIP/GitHub prep+indexing exactly once, before any artifact
-    task starts (see process_analysis docstring for why this cannot safely
-    run concurrently with artifact processing).
+def _publish_source_for_current_generation(
+    analysis_id: int, generation: int, publisher
+):
+    """Run the short canonical-source publication while holding the Analysis
+    row lock, then durably mark the exact current generation ready before
+    releasing that lock. Clone/extract/index work happens before this helper
+    is entered, so the DB lock is never held across expensive source prep.
 
-    Single durable ownership: acquisition (clone/extract/publish) may only
-    ever be performed by whichever invocation wins the atomic
-    source_status NULL -> "preparing" claim below, scoped to this exact
-    (analysis_id, processing_generation) pair. Artifact workers never
-    acquire source themselves (see _load_ready_source_index_for_artifact);
-    this task is the ONLY source-preparation owner in the whole system.
+    Returns the published/adopted SourceIndex, or None when cancellation,
+    failure, or recovery already superseded this generation.
+    """
+    publish_db = sessionLocal(expire_on_commit=False)
+
+    try:
+        current = (
+            publish_db.query(
+                Analysis.status,
+                Analysis.processing_generation,
+                Analysis.source_status,
+            )
+            .filter(Analysis.id == analysis_id)
+            .with_for_update()
+            .first()
+        )
+
+        if current is None:
+            publish_db.rollback()
+            return None
+
+        status, current_generation, source_status = current
+
+        if (
+            status != "processing"
+            or current_generation != generation
+            or source_status != "preparing"
+        ):
+            publish_db.rollback()
+            return None
+
+        index = publisher()
+
+        if index is None:
+            publish_db.rollback()
+            return None
+
+        ready = publish_db.execute(
+            update(Analysis)
+            .where(
+                Analysis.id == analysis_id,
+                Analysis.status == "processing",
+                Analysis.processing_generation == generation,
+                Analysis.source_status == "preparing",
+            )
+            .values(
+                source_status="ready",
+                source_failure_reason=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        if ready.rowcount != 1:
+            publish_db.rollback()
+            return None
+
+        publish_db.commit()
+        return index
+
+    except Exception:
+        _safe_rollback(publish_db)
+        raise
+
+    finally:
+        publish_db.close()
+
+
+def _remove_staged_zip_after_ready(analysis: Analysis) -> None:
+    """Best-effort staged ZIP reclaim, only after source_status is durably
+    ready. A cleanup failure is housekeeping only and never changes source
+    availability."""
+    if analysis.source_kind != "zip" or not analysis.source_reference:
+        return
+
+    try:
+        _remove_staged_source_archive(analysis.source_reference)
+    except OSError:
+        logger.warning(
+            "Analysis %s | source is durably ready but the staged ZIP could "
+            "not be removed",
+            analysis.id,
+            exc_info=True,
+        )
+
+
+@celery_app.task(bind=True, max_retries=None)
+def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
+    """Prepare optional source once for this exact processing generation.
+
+    A durable NULL -> preparing claim elects the single expensive acquisition
+    owner. Duplicate deliveries never clone/extract: while the owner is still
+    healthy they retry, and if a crash left a complete filesystem-ready source
+    they adopt it and finish the DB ready transition. Canonical publication is
+    generation-fenced by _publish_source_for_current_generation.
     """
     db = sessionLocal(expire_on_commit=False)
+
     try:
         analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
+
         if analysis is None:
             logger.warning("Analysis %s not found for source prep", analysis_id)
             return
@@ -827,24 +919,17 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
                 analysis_id,
             )
             return
+
         if analysis.source_status == "ready":
+            # A worker can crash after durable ready but before ZIP cleanup.
+            _remove_staged_zip_after_ready(analysis)
+
             logger.info(
-                "Analysis %s | optional source already ready; nothing to " "prepare",
+                "Analysis %s | optional source already ready; nothing to prepare",
                 analysis_id,
             )
             return
 
-        _bump_processing_heartbeat(analysis_id, generation)
-
-        # Atomic ownership claim: only the ONE invocation whose UPDATE
-        # actually flips a still-NULL source_status may acquire source for
-        # this generation. source_status starts NULL for an
-        # never-yet-attempted analysis, and is reset back to NULL by
-        # stale-recovery demotion if a PRIOR, now-abandoned generation's
-        # acquisition never finished (see
-        # _claim_and_demote_stale_processing) - so a fresh generation
-        # always finds a claimable NULL, never stuck behind a dead
-        # generation's stale "preparing".
         claim = db.execute(
             update(Analysis)
             .where(
@@ -857,6 +942,7 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
             .execution_options(synchronize_session=False)
         )
         db.commit()
+
         if claim.rowcount != 1:
             current = (
                 db.query(
@@ -867,10 +953,15 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
                 .filter(Analysis.id == analysis_id)
                 .first()
             )
+
             current_status, current_generation, current_source_status = (
                 current if current is not None else (None, None, None)
             )
-            if current_status != "processing" or current_generation != generation:
+
+            if (
+                current_status != "processing"
+                or current_generation != generation
+            ):
                 logger.info(
                     "Analysis %s | generation %s superseded (status=%s) "
                     "before source preparation could be claimed",
@@ -879,69 +970,170 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
                     current_status,
                 )
                 return
-            if current_source_status in ("ready", "unavailable"):
+
+            if current_source_status == "ready":
+                _remove_staged_zip_after_ready(analysis)
+
                 logger.info(
-                    "Analysis %s | source already %s; nothing to prepare",
+                    "Analysis %s | source already ready; nothing to prepare",
                     analysis_id,
-                    current_source_status,
                 )
                 return
-            # current_source_status == "preparing": a duplicate/redelivered
-            # invocation for this SAME generation found preparation
-            # already owned (by itself, an earlier delivery of the exact
-            # same message). Never clone/extract/remove source here -
-            # just wait, bounded, for the owner to finish.
+
+            if current_source_status == "unavailable":
+                logger.info(
+                    "Analysis %s | source already unavailable; nothing to prepare",
+                    analysis_id,
+                )
+                return
+
+            # source_status == "preparing".
+            #
+            # Either:
+            #   1. the legitimate owner is still preparing, or
+            #   2. it crashed after tree+manifest+.ready but before DB ready.
+            #
+            # Adopt only case 2. Never clone/extract from a duplicate waiter.
+            try:
+                ready_index = load_ready_source_index(analysis_id)
+            except Exception:
+                logger.warning(
+                    "Analysis %s | filesystem-ready source could not yet be "
+                    "loaded while another preparation delivery owns generation %s; "
+                    "retrying without failing the analysis",
+                    analysis_id,
+                    generation,
+                    exc_info=True,
+                )
+                ready_index = None
+
+            if ready_index is not None:
+                adopted = db.execute(
+                    update(Analysis)
+                    .where(
+                        Analysis.id == analysis_id,
+                        Analysis.status == "processing",
+                        Analysis.processing_generation == generation,
+                        Analysis.source_status == "preparing",
+                    )
+                    .values(
+                        source_status="ready",
+                        source_failure_reason=None,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                db.commit()
+
+                if adopted.rowcount == 1:
+                    _cache_source_index(
+                        (analysis_id, generation),
+                        ready_index,
+                    )
+                    _remove_staged_zip_after_ready(analysis)
+
+                    logger.info(
+                        "Analysis %s | adopted complete filesystem-ready source "
+                        "for generation %s after interrupted preparation",
+                        analysis_id,
+                        generation,
+                    )
+                    return
+
+                current = (
+                    db.query(
+                        Analysis.status,
+                        Analysis.processing_generation,
+                        Analysis.source_status,
+                    )
+                    .filter(Analysis.id == analysis_id)
+                    .first()
+                )
+
+                if current is None:
+                    return
+
+                (
+                    current_status,
+                    current_generation,
+                    current_source_status,
+                ) = current
+
+                if (
+                    current_status != "processing"
+                    or current_generation != generation
+                ):
+                    return
+
+                if current_source_status == "ready":
+                    _remove_staged_zip_after_ready(analysis)
+                    return
+
+                if current_source_status == "unavailable":
+                    return
+
             logger.info(
-                "Analysis %s | source preparation for generation %s already "
-                "owned; retrying in %ss (attempt %s/%s)",
+                "Analysis %s | source preparation for generation %s is still "
+                "owned; retrying in %ss (attempt %s)",
                 analysis_id,
                 generation,
                 _SOURCE_PREPARING_RETRY_DELAY_SECONDS,
                 self.request.retries + 1,
-                _SOURCE_PREPARING_RETRY_MAX,
             )
-            raise self.retry(countdown=_SOURCE_PREPARING_RETRY_DELAY_SECONDS)
+
+            raise self.retry(
+                countdown=_SOURCE_PREPARING_RETRY_DELAY_SECONDS
+            )
+
+        # IMPORTANT:
+        # only the real NULL -> preparing owner refreshes the heartbeat.
+        #
+        # Duplicate waiters must NOT keep a crashed owner permanently alive.
+        _bump_processing_heartbeat(analysis_id, generation)
+
         db.refresh(analysis)
 
         source_prep_start = perf_counter()
+
         try:
-            _acquire_source_index(analysis, generation)
+            index = _acquire_source_index(
+                analysis,
+                generation,
+                publish_callback=lambda publisher: (
+                    _publish_source_for_current_generation(
+                        analysis_id,
+                        generation,
+                        publisher,
+                    )
+                ),
+            )
         except (SourceInputError, SourceSubsystemError) as error:
             db.rollback()
-            _record_optional_source_failure(db, analysis, error, generation=generation)
+            _record_optional_source_failure(
+                db,
+                analysis,
+                error,
+                generation=generation,
+            )
             return
 
-        # Atomic, generation-conditional publish of the "ready" transition -
-        # a fresh, CURRENT locking read decides this, never the `analysis`
-        # ORM object read (possibly minutes ago, before a slow clone/
-        # extract) at the top of this function. If a newer generation (or
-        # cancellation/failure) has since won, this UPDATE simply matches
-        # zero rows - the tree this invocation just acquired was already
-        # published into the shared canonical location by prepare_source's
-        # own atomic os.replace()+marker-recheck, so there is nothing of
-        # this invocation's own to discard, and nothing here ever deletes
-        # the canonical tree a newer generation may already be relying on.
-        claim = db.execute(
-            update(Analysis)
-            .where(
-                Analysis.id == analysis_id,
-                Analysis.status == "processing",
-                Analysis.processing_generation == generation,
-                Analysis.source_status == "preparing",
-            )
-            .values(source_status="ready", source_failure_reason=None)
-            .execution_options(synchronize_session=False)
-        )
-        db.commit()
-        if claim.rowcount != 1:
+        # Publication ownership was lost after expensive private work.
+        # prepare_source() already discarded only this generation's temp state.
+        if index is None:
             logger.info(
-                "Analysis %s | generation %s superseded before source could "
-                "be marked ready; leaving the published tree in place",
+                "Analysis %s | generation %s lost source-publication ownership; "
+                "discarding private prepared state",
                 analysis_id,
                 generation,
             )
-            _invalidate_source_index_cache(analysis_id)
+            _source_index_process_cache.pop(
+                (analysis_id, generation),
+                None,
+            )
             return
+
+        # The publication callback has ALREADY committed source_status=ready.
+        # Only now may the original ZIP disappear.
+        _remove_staged_zip_after_ready(analysis)
 
         logger.info(
             "Analysis %s | source prep (%s) completed in %.2fs",
@@ -949,14 +1141,30 @@ def _prepare_source_task(self, analysis_id: int, generation: int) -> None:
             analysis.source_kind,
             perf_counter() - source_prep_start,
         )
+
     except Retry:
         raise
+
     except Exception:
         _safe_rollback(db)
-        logger.exception("Analysis %s | source preparation failed", analysis_id)
-        if _mark_analysis_failed(db, analysis_id, generation=generation):
-            _cleanup_files_after_terminal_failure(db, analysis_id)
+
+        logger.exception(
+            "Analysis %s | source preparation failed",
+            analysis_id,
+        )
+
+        if _mark_analysis_failed(
+            db,
+            analysis_id,
+            generation=generation,
+        ):
+            _cleanup_files_after_terminal_failure(
+                db,
+                analysis_id,
+            )
+
         raise
+
     finally:
         db.close()
 
@@ -2274,15 +2482,18 @@ def _cache_source_index(cache_key: tuple[int, int], index) -> None:
     _source_index_process_cache[cache_key] = index
 
 
-def _acquire_source_index(analysis: Analysis, generation: int):
-    """ACQUISITION-CAPABLE (may clone/extract/publish, via prepare_source).
-    Reserved for the single source-preparation owner: only ever called by
-    _prepare_source_task, and only after it has already durably won the
-    "preparing" ownership claim (source_status "preparing", scoped to this
-    exact generation) - never by an artifact worker. See
-    _load_ready_source_index_for_artifact for the read-only equivalent
-    artifact tasks must use instead (item 24 of the source-ownership
-    hardening pass)."""
+def _acquire_source_index(
+    analysis: Analysis,
+    generation: int,
+    publish_callback=None,
+):
+    """ACQUISITION-CAPABLE (may clone/extract/index, via prepare_source).
+
+    Reserved for the single source-preparation owner. Production supplies a
+    publication callback that generation-fences the short canonical publish +
+    durable ready transition. Direct unit tests may omit it to exercise the
+    source service in isolation.
+    """
     if (
         not analysis.source_kind
         or not analysis.source_reference
@@ -2292,45 +2503,45 @@ def _acquire_source_index(analysis: Analysis, generation: int):
 
     cache_key = (analysis.id, generation)
     cached = _source_index_process_cache.get(cache_key)
+
     if cached is not None:
         return cached
 
     try:
-        index = prepare_source(
-            analysis.source_kind,
-            analysis.source_reference,
-            analysis.id,
-            generation,
-        )
+        if publish_callback is None:
+            index = prepare_source(
+                analysis.source_kind,
+                analysis.source_reference,
+                analysis.id,
+                generation,
+            )
+        else:
+            index = prepare_source(
+                analysis.source_kind,
+                analysis.source_reference,
+                analysis.id,
+                generation,
+                publish_callback=publish_callback,
+            )
+
     except SourceInputError:
         raise
+
     except Exception as error:
         logger.exception(
             "Analysis %s | optional source acquisition/indexing failed",
             analysis.id,
         )
+
         raise SourceSubsystemError(
             "Optional source acquisition or indexing failed"
         ) from error
 
-    # Deliberately its own try/except, OUTSIDE the block above: prepare_source()
-    # already fully succeeded by this point (tree + index + manifest all
-    # durably complete), so a staged-ZIP-unlink OSError here is a
-    # housekeeping failure, not a source-availability failure - it must
-    # never be converted into a SourceSubsystemError that would mark this
-    # perfectly good source "unavailable".
-    if analysis.source_kind == "zip":
-        try:
-            _remove_staged_source_archive(analysis.source_reference)
-        except OSError:
-            logger.warning(
-                "Analysis %s | source preparation succeeded but the staged "
-                "ZIP could not be removed; source remains ready",
-                analysis.id,
-                exc_info=True,
-            )
+    if index is None:
+        return None
 
     _cache_source_index(cache_key, index)
+
     return index
 
 
@@ -3340,18 +3551,6 @@ def _claim_and_demote_stale_processing(
             db.rollback()
             continue
 
-        if stale_source_status == "preparing":
-            try:
-                cleanup_generation_source_temp(analysis_id, stale_generation)
-            except OSError:
-                logger.warning(
-                    "Analysis %s | could not clean up generation %s's "
-                    "abandoned source staging directory",
-                    analysis_id,
-                    stale_generation,
-                    exc_info=True,
-                )
-
         stuck_artifacts = (
             db.query(AnalysisArtifact.id, AnalysisArtifact.detected_format)
             .filter(
@@ -3397,6 +3596,24 @@ def _claim_and_demote_stale_processing(
             AnalysisArtifact.status == "processing",
         ).update({"status": "pending"}, synchronize_session=False)
         db.commit()
+        # Filesystem cleanup is deliberately AFTER the durable demotion/reset
+        # commit. A large recursive delete must never hold the Analysis DB
+        # transaction/locks open; failure here is housekeeping only.
+        if stale_source_status == "preparing":
+            try:
+                cleanup_generation_source_temp(
+                    analysis_id,
+                    stale_generation,
+                )
+            except OSError:
+                logger.warning(
+                    "Analysis %s | could not clean up generation %s's "
+                    "abandoned source staging directory",
+                    analysis_id,
+                    stale_generation,
+                    exc_info=True,
+                )
+
         claimed_ids.append(analysis_id)
     return claimed_ids
 

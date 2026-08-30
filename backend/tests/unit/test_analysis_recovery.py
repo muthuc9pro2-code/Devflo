@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from celery.exceptions import Retry
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
@@ -931,6 +932,312 @@ def test_prepare_source_task_reuses_the_ready_marker_instead_of_recloning(monkey
     db.expire_all()
     assert analysis.source_status == "ready"
 
+def test_duplicate_source_preparing_waiter_retries_without_heartbeat_or_failure(
+    monkeypatch,
+):
+    db = _session()
+
+    alice = _user(db)
+
+    analysis = _analysis(
+        db,
+        alice,
+        status="processing",
+        source_kind="github",
+        source_reference="https://github.com/example/repo",
+        source_status="preparing",
+    )
+
+    analysis_id = analysis.id
+
+    heartbeat = Mock()
+    mark_failed = Mock()
+
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        lambda **_k: db,
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_bump_processing_heartbeat",
+        heartbeat,
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_mark_analysis_failed",
+        mark_failed,
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "load_ready_source_index",
+        lambda _aid: None,
+    )
+
+    assert (
+        analysis_task._prepare_source_task.max_retries
+        is None
+    )
+
+    with pytest.raises(Retry):
+        analysis_task._prepare_source_task.run(
+            analysis_id,
+            0,
+        )
+
+    heartbeat.assert_not_called()
+    mark_failed.assert_not_called()
+
+
+def test_prepare_source_task_adopts_complete_ready_source_after_owner_crash(
+    monkeypatch,
+    tmp_path,
+):
+    from app.services import source_archive
+
+    monkeypatch.setattr(
+        source_archive,
+        "SOURCE_STORAGE_ROOT",
+        str(tmp_path / "sources"),
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_source_index_process_cache",
+        {},
+    )
+
+    def fake_clone(_url, dest):
+        dest.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        (dest / "app.py").write_text(
+            "print(1)\n"
+        )
+
+    monkeypatch.setattr(
+        source_archive,
+        "_clone_github",
+        fake_clone,
+    )
+
+    db = _session()
+
+    alice = _user(db)
+
+    analysis = _analysis(
+        db,
+        alice,
+        status="processing",
+        source_kind="github",
+        source_reference="https://github.com/example/repo",
+        source_status="preparing",
+    )
+
+    analysis_id = analysis.id
+
+    # Exact crash window:
+    #
+    # tree + index + manifest + .ready exist,
+    # but DB still says preparing.
+    source_archive.prepare_source(
+        "github",
+        "https://github.com/example/repo",
+        analysis_id,
+        0,
+    )
+
+    assert source_archive._ready_marker(
+        tmp_path / "sources" / str(analysis_id)
+    ).exists()
+
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        lambda **_k: db,
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_bump_processing_heartbeat",
+        lambda *_a, **_k: (
+            _ for _ in ()
+        ).throw(
+            AssertionError(
+                "duplicate ready-source adopter must not bump heartbeat"
+            )
+        ),
+    )
+
+    analysis_task._prepare_source_task.run(
+        analysis_id,
+        0,
+    )
+
+    db.expire_all()
+
+    reloaded = (
+        db.query(Analysis)
+        .filter(
+            Analysis.id == analysis_id
+        )
+        .one()
+    )
+
+    assert reloaded.source_status == "ready"
+
+    assert (
+        analysis_id,
+        0,
+    ) in analysis_task._source_index_process_cache
+
+
+def test_source_publication_guard_rejects_superseded_generation(
+    monkeypatch,
+):
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:"
+    )
+
+    Base.metadata.create_all(engine)
+
+    session_factory = sessionmaker(
+        bind=engine
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        session_factory,
+    )
+
+    db = session_factory()
+
+    alice = _user(db)
+
+    analysis = _analysis(
+        db,
+        alice,
+        status="processing",
+        processing_generation=2,
+        source_kind="github",
+        source_reference="https://github.com/example/repo",
+        source_status="preparing",
+    )
+
+    analysis_id = analysis.id
+
+    db.close()
+
+    publisher = Mock(
+        return_value=object()
+    )
+
+    result = (
+        analysis_task
+        ._publish_source_for_current_generation(
+            analysis_id,
+            1,
+            publisher,
+        )
+    )
+
+    assert result is None
+
+    publisher.assert_not_called()
+
+
+def test_recovery_source_temp_cleanup_runs_only_after_demote_commit(
+    monkeypatch,
+):
+    db = _session()
+
+    alice = _user(db)
+
+    analysis = _analysis(
+        db,
+        alice,
+        status="processing",
+        processing_generation=3,
+        source_kind="github",
+        source_reference="https://github.com/example/repo",
+        source_status="preparing",
+    )
+
+    analysis_id = analysis.id
+
+    committed = {
+        "value": False
+    }
+
+    real_commit = db.commit
+
+    def tracked_commit():
+        real_commit()
+        committed["value"] = True
+
+    monkeypatch.setattr(
+        db,
+        "commit",
+        tracked_commit,
+    )
+
+    cleanup_calls = []
+
+    def tracked_cleanup(
+        aid,
+        generation,
+    ):
+        assert committed["value"] is True
+
+        cleanup_calls.append(
+            (
+                aid,
+                generation,
+            )
+        )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "cleanup_generation_source_temp",
+        tracked_cleanup,
+    )
+
+    claimed = (
+        analysis_task
+        ._claim_and_demote_stale_processing(
+            db,
+            Analysis.id == analysis_id,
+            datetime.now(timezone.utc),
+        )
+    )
+
+    assert claimed == [analysis_id]
+
+    assert cleanup_calls == [
+        (
+            analysis_id,
+            3,
+        )
+    ]
+
+    db.expire_all()
+
+    reloaded = (
+        db.query(Analysis)
+        .filter(
+            Analysis.id == analysis_id
+        )
+        .one()
+    )
+
+    assert reloaded.status == "pending"
+    assert reloaded.source_status is None
 
 def test_prepare_source_task_does_not_retry_when_source_is_already_unavailable(monkeypatch):
     db = _session()

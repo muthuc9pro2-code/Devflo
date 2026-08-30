@@ -283,57 +283,157 @@ def test_source_failure_ignored_when_analysis_already_cancelled(monkeypatch):
 # --- Successful preparation's existing archive-removal is unchanged --------
 
 
-def test_successful_zip_preparation_still_removes_the_staged_archive(staged_zip, monkeypatch):
-    db = _session()
-    alice = _user(db)
-    analysis = _analysis(
-        db, alice, status="processing",
-        source_kind="zip", source_reference=str(staged_zip), source_status=None,
+def test_successful_zip_preparation_removes_staged_archive_only_after_ready_commit(
+    staged_zip,
+    monkeypatch,
+):
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:"
     )
-    monkeypatch.setattr(analysis_task, "prepare_source", lambda kind, ref, aid, gen: object())
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
 
-    index = analysis_task._acquire_source_index(analysis, 0)
+    db = session_factory()
 
-    assert index is not None
+    alice = _user(db)
+
+    analysis = _analysis(
+        db,
+        alice,
+        status="processing",
+        source_kind="zip",
+        source_reference=str(staged_zip),
+        source_status=None,
+    )
+
+    analysis_id = analysis.id
+    db.close()
+
+    monkeypatch.setattr(
+        analysis_task,
+        "sessionLocal",
+        session_factory,
+    )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_bump_processing_heartbeat",
+        lambda *_a, **_k: None,
+    )
+
+    real_index = object()
+
+    def fake_acquire(
+        analysis_arg,
+        generation_arg,
+        publish_callback=None,
+    ):
+        # The original ZIP MUST still exist before the durable ready commit.
+        assert staged_zip.exists()
+        assert publish_callback is not None
+
+        return publish_callback(
+            lambda: real_index
+        )
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_acquire_source_index",
+        fake_acquire,
+    )
+
+    observed_source_status = []
+
+    real_remove = (
+        analysis_task._remove_staged_source_archive
+    )
+
+    def tracked_remove(reference):
+        check_db = session_factory()
+
+        try:
+            observed_source_status.append(
+                check_db.query(
+                    Analysis.source_status
+                )
+                .filter(
+                    Analysis.id == analysis_id
+                )
+                .scalar()
+            )
+        finally:
+            check_db.close()
+
+        real_remove(reference)
+
+    monkeypatch.setattr(
+        analysis_task,
+        "_remove_staged_source_archive",
+        tracked_remove,
+    )
+
+    analysis_task._prepare_source_task.run(
+        analysis_id,
+        0,
+    )
+
+    check_db = session_factory()
+
+    try:
+        reloaded = (
+            check_db.query(Analysis)
+            .filter(
+                Analysis.id == analysis_id
+            )
+            .one()
+        )
+
+        assert reloaded.source_status == "ready"
+
+    finally:
+        check_db.close()
+
+    assert observed_source_status == ["ready"]
     assert not staged_zip.exists()
 
 
-# --- A staged-ZIP cleanup failure AFTER a real success is not a source failure --
-
-
-def test_staged_zip_unlink_oserror_after_success_does_not_mark_source_unavailable(
-    staged_zip, monkeypatch,
+def test_staged_zip_unlink_oserror_after_ready_is_housekeeping_only(
+    staged_zip,
+    monkeypatch,
 ):
-    """prepare_source() itself already fully succeeded (tree + index +
-    manifest durably complete) by the time _remove_staged_source_archive
-    runs - an OSError from THAT purely-cosmetic cleanup step must never be
-    reinterpreted as "the source failed to prepare". _acquire_source_index
-    must return the real index, not raise SourceSubsystemError."""
     db = _session()
+
     alice = _user(db)
+
     analysis = _analysis(
-        db, alice, status="processing",
-        source_kind="zip", source_reference=str(staged_zip), source_status=None,
+        db,
+        alice,
+        status="processing",
+        source_kind="zip",
+        source_reference=str(staged_zip),
+        source_status="ready",
     )
-    # The process-local cache is module-level and keyed by
-    # (analysis.id, generation) - this test's fresh in-memory DB restarts
-    # ids at 1, so without resetting the cache a stale entry left by an
-    # earlier test in this file could mask what this test actually checks.
-    monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
-    real_index = object()
-    monkeypatch.setattr(analysis_task, "prepare_source", lambda kind, ref, aid, gen: real_index)
+
     monkeypatch.setattr(
-        analysis_task, "_remove_staged_source_archive",
-        lambda ref: (_ for _ in ()).throw(OSError("permission denied")),
+        analysis_task,
+        "_remove_staged_source_archive",
+        lambda ref: (
+            _ for _ in ()
+        ).throw(
+            OSError("permission denied")
+        ),
     )
 
-    index = analysis_task._acquire_source_index(analysis, 0)
+    # Must not raise and must not alter durable source/analysis state.
+    analysis_task._remove_staged_zip_after_ready(
+        analysis
+    )
 
-    assert index is real_index
-    assert analysis.source_status is None  # never flipped to "unavailable"
+    db.expire_all()
 
-
-# --- Process-local cache is generation-scoped, never analysis_id alone -----
+    assert analysis.status == "processing"
+    assert analysis.source_status == "ready"
+    assert staged_zip.exists()
 
 
 def test_source_index_cache_does_not_leak_across_generations(monkeypatch):

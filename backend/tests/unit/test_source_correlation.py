@@ -344,3 +344,53 @@ def test_old_generation_cannot_delete_or_replace_a_newer_generations_published_s
     # behind or promoted to canonical.
     stray_temps = list((tmp_path / "sources").glob("99.tmp-*"))
     assert stray_temps == []
+
+def test_stale_generation_denied_publication_cannot_touch_unready_canonical_tree(
+    tmp_path,
+    monkeypatch,
+):
+    """A stale generation denied DB publication ownership cannot touch a
+    canonical tree even when that tree has no .ready marker yet."""
+    monkeypatch.setattr(
+        source_archive,
+        "SOURCE_STORAGE_ROOT",
+        str(tmp_path / "sources"),
+    )
+
+    root = tmp_path / "sources"
+    root.mkdir(parents=True)
+
+    dest = root / "99"
+    dest.mkdir()
+
+    (dest / "gen2_real.py").write_text(
+        "print('gen2')\n"
+    )
+
+    def fake_clone(_url, private_dest):
+        private_dest.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        (private_dest / "gen1_stale.py").write_text(
+            "print('gen1')\n"
+        )
+
+    monkeypatch.setattr(
+        source_archive,
+        "_clone_github",
+        fake_clone,
+    )
+
+    result = prepare_source(
+        "github",
+        "https://github.com/acme/project",
+        99,
+        1,
+        publish_callback=lambda _publisher: None,
+    )
+
+    assert result is None
+    assert (dest / "gen2_real.py").exists()
+    assert not (dest / "gen1_stale.py").exists()
+    assert list(root.glob("99.tmp-1-*")) == []

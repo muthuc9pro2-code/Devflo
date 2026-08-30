@@ -196,8 +196,11 @@ def cleanup_prepared_source(analysis_id: int) -> None:
     manifest_path.unlink(missing_ok=True)
     tmp_manifest_path.unlink(missing_ok=True)
 
-    for stray_temp_dir in dest.parent.glob(f"{dest.name}.tmp-*"):
-        shutil.rmtree(stray_temp_dir, ignore_errors=True)
+    for stray_temp in dest.parent.glob(f"{dest.name}.tmp-*"):
+        if stray_temp.is_dir():
+            shutil.rmtree(stray_temp, ignore_errors=True)
+        else:
+            stray_temp.unlink(missing_ok=True)
 
 
 def _load_or_rebuild_index(dest: Path, manifest_path: Path):
@@ -252,55 +255,71 @@ def cleanup_generation_source_temp(analysis_id: int, generation: int) -> None:
     temp directory is eventually swept by cleanup_prepared_source's own
     broader glob at genuine terminal cleanup)."""
     dest = _analysis_source_dir(analysis_id)
-    for stray_temp_dir in dest.parent.glob(f"{dest.name}.tmp-{generation}-*"):
-        shutil.rmtree(stray_temp_dir, ignore_errors=True)
+    for stray_temp in dest.parent.glob(f"{dest.name}.tmp-{generation}-*"):
+        if stray_temp.is_dir():
+            shutil.rmtree(stray_temp, ignore_errors=True)
+        else:
+            stray_temp.unlink(missing_ok=True)
 
 
-def prepare_source(source_kind: str, source_reference: str, analysis_id: int, generation: int):
-    """ACQUISITION-CAPABLE: may clone/extract/publish. Reserved for the
-    single source-preparation owner (app.tasks.analysis's
-    _prepare_source_task, via its own durable "preparing" ownership claim)
-    - never called by an artifact worker, which must use
-    load_ready_source_index() instead (see item 24 of the source-ownership
-    hardening pass this docstring documents).
+def prepare_source(
+    source_kind: str,
+    source_reference: str,
+    analysis_id: int,
+    generation: int,
+    publish_callback=None,
+):
+    """Prepare optional source in generation-private storage, then publish it.
 
-    Idempotent across a resumed process_analysis run: if this analysis's
-    source was already fully acquired by ANY prior invocation (ready
-    marker present), skip re-cloning/re-extracting entirely and just
-    (re)load its index - without this, resuming a GitHub-sourced analysis
-    always fails outright (`git clone` refuses a non-empty destination),
-    and resuming a ZIP-sourced one fails once the staged upload has been
-    deleted after its first successful use. The marker lives beside
-    `dest`, not inside it, so it is never picked up by build_index as a
-    source file.
+    Clone/extract, index construction, and manifest construction all happen
+    under a private ``<analysis>.tmp-<generation>-<uuid>`` directory. The
+    canonical analysis source directory is not touched until every expensive
+    preparation step has succeeded.
 
-    Generation-owned temporary staging: acquisition (clone/extract) always
-    happens into a private, this-call-only temporary directory embedding
-    `generation` in its name - never directly into the canonical `dest`.
-    Only once acquisition fully succeeds is the temp directory published
-    into `dest` with one atomic os.replace() (a rename, not a copy - POSIX
-    guarantees this is atomic when both paths are on the same filesystem/
-    mount, which they always are here since both live directly under
-    SOURCE_STORAGE_ROOT). This is what makes "an old, superseded
-    generation's still-running acquisition clobbers a newer generation's
-    already-published source" impossible: an old generation can only ever
-    delete/replace its OWN temp directory (see its except-block below,
-    and the marker re-check immediately before publishing), never the
-    canonical `dest` a different, newer execution already finished
-    publishing - the marker re-check closes that window at the filesystem
-    level, and the caller's own generation-conditional DB claim/transition
-    (source_status "preparing" -> "ready", only for the exact generation
-    that is still current) closes it at the durable-state level.
+    Production passes ``publish_callback`` from the source-preparation task.
+    That callback acquires the Analysis row lock, re-verifies that this exact
+    processing generation still owns ``source_status='preparing'``, invokes
+    the short filesystem publisher while that lock is held, and durably
+    commits ``source_status='ready'`` before releasing the lock. This makes a
+    stale generation unable to delete or replace a newer generation's
+    canonical source while avoiding any DB lock across clone, ZIP extraction,
+    or index construction.
+
+    A ready marker is still the crash-safe filesystem publication boundary.
+    If it already exists, the prepared source is adopted without requiring
+    the original ZIP or another Git clone.
     """
     dest = Path(SOURCE_STORAGE_ROOT) / str(analysis_id)
     marker = _ready_marker(dest)
     manifest_path = index_manifest_path(dest)
 
+    def _run_publisher(publisher):
+        if publish_callback is None:
+            return publisher()
+        return publish_callback(publisher)
+
     if marker.exists():
-        return _load_or_rebuild_index(dest, manifest_path)
+        # Read/build the index before the DB publication guard, but do not
+        # mutate canonical filesystem state yet. A stale generation may do
+        # harmless read-only work; only an authorized current generation may
+        # refresh a missing/corrupt manifest.
+        ready_index = load_index_manifest(manifest_path, dest)
+        manifest_needs_refresh = ready_index is None
+        if ready_index is None:
+            ready_index = build_index(dest)
+
+        def _adopt_ready():
+            if not marker.exists():
+                return None
+            if manifest_needs_refresh:
+                save_index_manifest(ready_index, manifest_path)
+            return ready_index
+
+        return _run_publisher(_adopt_ready)
 
     temp_dest = dest.parent / f"{dest.name}.tmp-{generation}-{uuid.uuid4().hex}"
-    published_by_this_call = False
+    retired_dest = None
+
     try:
         if source_kind == "github":
             _clone_github(source_reference, temp_dest)
@@ -309,50 +328,54 @@ def prepare_source(source_kind: str, source_reference: str, analysis_id: int, ge
         else:
             raise SourceInputError(f"Unsupported source kind: {source_kind}")
 
-        # A different (necessarily newer, since ids/generations only ever
-        # advance) execution may have finished publishing while this one
-        # was still cloning/extracting - never overwrite an
-        # already-published canonical tree with this now-superseded copy.
-        # This is a defense-in-depth filesystem-level check alongside the
-        # caller's own DB-level generation-conditional claim/transition;
-        # either alone already makes the double-publish race exceedingly
-        # unlikely, together they close it.
-        if marker.exists():
-            shutil.rmtree(temp_dest, ignore_errors=True)
-            return _load_or_rebuild_index(dest, manifest_path)
+        # All expensive preparation is still generation-private here.
+        # Keep the private manifest BESIDE the user-controlled tree so a
+        # source file can never collide with or be overwritten by it.
+        index = build_index(temp_dest)
+        private_manifest = temp_dest.parent / f"{temp_dest.name}.index.json"
+        save_index_manifest(index, private_manifest)
 
-        if dest.exists():
-            # Not marked ready - a partial tree left by a crashed prior
-            # attempt (or by a since-abandoned generation that never
-            # reached publication). Never proven complete, so never
-            # trusted; always safe to discard and replace.
-            shutil.rmtree(dest)
-        os.replace(temp_dest, dest)
-        published_by_this_call = True
+        def _publish_prepared():
+            # Another complete source may have appeared while this generation
+            # was doing its private preparation. Production calls this only
+            # while holding the Analysis publication lock.
+            if marker.exists():
+                return _load_or_rebuild_index(dest, manifest_path)
 
-        index = build_index(dest)
-        save_index_manifest(index, manifest_path)
-        # The ready marker is published LAST, only once the source tree,
-        # its index, and the on-disk manifest are all durably complete - a
-        # reader that observes the marker can trust the whole prepared
-        # state is loadable via the fast path above, with no dependency on
-        # this same process ever finishing. Publishing it any earlier would
-        # let a crash between the touch and the manifest write leave a
-        # marker whose promised state is not actually there yet.
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.touch()
-    except Exception:
-        # Always removes THIS call's own private temp directory - a no-op
-        # if it was already renamed away. If THIS call is also the one
-        # that published `dest` (the os.replace above already succeeded)
-        # and index-build/manifest-save then failed, `dest` is this call's
-        # own incomplete work, not a canonical tree any newer execution
-        # could yet be relying on - safe to remove, but only after one
-        # more marker re-check: if some other, newer execution has somehow
-        # already published in the meantime, its canonical tree must never
-        # be touched.
+            # A canonical directory with no ready marker is incomplete state
+            # left by a crashed publication. Never recursively delete it while
+            # holding the Analysis row lock. Rename it atomically to private
+            # retirement storage, publish the complete candidate, and delete
+            # the retired tree later after the DB lock has been released.
+            nonlocal retired_dest
+            if dest.exists():
+                retired_dest = dest.parent / (
+                    f"{dest.name}.tmp-{generation}-retired-{uuid.uuid4().hex}"
+                )
+                os.replace(dest, retired_dest)
+
+            os.replace(temp_dest, dest)
+            os.replace(private_manifest, manifest_path)
+            index.root = dest
+
+            # Marker LAST. If a worker dies after this line but before the DB
+            # ready commit, a redelivery can safely adopt this exact tree.
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+
+            return index
+
+        return _run_publisher(_publish_prepared)
+
+    finally:
+        # Only private state owned by this invocation is reclaimed here.
+        # Never rmtree canonical `dest` from this exception/finally path:
+        # after publication ownership is lost, a newer generation may own it.
         shutil.rmtree(temp_dest, ignore_errors=True)
-        if published_by_this_call and not marker.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        raise
-    return index
+
+        private_manifest = locals().get("private_manifest")
+        if private_manifest is not None:
+            private_manifest.unlink(missing_ok=True)
+
+        if retired_dest is not None:
+            shutil.rmtree(retired_dest, ignore_errors=True)

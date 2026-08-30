@@ -156,26 +156,49 @@ def test_artifact_batch_correlates_only_retained_events(monkeypatch):
     assert discarded.source_matches == []
 
 
-def test_source_index_is_prepared_once_and_zip_staging_is_removed(monkeypatch):
+def test_source_index_is_prepared_once_and_zip_is_not_removed_before_ready_commit(
+    monkeypatch,
+):
     # The process-local cache is module-level and keyed by
     # (analysis.id, generation) - reset it so an entry left behind by
     # another test (this fixture id is reused throughout the suite) can
     # never make this test silently skip calling prepare_source.
     monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
+
     analysis = SimpleNamespace(
         id=9,
         source_kind="zip",
         source_reference="uploads/source.zip",
     )
+
     index = object()
     prepare = Mock(return_value=index)
     remove = Mock()
-    monkeypatch.setattr(analysis_task, "prepare_source", prepare)
-    monkeypatch.setattr(analysis_task, "_remove_staged_source_archive", remove)
+
+    monkeypatch.setattr(
+        analysis_task,
+        "prepare_source",
+        prepare,
+    )
+    monkeypatch.setattr(
+        analysis_task,
+        "_remove_staged_source_archive",
+        remove,
+    )
 
     assert analysis_task._acquire_source_index(analysis, 0) is index
-    prepare.assert_called_once_with("zip", "uploads/source.zip", 9, 0)
-    remove.assert_called_once_with("uploads/source.zip")
+
+    prepare.assert_called_once_with(
+        "zip",
+        "uploads/source.zip",
+        9,
+        0,
+    )
+
+    # Item 7: filesystem preparation alone is NOT enough to delete the
+    # original staged ZIP. _prepare_source_task removes it only after the
+    # generation-authorized source_status="ready" DB commit succeeds.
+    remove.assert_not_called()
 
 
 def test_log_only_analysis_does_not_prepare_source(monkeypatch):

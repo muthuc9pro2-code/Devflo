@@ -602,7 +602,7 @@ def test_prepare_source_task_does_not_touch_the_published_tree_when_cancelled_mi
     # keeps it from closing this test's real `db`.
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
 
-    def fake_prepare(analysis_arg, generation_arg):
+    def fake_prepare(analysis_arg, generation_arg, **_kwargs):
         # Simulate the cancel endpoint racing in while the (real,
         # slow) source prep call above was running.
         db.query(Analysis).filter(Analysis.id == analysis_id).update({"status": "cancelled"})
@@ -630,7 +630,7 @@ def test_prepare_source_task_does_not_mark_unavailable_for_a_cancelled_analysis(
     analysis_id = analysis.id
     monkeypatch.setattr(analysis_task, "sessionLocal", Mock(side_effect=[db, Mock()]))
 
-    def fake_prepare(analysis_arg, generation_arg):
+    def fake_prepare(analysis_arg, generation_arg, **_kwargs):
         db.query(Analysis).filter(Analysis.id == analysis_id).update({"status": "cancelled"})
         db.commit()
         raise SourceInputError("repository not found")
