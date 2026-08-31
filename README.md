@@ -100,9 +100,13 @@ parsing, source indexing, and correlation — not part of the test suite.
 
 ## Deployment status
 
-Not yet containerized or deployed. `backend/Dockerfile` and
-`docker-compose.yml` exist as empty placeholders, and there is no CI/CD
-workflow configured. Several resource limits (e.g. OCR/artifact-fan-out
-bounds, Celery worker concurrency) are sized in code comments for a small,
-single-machine target (~2 vCPU) rather than for horizontal scaling or high
-availability.
+Container definitions are included for the small Devflo deployment.
+`backend/Dockerfile` builds the FastAPI/Celery image,
+`frontend/Dockerfile` builds the Vite frontend and serves it through Caddy,
+and `docker-compose.yml` wires the API, Celery worker, Celery Beat, Redis,
+and frontend services together. MySQL remains an externally configured
+database dependency.
+
+The deployment is intentionally sized for a small single-host target rather
+than horizontal scaling or high availability. No CI/CD workflow is
+configured in this repository.

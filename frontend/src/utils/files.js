@@ -5,6 +5,7 @@ export const DIAGNOSTIC_ACCEPT = [
   '.jsonl',
   '.ndjson',
   '.har',
+  '.tsv',
   '.out',
   '.err',
   '.png',
@@ -26,8 +27,8 @@ export const MAX_DIAGNOSTIC_ARTIFACTS = 200
 export const MAX_OCR_IMAGES_PER_INVESTIGATION = 20
 export const MAX_OCR_IMAGE_BYTES = 20 * 1024 ** 2
 
-const EXPLICIT_DIAGNOSTIC_SUFFIX = /\.(?:log|txt|json|jsonl|ndjson|har|out|err|png|jpe?g|webp)$/i
-const ROTATED_TEXT_SUFFIX = /\.(?:log|txt|json|jsonl|ndjson|har|out|err)\.\d+$/i
+const EXPLICIT_DIAGNOSTIC_SUFFIX = /\.(?:log|txt|json|jsonl|ndjson|har|tsv|out|err|png|jpe?g|webp)$/i
+const ROTATED_TEXT_SUFFIX = /\.(?:log|txt|json|jsonl|ndjson|har|tsv|out|err)\.\d+$/i
 const SUPPORTED_IMAGE_SUFFIX = /\.(?:png|jpe?g|webp)$/i
 
 export function isSupportedDiagnosticFilename(filename) {

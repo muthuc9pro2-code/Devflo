@@ -9,12 +9,27 @@ vi.mock('../api/analysis', () => ({ uploadFiles: mocks.uploadFiles }))
 
 vi.mock('../components/FileDropzone', () => ({
   default: ({ onAddFiles }) => (
-    <button
-      type="button"
-      onClick={() => onAddFiles([{ file: new File(['x'], 'app.log'), displayPath: 'app.log' }])}
-    >
-      Add app.log
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={() => onAddFiles([{ file: new File(['x'], 'app.log'), displayPath: 'app.log' }])}
+      >
+        Add app.log
+      </button>
+      <button
+        type="button"
+        onClick={() => onAddFiles([{
+          file: new File(
+            ['#Version: 1.0\n#Fields: date time x-edge-location sc-status\n'],
+            'cloudfront.tsv',
+            { type: 'text/tab-separated-values' },
+          ),
+          displayPath: 'cloudfront.tsv',
+        }])}
+      >
+        Add cloudfront.tsv
+      </button>
+    </>
   ),
 }))
 
@@ -154,5 +169,37 @@ describe('NewInvestigationPage - backend admission errors', () => {
     expect(
       screen.getByRole('button', { name: 'Start investigation' }).disabled,
     ).toBe(false)
+  })
+})
+
+describe('NewInvestigationPage - supported diagnostic formats', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('accepts a CloudFront TSV artifact and submits it unchanged', async () => {
+    mocks.uploadFiles.mockResolvedValue({ id: 41 })
+
+    render(<NewInvestigationPage onUploaded={() => {}} />)
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Add cloudfront.tsv' }),
+      )
+    })
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Start investigation' }),
+      )
+    })
+
+    expect(mocks.uploadFiles).toHaveBeenCalledTimes(1)
+    const [files, source] = mocks.uploadFiles.mock.calls[0]
+    expect(files).toHaveLength(1)
+    expect(files[0].name).toBe('cloudfront.tsv')
+    expect(source).toEqual({
+      githubUrl: '',
+      sourceZip: null,
+    })
   })
 })
