@@ -595,7 +595,7 @@ def test_concurrent_manifest_writers_use_distinct_temp_files(tmp_path, monkeypat
     def synchronized_replace(source, destination):
         if Path(destination) == manifest:
             with capture_lock:
-                replace_sources.append(Path(source).name)
+                replace_sources.append(Path(source))
             barrier.wait(timeout=5)
         return real_replace(source, destination)
 
@@ -610,8 +610,67 @@ def test_concurrent_manifest_writers_use_distinct_temp_files(tmp_path, monkeypat
 
     assert len(replace_sources) == 2
     assert len(set(replace_sources)) == 2
+    assert all(path.suffix == ".pyc" for path in replace_sources)
     assert list(tmp_path.glob("index.json.tmp-*")) == []
+    assert list(tmp_path.glob(".devflo-index-manifest-*.pyc")) == []
     assert load_index_manifest(manifest, tmp_path) is not None
+
+
+def test_terminal_cleanup_cannot_be_undone_by_late_manifest_writer(tmp_path, monkeypatch):
+    """Terminal cleanup must remain final even if a stale manifest refresh
+    had already started but had not yet written its unique temp file.
+
+    The manifest writer temp belongs inside the canonical source tree. Once
+    cleanup_prepared_source() removes that tree, the stale writer must fail
+    rather than recreating the sibling <analysis>.index.json after terminal
+    cleanup has already completed.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(source_root))
+
+    analysis_id = 77
+    dest = source_root / str(analysis_id)
+    dest.mkdir()
+    source_file = dest / "app.py"
+    source_file.write_text("print('hi')\n")
+    marker = source_archive._ready_marker(dest)
+    marker.touch()
+    manifest = source_index.index_manifest_path(dest)
+    index = build_index(dest)
+
+    writer_reached_temp_write = threading.Event()
+    allow_writer_to_continue = threading.Event()
+    real_write_bytes = Path.write_bytes
+
+    def blocked_write_bytes(path, data):
+        if path.name.startswith(".devflo-index-manifest-"):
+            writer_reached_temp_write.set()
+            assert allow_writer_to_continue.wait(timeout=5)
+        return real_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", blocked_write_bytes)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(save_index_manifest, index, manifest)
+        assert writer_reached_temp_write.wait(timeout=5)
+
+        # Terminal cleanup wins while the stale writer has selected its temp
+        # path but has not physically written anything yet.
+        cleanup_prepared_source(analysis_id)
+
+        allow_writer_to_continue.set()
+        with pytest.raises(OSError):
+            future.result(timeout=5)
+
+    assert not dest.exists()
+    assert not marker.exists()
+    assert not manifest.exists()
+    assert list(source_root.glob(f"{analysis_id}.index.json.tmp-*")) == []
+    assert list(source_root.rglob(".devflo-index-manifest-*.pyc")) == []
 
 
 # --- 13: cleanup_prepared_source() is idempotent ----------------------------

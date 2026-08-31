@@ -175,8 +175,17 @@ def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
     """Persist only canonical bounded source-file metadata as safe JSON.
 
     Derived lookup structures are reconstructed from by_path. Each writer gets
-    its own sibling temporary file so multiple ready-source artifact workers
-    can safely refresh the same missing/corrupt manifest concurrently.
+    its own source-tree-owned temporary file before atomically replacing the
+    sibling manifest.
+
+    Keeping the writer temp inside index.root is important for terminal
+    cleanup: if cancellation/failure removes the source tree while a stale
+    manifest refresh is in flight, that stale writer cannot recreate the
+    sibling manifest after cleanup has already won.
+
+    The .pyc suffix also keeps implementation-owned writer temps invisible to
+    concurrent build_index() walks because .pyc is already excluded from the
+    source index.
     """
     payload = {
         "version": _SOURCE_INDEX_MANIFEST_VERSION,
@@ -190,9 +199,7 @@ def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
         raise SourceIndexLimitError(
             "Source index manifest exceeds the supported size limit"
         )
-    temp_path = manifest_path.with_name(
-        f"{manifest_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
-    )
+    temp_path = index.root / f".devflo-index-manifest-{os.getpid()}-{uuid.uuid4().hex}.pyc"
     try:
         temp_path.write_bytes(encoded)
         os.replace(temp_path, manifest_path)
