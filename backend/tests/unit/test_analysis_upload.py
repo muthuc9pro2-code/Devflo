@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api import analysis as analysis_api
+from app.crud.analysis import ActiveAnalysisLimitReached
 
 
 def test_multiple_files_are_streamed_into_one_analysis(tmp_path, monkeypatch):
@@ -357,6 +358,43 @@ def test_generic_log_with_no_error_in_first_bytes_is_accepted(tmp_path, monkeypa
 
     assert result.id == 21
     create_analysis.assert_called_once()
+
+
+def test_active_analysis_quota_preflight_maps_to_429(monkeypatch):
+    monkeypatch.setattr(
+        analysis_api, "user_has_analysis_capacity", lambda _db, _user_id: False
+    )
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api._require_analysis_capacity(
+            db=Mock(),
+            current_user=SimpleNamespace(id=4),
+        )
+
+    assert error.value.status_code == 429
+    assert "3 active investigations" in error.value.detail
+
+
+def test_active_analysis_quota_race_cleans_staged_bytes_and_never_dispatches(
+    tmp_path, monkeypatch
+):
+    create_analysis = Mock(side_effect=ActiveAnalysisLimitReached())
+    task = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
+
+    with pytest.raises(HTTPException) as error:
+        analysis_api.upload_file(
+            file=_upload("diagnostic.log", b"ERROR failed"),
+            db=Mock(),
+            current_user=SimpleNamespace(id=4),
+        )
+
+    assert error.value.status_code == 429
+    assert "3 active investigations" in error.value.detail
+    assert list(tmp_path.iterdir()) == []
+    task.delay.assert_not_called()
 
 
 def _upload(filename: str, content: bytes):

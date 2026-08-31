@@ -4,6 +4,8 @@ from sqlalchemy.exc import OperationalError
 from app.core.config import Settings
 import logging
 from app.core.logger import setup_logging
+from app.core.processing_config import MAX_ANALYSIS_REQUEST_BODY_BYTES
+from app.core.request_body_limit import RequestBodyLimitMiddleware
 from contextlib import asynccontextmanager
 from app.api.v1.health import router as health_router
 from app.api import auth, analysis, analysis_stream
@@ -29,6 +31,12 @@ async def lifespan(app: FastAPI):
     logger.info("shutting down Devflo API")
 
 app = FastAPI(title=Settings.APP_NAME, version=Settings.APP_VERSION, lifespan=lifespan)
+
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    path="/analysis/upload",
+    max_body_size=MAX_ANALYSIS_REQUEST_BODY_BYTES,
+)
 
 
 @app.exception_handler(OperationalError)

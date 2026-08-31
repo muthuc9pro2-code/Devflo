@@ -23,6 +23,7 @@ vi.mock('../components/SourceCodeSection', () => ({
 }))
 
 import NewInvestigationPage from './NewInvestigationPage'
+import { ApiError } from '../api/client'
 
 // Each click gets its OWN act() boundary: React needs to flush the file
 // selection's state update before the "Start investigation" click's
@@ -118,5 +119,40 @@ describe('NewInvestigationPage - beforeunload lifecycle during active upload', (
 
     expect(preventDefaultSpy).toHaveBeenCalled()
     expect(event.returnValue).toBe('')
+  })
+})
+
+describe('NewInvestigationPage - backend admission errors', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('shows the active-investigation quota and releases the upload lock', async () => {
+    const onUploadingChange = vi.fn()
+    mocks.uploadFiles.mockRejectedValue(
+      new ApiError(
+        'You already have 3 active investigations. Wait for one to finish or cancel one before starting another.',
+        429,
+      ),
+    )
+
+    render(
+      <NewInvestigationPage
+        onUploaded={() => {}}
+        onUploadingChange={onUploadingChange}
+      />,
+    )
+    await addFileAndStart()
+
+    expect(
+      screen.getByText(
+        'You already have 3 active investigations. Wait for one to finish or cancel one before starting another.',
+      ),
+    ).toBeTruthy()
+    expect(onUploadingChange).toHaveBeenNthCalledWith(1, true)
+    expect(onUploadingChange).toHaveBeenLastCalledWith(false)
+    expect(
+      screen.getByRole('button', { name: 'Start investigation' }).disabled,
+    ).toBe(false)
   })
 })

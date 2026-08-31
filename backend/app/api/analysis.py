@@ -18,7 +18,11 @@ from app.core.processing_config import (
     MEBIBYTE,
     UPLOAD_COPY_CHUNK_BYTES,
 )
-from app.crud.analysis import create_analysis
+from app.crud.analysis import (
+    ActiveAnalysisLimitReached,
+    create_analysis,
+    user_has_analysis_capacity,
+)
 from app.db.database import get_db
 from app.models.analysis import Analysis
 from app.models.analysis_artifact import AnalysisArtifact
@@ -60,6 +64,23 @@ router = APIRouter(prefix="/analysis", tags=["Analysis"])
 logger = logging.getLogger(__name__)
 
 
+def _require_analysis_capacity(
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_verified_user)],
+) -> None:
+    # Cheap early rejection before the endpoint copies multipart temp files
+    # into Devflo's own staging directory.
+    #
+    # This is not trusted as the race-safe decision. create_analysis()
+    # repeats the check under the User lock.
+    if user_has_analysis_capacity(db, current_user.id):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=str(ActiveAnalysisLimitReached()),
+    )
+
+
 @router.post(
     "/upload",
     response_model=AnalysisResponse,
@@ -70,6 +91,7 @@ def upload_file(
     current_user: Annotated[User, Depends(get_current_verified_user)],
     github_url: Annotated[str | None, Form()] = None,
     source_zip: Annotated[UploadFile | None, File()] = None,
+    _capacity: None = Depends(_require_analysis_capacity),
 ):
     """Create one investigation from one or more repeated ``file`` parts."""
     uploads = file if isinstance(file, list) else [file]
@@ -282,6 +304,12 @@ def upload_file(
             source_status=source_status,
             source_failure_reason=source_failure_reason,
         )
+    except ActiveAnalysisLimitReached as error:
+        _remove_staged_uploads(staged_paths)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(error),
+        ) from error
     except UploadTooLarge as error:
         _remove_staged_uploads(staged_paths)
         raise HTTPException(status_code=413, detail=str(error)) from error

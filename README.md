@@ -37,7 +37,8 @@ stack frames against real source locations.
 
 - **Bounded-memory ingestion** — diagnostics are streamed and parsed in
   fixed-size batches rather than loaded whole, up to a 1 GiB combined
-  upload budget.
+  diagnostic budget, with a coarse raw-request ceiling ahead of multipart
+  parsing.
 - **Durable checkpoints** — each artifact tracks `processed_bytes` /
   `last_processed_line`, so a resumed or redispatched run continues from
   where it left off instead of reparsing from the start.
@@ -49,6 +50,10 @@ stack frames against real source locations.
   LLM is involved.
 - **Per-user ownership isolation** — JWT access/refresh tokens in HttpOnly
   cookies; every analysis is scoped to the authenticated user who created it.
+- **Small-deployment admission control** — one account may have at most
+  three nonterminal investigations (pending/processing) at once, matching
+  the two-worker interview deployment without introducing distributed
+  quota infrastructure.
 
 ## Tech stack
 

@@ -5,10 +5,75 @@ from typing import Any
 from sqlalchemy.orm import Session
 from app.models.analysis import Analysis
 from app.models.analysis_artifact import AnalysisArtifact
+from app.models.user import User
+from app.core.processing_config import MAX_ACTIVE_ANALYSES_PER_USER
 
 logger = logging.getLogger(__name__)
 
 _UPLOAD_ROOT = Path("uploads").resolve()
+
+_ACTIVE_ANALYSIS_STATUSES = ("pending", "processing")
+
+
+class ActiveAnalysisLimitReached(Exception):
+    def __init__(self, limit: int = MAX_ACTIVE_ANALYSES_PER_USER) -> None:
+        self.limit = limit
+        super().__init__(
+            f"You already have {limit} active investigations. "
+            "Wait for one to finish or cancel one before starting another."
+        )
+
+
+def _active_analysis_query(db: Session, user_id: int):
+    return (
+        db.query(Analysis.id)
+        .filter(
+            Analysis.user_id == user_id,
+            Analysis.status.in_(_ACTIVE_ANALYSIS_STATUSES),
+        )
+        .order_by(Analysis.id)
+    )
+
+
+def user_has_analysis_capacity(db: Session, user_id: int) -> bool:
+    """Cheap upload preflight only. The authoritative race-safe check
+    happens inside create_analysis()."""
+    active_rows = (
+        _active_analysis_query(db, user_id)
+        .limit(MAX_ACTIVE_ANALYSES_PER_USER)
+        .all()
+    )
+    return len(active_rows) < MAX_ACTIVE_ANALYSES_PER_USER
+
+
+def _ensure_user_analysis_capacity(db: Session, user_id: int) -> None:
+    # User is the per-account serialization row. No Analysis lifecycle path
+    # takes User after taking Analysis, so this does not introduce the lock
+    # inversion we spent half our natural lifespan removing earlier.
+    locked_user_id = (
+        db.query(User.id).filter(User.id == user_id).with_for_update().scalar()
+    )
+    if locked_user_id is None:
+        raise ValueError("User does not exist")
+
+    # This MUST be a locking/current read, not COUNT(*) from an earlier
+    # request snapshot.
+    #
+    # Authentication has already read User through this Session. Under
+    # MySQL's default transaction isolation a normal later SELECT may
+    # therefore use that older consistent-read snapshot.
+    #
+    # FOR UPDATE is a current read. Combined with the User-row lock above,
+    # concurrent Analysis creations for this SAME account serialize here.
+    active_rows = (
+        _active_analysis_query(db, user_id)
+        .with_for_update()
+        .limit(MAX_ACTIVE_ANALYSES_PER_USER)
+        .all()
+    )
+    if len(active_rows) >= MAX_ACTIVE_ANALYSES_PER_USER:
+        raise ActiveAnalysisLimitReached()
+
 
 def create_analysis(
     db: Session,
@@ -21,18 +86,18 @@ def create_analysis(
     source_status: str | None = None,
     source_failure_reason: str | None = None,
 ) -> Analysis:
-    
-    analysis = Analysis(
-        user_id=user_id,
-        original_filename=filename,
-        saved_file_path=saved_file_path,
-        source_kind=source_kind,
-        source_reference=source_reference,
-        source_status=source_status,
-        source_failure_reason=source_failure_reason,
-    )
-
     try:
+        _ensure_user_analysis_capacity(db, user_id)
+
+        analysis = Analysis(
+            user_id=user_id,
+            original_filename=filename,
+            saved_file_path=saved_file_path,
+            source_kind=source_kind,
+            source_reference=source_reference,
+            source_status=source_status,
+            source_failure_reason=source_failure_reason,
+        )
         db.add(analysis)
         db.flush()
 

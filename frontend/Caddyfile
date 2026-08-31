@@ -7,6 +7,14 @@
     }
 
     handle /analysis/* {
+        # Keep in sync with backend MAX_ANALYSIS_REQUEST_BODY_BYTES:
+        #
+        # 1 GiB diagnostics
+        # + 200 MiB optional source ZIP
+        # + 8 MiB multipart overhead.
+        request_body {
+            max_size 1291845632
+        }
         reverse_proxy api:8000
     }
 
