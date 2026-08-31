@@ -1,11 +1,18 @@
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
+from app.core.processing_config import ANALYSIS_REQUEST_BODY_LIMIT_DETAIL
 
-class _RequestBodyLimitExceeded(Exception):
-    pass
+
+class _RequestBodyLimitExceeded(HTTPException):
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=413,
+            detail=ANALYSIS_REQUEST_BODY_LIMIT_DETAIL,
+        )
 
 
 class RequestBodyLimitMiddleware:
@@ -55,7 +62,7 @@ class RequestBodyLimitMiddleware:
             if message.get("type") == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_body_size:
-                    raise _RequestBodyLimitExceeded
+                    raise _RequestBodyLimitExceeded()
             return message
 
         try:
@@ -66,11 +73,7 @@ class RequestBodyLimitMiddleware:
     async def _reject(self, scope, receive, send) -> None:
         response = JSONResponse(
             status_code=413,
-            content={
-                "detail": (
-                    "Analysis upload request exceeds the configured body limit"
-                )
-            },
+            content={"detail": ANALYSIS_REQUEST_BODY_LIMIT_DETAIL},
         )
         await response(scope, receive, send)
 

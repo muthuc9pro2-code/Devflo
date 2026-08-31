@@ -130,6 +130,27 @@ describe('verification handoff API retry behavior', () => {
     window.removeEventListener('devflo:service-unavailable', unavailable)
   })
 
+  it('preserves the JSON detail from an ingress 413 as a local ApiError', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 413,
+      ok: false,
+      statusText: 'Content Too Large',
+      json: vi.fn().mockResolvedValue({
+        detail: 'Analysis upload request exceeds the configured body limit',
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { request } = await import('./client')
+
+    await expect(
+      request('/analysis/upload', { method: 'POST', body: new FormData() }),
+    ).rejects.toMatchObject({
+      status: 413,
+      message: 'Analysis upload request exceeds the configured body limit',
+      code: null,
+    })
+  })
+
   it.each([
     '/auth/login',
     '/auth/register',

@@ -22,6 +22,22 @@
         reverse_proxy api:8000
     }
 
+    # request_body failures happen before FastAPI, so keep Caddy's
+    # ingress rejection in the same JSON error contract as the backend.
+    #
+    # Reverse-proxied backend responses do not enter Caddy error routes,
+    # so specific FastAPI 413 messages such as image-size or diagnostic
+    # limits remain untouched.
+    handle_errors 413 {
+        @analysis path /analysis/*
+        handle @analysis {
+            respond `{"detail":"Analysis upload request exceeds the configured body limit"}` 413
+        }
+        handle {
+            respond `{"detail":"Request body exceeds the configured body limit"}` 413
+        }
+    }
+
     handle {
         root * /srv
         try_files {path} /index.html

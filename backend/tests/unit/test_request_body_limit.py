@@ -2,8 +2,13 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI, File, UploadFile
+from fastapi.testclient import TestClient
 
-from app.core.processing_config import MAX_ANALYSIS_REQUEST_BODY_BYTES
+from app.core.processing_config import (
+    ANALYSIS_REQUEST_BODY_LIMIT_DETAIL,
+    MAX_ANALYSIS_REQUEST_BODY_BYTES,
+)
 from app.core.request_body_limit import RequestBodyLimitMiddleware
 
 
@@ -110,7 +115,7 @@ async def test_oversized_content_length_is_rejected_before_body_is_read():
     assert completed is False
     assert receive_calls == 0
     assert _response_status(sent) == 413
-    assert "configured body limit" in _response_json(sent)["detail"]
+    assert _response_json(sent)["detail"] == ANALYSIS_REQUEST_BODY_LIMIT_DETAIL
 
 
 @pytest.mark.asyncio
@@ -151,8 +156,46 @@ async def test_unrelated_routes_bypass_upload_body_limit():
     assert _response_status(sent) == 204
 
 
+def test_stream_over_limit_returns_413_through_real_fastapi_multipart_parser():
+    test_app = FastAPI()
+    test_app.add_middleware(
+        RequestBodyLimitMiddleware,
+        path="/analysis/upload",
+        max_body_size=128,
+    )
+
+    @test_app.post("/analysis/upload")
+    def upload(file: UploadFile = File()):
+        return {"filename": file.filename}
+
+    client = TestClient(test_app)
+
+    response = client.post(
+        "/analysis/upload",
+        files={"file": ("diagnostic.log", b"x" * 256, "text/plain")},
+        # Deliberately lie so the Content-Length fast path cannot reject
+        # first. This forces the receive-stream counter through FastAPI's
+        # real multipart parser.
+        headers={"Content-Length": "1"},
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": ANALYSIS_REQUEST_BODY_LIMIT_DETAIL}
+
+
 def test_caddy_upload_ceiling_matches_backend_raw_body_limit():
     repo_root = Path(__file__).resolve().parents[3]
     caddyfile = (repo_root / "frontend" / "Caddyfile").read_text(encoding="utf-8")
 
     assert f"max_size {MAX_ANALYSIS_REQUEST_BODY_BYTES}" in caddyfile
+
+
+def test_caddy_analysis_413_contract_matches_backend_detail():
+    repo_root = Path(__file__).resolve().parents[3]
+    caddyfile = (repo_root / "frontend" / "Caddyfile").read_text(encoding="utf-8")
+
+    assert "handle_errors 413" in caddyfile
+    assert "@analysis path /analysis/*" in caddyfile
+    assert (
+        f'{{"detail":"{ANALYSIS_REQUEST_BODY_LIMIT_DETAIL}"}}'
+    ) in caddyfile
