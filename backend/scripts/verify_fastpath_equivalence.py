@@ -24,7 +24,7 @@ from app.services.diagnostic_parser import (  # noqa: E402
 )
 from app.utils.file_reader import stream_text_lines  # noqa: E402
 
-FIXTURE_PATH = Path(__file__).resolve().parents[1] / "tests/fixtures/bench/devflo_10mib.log"
+FIXTURE_PATH = Path(__file__).resolve().parents[1] / "tests/fixtures/bench/generic_10mib.log"
 
 EDGE_CASES = [
     # --- ERR vs ERROR / mixed casing / all supported severities ---

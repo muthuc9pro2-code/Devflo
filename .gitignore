@@ -46,3 +46,8 @@ backend/dump.rdb
 *.tmp
 *.swp
 *.bak
+
+# Generated benchmark fixtures (reproducible via
+# backend/scripts/generate_fixtures.py) - not committed to keep the
+# repository small.
+backend/tests/fixtures/bench/

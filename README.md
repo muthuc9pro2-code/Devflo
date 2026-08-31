@@ -93,10 +93,27 @@ npm run dev
 ## Tests & benchmarking
 
 The backend test suite (`backend/tests/unit`, run with `uv run pytest`)
-covers the parser, evidence pipeline, correlation engine, cancellation and
-recovery lifecycle, and the API layer. `backend/scripts/` contains
-standalone A/B and profiling scripts used during performance work on
-parsing, source indexing, and correlation — not part of the test suite.
+covers parsing, evidence extraction, correlation, authentication,
+cancellation/recovery, resource limits, and API behavior.
+
+`backend/scripts/` contains standalone A/B, profiling, and benchmark tools
+used during performance work. Large benchmark inputs are generated locally
+rather than stored in Git:
+
+```
+cd backend
+uv run python scripts/generate_fixtures.py --size-mib 10
+```
+
+Some memory/performance benchmarks may use larger fixtures:
+
+```
+uv run python scripts/generate_fixtures.py \
+  --size-mib 50 \
+  --formats generic,json,container,database
+```
+
+Generated benchmark fixtures are not part of the normal automated test suite.
 
 ## Deployment status
 

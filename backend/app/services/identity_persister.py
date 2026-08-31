@@ -11,7 +11,8 @@ def persist_resolved_identities(
     *,
     generation: int | None = None,
 ) -> bool:
-    """Set-based UPDATE, never a per-row loop - see BASELINE_PHASE1 for why.
+    """Set-based UPDATE, never a per-row loop - a per-row loop measurably
+    dominated wall-clock time on large evidence sets during benchmarking.
 
     When `generation` is given (the finalizer's real call shape), the
     ownership check and the Evidence UPDATE happen inside ONE short

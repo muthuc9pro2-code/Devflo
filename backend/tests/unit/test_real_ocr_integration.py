@@ -12,13 +12,12 @@ ParsedEvent objects. Nothing here monkeypatches `_ocr` or
 extract_text_from_image_with_confidence.
 
 The fixture (tests/fixtures/images/real_import_error_screenshot.jpeg) is a
-real screenshot a Devflo user actually uploaded during manual testing of
-this exact repository (a VS Code terminal showing a genuine ImportError:
-`from app.services.email_service import send_password_reset_email` failing
-because that function did not exist yet). It was available
-locally (backend/uploads/) at the time this test was written and has been
-committed as a permanent fixture so this regression does not depend on
-ephemeral upload state.
+sanitized deterministic terminal screenshot used to exercise the real OCR
+ingestion path: a rendered terminal window showing a Python ImportError
+traceback (`from app.services.email import send_password_reset_email`
+failing because that function does not exist). It contains no real
+user/host/path information and is committed as a permanent fixture so this
+regression does not depend on ephemeral upload state.
 """
 from pathlib import Path
 
@@ -46,11 +45,9 @@ def test_real_screenshot_produces_coherent_non_fragmented_evidence():
     # against).
     assert events
 
-    # The real "File ..." frame chain in this
-    # screenshot must not fragment into one singleton record per frame
-    # line. There are 5 frame lines in the real captured text (importlib
-    # bootstrap x3, main.py, auth.py) - a handful of coherent records, not
-    # one per frame.
+    # The full traceback (two "File ..." frames plus the ImportError line)
+    # must not fragment into one singleton record per line - it is a
+    # single coherent incident, not a pile of unrelated records.
     assert len(events) < 5
 
     combined_raw = "\n".join(e.raw_line for e in events)
@@ -59,14 +56,14 @@ def test_real_screenshot_produces_coherent_non_fragmented_evidence():
     assert "send_password_reset_email" in combined_raw
     assert "main.py" in combined_raw
 
-    # Editor-chrome noise (VS Code panel tabs) must not survive
+    # Terminal-window chrome (the shell prompt line) must not survive
     # normalization into evidence.
-    assert "PROBLEMS" not in combined_raw
-    assert "TERMINAL" not in combined_raw
+    assert "python" not in combined_raw.lower()
 
-    # No exception line was actually captured in this screenshot (the crop
-    # ends at the traceback frames) - nothing must invent one.
-    assert all(e.exception_type is None for e in events)
+    # The real ImportError line is present in this screenshot; the parser
+    # must extract it from the genuinely captured OCR text, never fabricate
+    # a different exception type or silently drop it.
+    assert any(e.exception_type == "ImportError" for e in events)
 
     for event in events:
         assert event.source_format == "image"

@@ -2,7 +2,7 @@
 
 Runs the REAL production code paths (app.tasks.analysis.process_analysis,
 app.services.diagnostic_adapters.stream_artifact_events, ...) against the
-frozen 10 MiB fixture at tests/fixtures/bench/devflo_10mib.log and a real
+frozen 10 MiB fixture at tests/fixtures/bench/generic_10mib.log and a real
 MySQL database (same one the app uses). Not part of the pytest suite -
 this is a manual/dev tool, invoked directly:
 
@@ -29,7 +29,7 @@ from sqlalchemy import text  # noqa: E402
 from app.db.database import sessionLocal  # noqa: E402
 from app.models import Analysis, AnalysisArtifact, Evidence, User  # noqa: E402
 
-FIXTURE_PATH = Path(__file__).resolve().parents[1] / "tests/fixtures/bench/devflo_10mib.log"
+FIXTURE_PATH = Path(__file__).resolve().parents[1] / "tests/fixtures/bench/generic_10mib.log"
 BENCH_USERNAME = "__bench_pipeline__"
 BENCH_EMAIL = "bench-pipeline@example.invalid"
 
@@ -70,7 +70,7 @@ def _reset_analysis(db, user_id: int) -> int:
 
     analysis = Analysis(
         user_id=user_id,
-        original_filename="devflo_10mib.log",
+        original_filename="generic_10mib.log",
         saved_file_path=str(FIXTURE_PATH),
         status="pending",
         last_processed_line=0,
@@ -83,7 +83,7 @@ def _reset_analysis(db, user_id: int) -> int:
     artifact = AnalysisArtifact(
         analysis_id=analysis.id,
         position=0,
-        original_filename="devflo_10mib.log",
+        original_filename="generic_10mib.log",
         saved_file_path=str(FIXTURE_PATH),
         content_type="text/plain",
         size_bytes=size_bytes,
