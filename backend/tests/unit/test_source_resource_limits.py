@@ -324,7 +324,7 @@ def test_source_index_builds_only_bounded_trailing_suffixes_per_file(tmp_path, m
     index = build_index(tmp_path)
 
     assert set(index.by_path) == {"a/b/c/d/main.py"}
-    assert set(index.by_suffix) == {"c/d/main.py", "d/main.py", "main.py"}
+    assert set(index.by_suffix) == {"b/c/d/main.py", "c/d/main.py", "main.py"}
 
 
 def test_bounded_suffix_index_still_resolves_deep_stack_frame_paths(tmp_path, monkeypatch):
@@ -350,6 +350,38 @@ def test_bounded_suffix_index_still_resolves_deep_stack_frame_paths(tmp_path, mo
     assert matches[0]["relative_path"] == "a/b/c/d/main.py"
 
 
+def test_bounded_suffix_index_keeps_discriminating_long_suffixes_when_short_tails_collide(
+    tmp_path, monkeypatch
+):
+    from app.services.log_praser import ParsedEvent, StackFrame
+    from app.services.source_index import correlate_event
+
+    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 20)
+    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 4)
+    first = tmp_path / "x" / "one" / "a" / "b" / "c" / "d" / "main.py"
+    second = tmp_path / "y" / "two" / "a" / "b" / "c" / "d" / "main.py"
+    for path in (first, second):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("print('hi')\n")
+
+    index = build_index(tmp_path)
+
+    # Short tails collide, so the bounded index must retain a discriminating
+    # long suffix as well as fallbacks.
+    assert len(index.by_suffix["main.py"]) == 2
+    assert len(index.by_suffix["one/a/b/c/d/main.py"]) == 1
+
+    event = ParsedEvent(line_number=1, raw_line="ERROR failure")
+    event.stack_frames = [
+        StackFrame(file="/srv/one/a/b/c/d/main.py", line=1, function="run")
+    ]
+
+    matches = correlate_event(event, index)
+
+    assert len(matches) == 1
+    assert matches[0]["relative_path"] == "x/one/a/b/c/d/main.py"
+
+
 def test_source_index_manifest_write_is_bounded_before_publication(tmp_path, monkeypatch):
     path = tmp_path / "app.py"
     path.write_text("print('hi')\n")
@@ -372,7 +404,7 @@ def test_oversized_source_index_manifest_is_not_loaded(tmp_path, monkeypatch):
     assert load_index_manifest(manifest, tmp_path) is None
 
 
-def test_manifest_cannot_reintroduce_unbounded_suffix_references(tmp_path, monkeypatch):
+def test_unversioned_legacy_source_index_manifest_is_not_loaded(tmp_path):
     import json
 
     manifest = tmp_path / "index.json"
@@ -380,14 +412,74 @@ def test_manifest_cannot_reintroduce_unbounded_suffix_references(tmp_path, monke
         json.dumps(
             {
                 "by_path": {"app.py": ["app.py", ".py", 1]},
-                "by_suffix": {"app.py": ["app.py", "app.py", "app.py"]},
+                "by_suffix": {},
                 "by_stem": {"app": ["app.py"]},
             }
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(source_index, "MAX_SOURCE_FILES", 1)
-    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 2)
+
+    assert load_index_manifest(manifest, tmp_path) is None
+
+
+def test_manifest_cannot_reintroduce_more_than_per_file_suffix_budget(tmp_path):
+    import json
+
+    relative_path = "a/b/c/d/e/f/g/h/i/j/main.py"
+    parts = relative_path.split("/")
+    legacy_suffixes = {
+        "/".join(parts[start:]): [relative_path] for start in range(1, len(parts))
+    }
+    assert len(legacy_suffixes) > processing_config.MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
+
+    manifest = tmp_path / "index.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": source_index._SOURCE_INDEX_MANIFEST_VERSION,
+                "by_path": {relative_path: ["main.py", ".py", 1]},
+                "by_suffix": legacy_suffixes,
+                "by_stem": {"main": [relative_path]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Far below the old global 20_000 * 8 ceiling. Rejection therefore must
+    # genuinely be per-file.
+    assert len(legacy_suffixes) < (
+        processing_config.MAX_SOURCE_FILES
+        * processing_config.MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
+    )
+
+    assert load_index_manifest(manifest, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("by_suffix", "by_stem"),
+    [
+        ({"app.py": ["missing.py"]}, {"app": ["app.py"]}),
+        ({"other.py": ["app.py"]}, {"app": ["app.py"]}),
+        ({}, {"app": ["missing.py"]}),
+        ({}, {"wrong": ["app.py"]}),
+    ],
+)
+def test_manifest_derived_indexes_cannot_reference_or_mislabel_source_paths(
+    tmp_path, by_suffix, by_stem
+):
+    import json
+
+    manifest = tmp_path / "index.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": source_index._SOURCE_INDEX_MANIFEST_VERSION,
+                "by_path": {"app.py": ["app.py", ".py", 1]},
+                "by_suffix": by_suffix,
+                "by_stem": by_stem,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert load_index_manifest(manifest, tmp_path) is None
 

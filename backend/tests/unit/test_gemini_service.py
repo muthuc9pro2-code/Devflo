@@ -411,19 +411,22 @@ def test_gemini_request_redacts_obvious_secrets_without_mutating_context():
                     "password": "database-password",
                     "safe_field": "database timeout",
                 },
+                "source_matches": [
+                    {
+                        "relative_path": "app/main.py",
+                        "snippet": (
+                            "url=mysql://alice:s3cr3t@example.com/db?"
+                            "token=query-secret&mode=rw\n"
+                            "client_secret='source-secret'\n"
+                            "AKIAABCDEFGHIJKLMNOP "
+                            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 "
+                            "sk-abcdefghijklmnopqrstuvwxyz123456\n"
+                            "raise RuntimeError('boom')"
+                        ),
+                    }
+                ],
             }
         ],
-        "source": {
-            "snippet": (
-                "url=mysql://alice:s3cr3t@example.com/db?"
-                "token=query-secret&mode=rw\n"
-                "client_secret='source-secret'\n"
-                "AKIAABCDEFGHIJKLMNOP "
-                "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 "
-                "sk-abcdefghijklmnopqrstuvwxyz123456\n"
-                "raise RuntimeError('boom')"
-            ),
-        },
         # Deliberately NOT PII redaction.
         "contact": "alice@example.com",
     }
@@ -454,8 +457,9 @@ def test_gemini_request_redacts_obvious_secrets_without_mutating_context():
 
     assert "[REDACTED]" in sent
     assert parsed["evidence"][0]["attributes"]["safe_field"] == "database timeout"
-    assert "mode=rw" in parsed["source"]["snippet"]
-    assert "raise RuntimeError('boom')" in parsed["source"]["snippet"]
+    source_snippet = parsed["evidence"][0]["source_matches"][0]["snippet"]
+    assert "mode=rw" in source_snippet
+    assert "raise RuntimeError('boom')" in source_snippet
     # We explicitly are NOT building a general PII scrubber in this project.
     assert parsed["contact"] == "alice@example.com"
     # Gemini gets a redacted COPY. Deterministic context remains intact.
@@ -489,3 +493,74 @@ def test_gemini_redaction_is_narrow_and_does_not_scrub_benign_security_words():
         "password authentication failed; "
         "secret rotation job completed"
     )
+
+
+def test_gemini_redacts_sensitive_values_embedded_in_json_log_strings():
+    context = {
+        "evidence": [
+            {
+                "representative_line": (
+                    '{"api_key":"json-api-secret",'
+                    '"Cookie":"sessionid=abcdef1234567890",'
+                    '"Authorization":"Basic abcdef1234567890",'
+                    '"message":"database timeout"}'
+                )
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])
+    representative = json.loads(sent["evidence"][0]["representative_line"])
+
+    assert representative["api_key"] == "[REDACTED]"
+    assert representative["Cookie"] == "[REDACTED]"
+    assert representative["Authorization"] == "[REDACTED]"
+    assert representative["message"] == "database timeout"
+
+
+def test_gemini_source_redaction_preserves_references_but_removes_hardcoded_literals():
+    context = {
+        "evidence": [
+            {
+                "source_matches": [
+                    {
+                        "relative_path": "app/config.py",
+                        "snippet": (
+                            "authorization = request.headers.get(\"Authorization\")\n"
+                            "password = os.getenv(\"DB_PASSWORD\")\n"
+                            "api_key = settings.API_KEY\n"
+                            "cookie = request.headers.get(\"Cookie\")\n"
+                            "password = \"actual-password-secret\"\n"
+                            "client_secret = 'actual-client-secret'"
+                        ),
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])
+    snippet = sent["evidence"][0]["source_matches"][0]["snippet"]
+
+    assert 'authorization = request.headers.get("Authorization")' in snippet
+    assert 'password = os.getenv("DB_PASSWORD")' in snippet
+    assert "api_key = settings.API_KEY" in snippet
+    assert 'cookie = request.headers.get("Cookie")' in snippet
+    assert "actual-password-secret" not in snippet
+    assert "actual-client-secret" not in snippet
+    assert 'password = "[REDACTED]"' in snippet
+    assert "client_secret = '[REDACTED]'" in snippet

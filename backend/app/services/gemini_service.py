@@ -18,23 +18,32 @@ _REQUEST_TIMEOUT_SECONDS = 60
 _RETRYABLE_CLIENT_ERROR_STATUS_CODES = {429}
 
 _REDACTED = "[REDACTED]"
-_SENSITIVE_CONTEXT_KEY = re.compile(
-    r"(?i)(?:^|[._-])(?:authorization|proxy[_-]?authorization|"
+_SENSITIVE_NAME_PATTERN = (
+    r"(?:[A-Za-z0-9]+[._-])*(?:authorization|proxy[_-]?authorization|"
     r"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
     r"id[_-]?token|token|password|passwd|client[_-]?secret|secret|"
-    r"cookie|set[_-]?cookie)$"
+    r"cookie|set[_-]?cookie)"
+)
+_SENSITIVE_CONTEXT_KEY = re.compile(
+    rf"(?i)^(?:{_SENSITIVE_NAME_PATTERN})$"
 )
 _HEADER_SECRET = re.compile(
     r"(?im)\b(authorization|proxy[_-]?authorization|cookie|"
     r"set[_-]?cookie)"
     r"(\s*[:=]\s*)[^\r\n]+"
 )
+_QUOTED_KEY_SECRET = re.compile(
+    rf"(?i)([\"']{_SENSITIVE_NAME_PATTERN}[\"']\s*:\s*)"
+    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+)
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"auth[_-]?token|id[_-]?token|token|password|passwd|"
-    r"client[_-]?secret|secret)"
+    rf"(?i)\b({_SENSITIVE_NAME_PATTERN})"
     r"(\s*[:=]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&#]+)"
+)
+_SOURCE_SECRET_LITERAL_ASSIGNMENT = re.compile(
+    rf"(?i)(\b{_SENSITIVE_NAME_PATTERN}\s*[:=]\s*)"
+    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
 )
 _BEARER_TOKEN = re.compile(
     r"(?i)\b(bearer\s+)"
@@ -62,24 +71,51 @@ _STANDALONE_SECRET_PATTERNS = (
 )
 
 
-def _redact_text_for_gemini(text: str) -> str:
-    redacted = _HEADER_SECRET.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
-        text,
-    )
-    redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", redacted)
+def _redact_quoted_secret(match: re.Match) -> str:
+    value = match.group(2)
+    quote = value[0]
+    return f"{match.group(1)}{quote}{_REDACTED}{quote}"
+
+
+def _redact_high_confidence_secret_shapes(text: str) -> str:
+    redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", text)
     redacted = _URL_QUERY_SECRET.sub(r"\1[REDACTED]", redacted)
-    redacted = _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
-        redacted,
-    )
     redacted = _BEARER_TOKEN.sub(r"\1[REDACTED]", redacted)
     for pattern in _STANDALONE_SECRET_PATTERNS:
         redacted = pattern.sub(_REDACTED, redacted)
     return redacted
 
 
-def _redact_context_for_gemini(value, *, key: str | None = None):
+def _redact_text_for_gemini(text: str) -> str:
+    # Diagnostic/log text may contain key=value, headers, or embedded JSON.
+    redacted = _QUOTED_KEY_SECRET.sub(_redact_quoted_secret, text)
+    redacted = _HEADER_SECRET.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
+        redacted,
+    )
+    redacted = _SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
+        redacted,
+    )
+    return _redact_high_confidence_secret_shapes(redacted)
+
+
+def _redact_source_text_for_gemini(text: str) -> str:
+    """Redact only high-confidence secrets from source snippets.
+
+    Source code often contains safe credential references such as
+    ``password = os.getenv("DB_PASSWORD")``. Those are diagnostically useful
+    and must survive. Hardcoded sensitive literals and unmistakable token/URL
+    secret shapes are still removed.
+    """
+    redacted = _QUOTED_KEY_SECRET.sub(_redact_quoted_secret, text)
+    redacted = _SOURCE_SECRET_LITERAL_ASSIGNMENT.sub(_redact_quoted_secret, redacted)
+    return _redact_high_confidence_secret_shapes(redacted)
+
+
+def _redact_context_for_gemini(
+    value, *, key: str | None = None, in_source_matches: bool = False
+):
     """Return a redacted copy of outbound Gemini context.
 
     Deliberately narrow: obvious credential/token fields and high-confidence
@@ -90,16 +126,29 @@ def _redact_context_for_gemini(value, *, key: str | None = None):
         if value is None:
             return None
         return _REDACTED
+    current_source_matches = in_source_matches or key == "source_matches"
     if isinstance(value, dict):
         return {
-            child_key: _redact_context_for_gemini(child_value, key=str(child_key))
+            child_key: _redact_context_for_gemini(
+                child_value,
+                key=str(child_key),
+                in_source_matches=current_source_matches,
+            )
             for child_key, child_value in value.items()
         }
     if isinstance(value, list):
-        return [_redact_context_for_gemini(item) for item in value]
+        return [
+            _redact_context_for_gemini(item, in_source_matches=current_source_matches)
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_redact_context_for_gemini(item) for item in value)
+        return tuple(
+            _redact_context_for_gemini(item, in_source_matches=current_source_matches)
+            for item in value
+        )
     if isinstance(value, str):
+        if current_source_matches and key == "snippet":
+            return _redact_source_text_for_gemini(value)
         return _redact_text_for_gemini(value)
     return value
 

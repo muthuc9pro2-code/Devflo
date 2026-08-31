@@ -29,6 +29,8 @@ BINARY_EXTENSIONS = {
 
 SourceFile = namedtuple("SourceFile", "relative_path basename extension size")
 
+_SOURCE_INDEX_MANIFEST_VERSION = 1
+
 
 class SourceIndexLimitError(ValueError):
     """A source tree would amplify into an unreasonably large derived index."""
@@ -48,6 +50,30 @@ def _validate_relative_path_for_index(relative_path: str) -> list[str]:
             "Source path length exceeds the supported index limit"
         )
     return parts
+
+
+def _bounded_suffix_start_indices(part_count: int) -> tuple[int, ...]:
+    """Choose at most the configured suffix budget without sacrificing either
+    specificity or short-path fallback matching.
+
+    Exact repository-relative paths remain in ``by_path``. For deeper paths we
+    keep the most specific generated suffixes from the front and the shortest
+    fallbacks from the tail. This avoids spending the entire budget on generic
+    tails such as ``pkg/file.py`` while still retaining basename/short-path
+    matches used by abbreviated stack frames.
+    """
+    available = max(part_count - 1, 0)
+    budget = min(MAX_SOURCE_INDEX_SUFFIXES_PER_FILE, available)
+    if budget <= 0:
+        return ()
+    if available <= budget:
+        return tuple(range(1, part_count))
+    specific_count = (budget + 1) // 2
+    fallback_count = budget - specific_count
+    starts = list(range(1, 1 + specific_count))
+    if fallback_count:
+        starts.extend(range(part_count - fallback_count, part_count))
+    return tuple(starts)
 
 @dataclass(slots=True)
 class SourceIndex:
@@ -106,9 +132,9 @@ def build_index(root: Path) -> SourceIndex:
             index.by_path[relative_path] = SourceFile(relative_path, filename, extension, full_path.stat().st_size)
             index.by_stem.setdefault(Path(filename).stem, []).append(relative_path)
             # Exact repository-relative matching remains available through by_path.
-            # Only the generated suffix variants are bounded.
-            first_suffix_start = max(1, len(parts) - MAX_SOURCE_INDEX_SUFFIXES_PER_FILE)
-            for start in range(first_suffix_start, len(parts)):
+            # Generated suffixes are bounded while retaining both high-specificity
+            # long suffixes and short fallback suffixes.
+            for start in _bounded_suffix_start_indices(len(parts)):
                 index.by_suffix.setdefault("/".join(parts[start:]), []).append(relative_path)
     return index
 
@@ -126,6 +152,7 @@ def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
     + os.replace, which is atomic on POSIX) so a concurrent reader can
     never observe a partially-written file."""
     payload = {
+        "version": _SOURCE_INDEX_MANIFEST_VERSION,
         "by_path": {
             relative_path: [source_file.basename, source_file.extension, source_file.size]
             for relative_path, source_file in index.by_path.items()
@@ -159,6 +186,15 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
             return None
 
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        if payload.get("version") != _SOURCE_INDEX_MANIFEST_VERSION:
+            logger.warning(
+                "Source index manifest %s uses an unsupported legacy format; "
+                "rebuilding",
+                manifest_path,
+            )
+            return None
+
         by_path_payload = payload["by_path"]
         by_suffix = payload["by_suffix"]
         by_stem = payload["by_stem"]
@@ -176,32 +212,6 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
             )
             return None
 
-        if any(not isinstance(paths, list) for paths in by_suffix.values()):
-            raise TypeError("Source index suffix lists have an invalid shape")
-
-        suffix_reference_count = sum(len(paths) for paths in by_suffix.values())
-        if suffix_reference_count > (
-            MAX_SOURCE_FILES * MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
-        ):
-            logger.warning(
-                "Source index manifest %s contains too many suffix "
-                "references; rebuilding",
-                manifest_path,
-            )
-            return None
-
-        if any(not isinstance(paths, list) for paths in by_stem.values()):
-            raise TypeError("Source index stem lists have an invalid shape")
-
-        stem_reference_count = sum(len(paths) for paths in by_stem.values())
-        if stem_reference_count > MAX_SOURCE_FILES:
-            logger.warning(
-                "Source index manifest %s contains too many stem "
-                "references; rebuilding",
-                manifest_path,
-            )
-            return None
-
         by_path = {}
         for relative_path, raw_source_file in by_path_payload.items():
             if not isinstance(relative_path, str):
@@ -215,6 +225,77 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
             ):
                 raise TypeError("Source index file metadata has an invalid shape")
             by_path[relative_path] = SourceFile(relative_path, basename, extension, size)
+
+        suffixes_per_path: dict[str, int] = {}
+        suffix_reference_count = 0
+        for suffix, paths in by_suffix.items():
+            if not isinstance(suffix, str) or not isinstance(paths, list):
+                raise TypeError("Source index suffix mappings have an invalid shape")
+            seen_paths: set[str] = set()
+            for relative_path in paths:
+                if not isinstance(relative_path, str) or relative_path not in by_path:
+                    raise TypeError(
+                        "Source index suffix references an unknown source path"
+                    )
+                if relative_path in seen_paths:
+                    raise TypeError(
+                        "Source index suffix contains a duplicate source path"
+                    )
+                if relative_path != suffix and not relative_path.endswith(f"/{suffix}"):
+                    raise TypeError(
+                        "Source index suffix does not match its source path"
+                    )
+                seen_paths.add(relative_path)
+                suffix_reference_count += 1
+                suffixes_per_path[relative_path] = (
+                    suffixes_per_path.get(relative_path, 0) + 1
+                )
+                if suffixes_per_path[relative_path] > MAX_SOURCE_INDEX_SUFFIXES_PER_FILE:
+                    logger.warning(
+                        "Source index manifest %s exceeds the per-file suffix "
+                        "limit; rebuilding",
+                        manifest_path,
+                    )
+                    return None
+
+        if suffix_reference_count > (
+            len(by_path) * MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
+        ):
+            logger.warning(
+                "Source index manifest %s contains too many suffix "
+                "references; rebuilding",
+                manifest_path,
+            )
+            return None
+
+        stem_reference_count = 0
+        for stem, paths in by_stem.items():
+            if not isinstance(stem, str) or not isinstance(paths, list):
+                raise TypeError("Source index stem mappings have an invalid shape")
+            seen_paths: set[str] = set()
+            for relative_path in paths:
+                if not isinstance(relative_path, str) or relative_path not in by_path:
+                    raise TypeError(
+                        "Source index stem references an unknown source path"
+                    )
+                if relative_path in seen_paths:
+                    raise TypeError(
+                        "Source index stem contains a duplicate source path"
+                    )
+                if Path(relative_path).stem != stem:
+                    raise TypeError(
+                        "Source index stem does not match its source path"
+                    )
+                seen_paths.add(relative_path)
+                stem_reference_count += 1
+
+        if stem_reference_count > len(by_path):
+            logger.warning(
+                "Source index manifest %s contains too many stem "
+                "references; rebuilding",
+                manifest_path,
+            )
+            return None
 
         return SourceIndex(
             root=root,
