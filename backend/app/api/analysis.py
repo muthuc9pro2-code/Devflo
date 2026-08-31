@@ -320,6 +320,14 @@ def upload_file(
         _remove_staged_uploads(staged_paths)
         raise
 
+    # create_analysis() returns only after the Analysis and AnalysisArtifact
+    # rows are durably committed. Keep this refresh intentionally OUTSIDE the
+    # staging-cleanup try/except above: if the DB connection disappears in
+    # this post-commit read window, the request may fail, but the staged raw
+    # inputs must remain for Beat recovery rather than being deleted as if
+    # creation had rolled back.
+    db.refresh(analysis)
+
     # unsupported/duplicate are already deterministically resolved at this
     # point (staging classified unsupported; create_analysis's within-
     # analysis content-hash grouping established the canonical artifact for

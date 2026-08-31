@@ -154,8 +154,12 @@ def create_analysis(
             if model.status == "unsupported":
                 model.processed_bytes = model.size_bytes
 
+        # Durability boundary: do not perform any database read after this
+        # commit inside create_analysis(). If the commit succeeds but the DB
+        # connection disappears immediately afterward, callers must treat the
+        # Analysis/Artifact rows as durable and preserve staged inputs for
+        # recovery instead of cleaning them up as though creation rolled back.
         db.commit()
-        db.refresh(analysis)
     except Exception:
         db.rollback()
         raise

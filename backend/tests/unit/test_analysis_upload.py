@@ -4,9 +4,13 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.api import analysis as analysis_api
 from app.crud.analysis import ActiveAnalysisLimitReached
+from app.db.database import Base
+from app.models import Analysis, User
 
 
 def test_multiple_files_are_streamed_into_one_analysis(tmp_path, monkeypatch):
@@ -395,6 +399,63 @@ def test_active_analysis_quota_race_cleans_staged_bytes_and_never_dispatches(
     assert "3 active investigations" in error.value.detail
     assert list(tmp_path.iterdir()) == []
     task.delay.assert_not_called()
+
+
+def test_post_commit_refresh_failure_preserves_staged_inputs_for_recovery(
+    tmp_path, monkeypatch
+):
+    """A DB outage after create_analysis() commits must not make the upload
+    path delete inputs that the durably-pending Analysis still needs.
+
+    This reproduces the exact boundary: Analysis + Artifact rows commit, the
+    immediately-following refresh fails, the HTTP call fails, but both the
+    durable rows and staged diagnostic bytes remain for Beat recovery.
+    """
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    user = User(
+        username="post-commit-user",
+        email="post-commit@example.com",
+        hashed_password="x",
+        is_verified=True,
+    )
+    db.add(user)
+    db.commit()
+
+    task = Mock()
+    monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(analysis_api, "process_analysis", task)
+
+    refresh = Mock(side_effect=RuntimeError("database unavailable after commit"))
+    monkeypatch.setattr(db, "refresh", refresh)
+
+    payload = b"ERROR durable upload\n"
+
+    with pytest.raises(RuntimeError, match="database unavailable after commit"):
+        analysis_api.upload_file(
+            file=_upload("diagnostic.log", payload),
+            db=db,
+            current_user=user,
+        )
+
+    refresh.assert_called_once()
+    task.delay.assert_not_called()
+
+    # Use a different DB session to prove this is genuinely durable state,
+    # not merely objects still hanging around in the request Session.
+    verify_db = session_factory()
+    try:
+        created = verify_db.query(Analysis).one()
+        assert created.status == "pending"
+        assert len(created.artifacts) == 1
+        with open(created.artifacts[0].saved_file_path, "rb") as staged_file:
+            assert staged_file.read() == payload
+        assert len(list(tmp_path.iterdir())) == 1
+    finally:
+        verify_db.close()
+        db.close()
 
 
 def _upload(filename: str, content: bytes):
