@@ -1,4 +1,7 @@
-from pydantic import field_validator
+from ipaddress import ip_address
+from urllib.parse import urlsplit
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +56,32 @@ class AppSettings(BaseSettings):
             return None
         candidate = str(value).strip()
         return candidate or None
+
+    @model_validator(mode="after")
+    def validate_cookie_security(self):
+        frontend = urlsplit(self.FRONTEND_URL)
+        hostname = frontend.hostname
+        is_loopback = hostname == "localhost"
+        if hostname and not is_loopback:
+            try:
+                is_loopback = ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+        # Local development is intentionally allowed to run over plain HTTP.
+        if is_loopback:
+            if frontend.scheme not in {"http", "https"}:
+                raise ValueError("FRONTEND_URL must use http or https")
+            return self
+        # Anything non-local is treated as production-like configuration.
+        # Failing closed here prevents accidentally issuing non-Secure auth
+        # cookies on a real deployed host.
+        if frontend.scheme != "https" or not hostname:
+            raise ValueError("Non-local FRONTEND_URL must use https")
+        if not self.COOKIE_SECURE:
+            raise ValueError(
+                "COOKIE_SECURE must be true when FRONTEND_URL is non-local"
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",
