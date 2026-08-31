@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from time import perf_counter, sleep
 from google import genai
 from google.genai import errors as genai_errors
@@ -15,6 +16,96 @@ _RETRY_BACKOFF_SECONDS = 1.5
 _REQUEST_TIMEOUT_SECONDS = 60
 
 _RETRYABLE_CLIENT_ERROR_STATUS_CODES = {429}
+
+_REDACTED = "[REDACTED]"
+_SENSITIVE_CONTEXT_KEY = re.compile(
+    r"(?i)(?:^|[._-])(?:authorization|proxy[_-]?authorization|"
+    r"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"id[_-]?token|token|password|passwd|client[_-]?secret|secret|"
+    r"cookie|set[_-]?cookie)$"
+)
+_HEADER_SECRET = re.compile(
+    r"(?im)\b(authorization|proxy[_-]?authorization|cookie|"
+    r"set[_-]?cookie)"
+    r"(\s*[:=]\s*)[^\r\n]+"
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"auth[_-]?token|id[_-]?token|token|password|passwd|"
+    r"client[_-]?secret|secret)"
+    r"(\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&#]+)"
+)
+_BEARER_TOKEN = re.compile(
+    r"(?i)\b(bearer\s+)"
+    r"([A-Za-z0-9._~+/=-]{8,})"
+)
+_URL_USERINFO = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.-]*://)"
+    r"([^/\s:@]+):([^@\s/]+)@"
+)
+_URL_QUERY_SECRET = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"auth[_-]?token|id[_-]?token|token|password|secret|"
+    r"client[_-]?secret)=)"
+    r"([^&#\s]+)"
+)
+_STANDALONE_SECRET_PATTERNS = (
+    # AWS access-key id
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Google API key
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    # GitHub token families
+    re.compile(r"\bgh[pousr]_[0-9A-Za-z]{20,}\b"),
+    # Common sk-* API-key families
+    re.compile(r"\bsk-[0-9A-Za-z_-]{20,}\b"),
+)
+
+
+def _redact_text_for_gemini(text: str) -> str:
+    redacted = _HEADER_SECRET.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
+        text,
+    )
+    redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", redacted)
+    redacted = _URL_QUERY_SECRET.sub(r"\1[REDACTED]", redacted)
+    redacted = _SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
+        redacted,
+    )
+    redacted = _BEARER_TOKEN.sub(r"\1[REDACTED]", redacted)
+    for pattern in _STANDALONE_SECRET_PATTERNS:
+        redacted = pattern.sub(_REDACTED, redacted)
+    return redacted
+
+
+def _redact_context_for_gemini(value, *, key: str | None = None):
+    """Return a redacted copy of outbound Gemini context.
+
+    Deliberately narrow: obvious credential/token fields and high-confidence
+    secret shapes only. This is not a general PII detector, and deterministic
+    context/result objects are never mutated.
+    """
+    if key is not None and _SENSITIVE_CONTEXT_KEY.search(str(key)):
+        if value is None:
+            return None
+        return _REDACTED
+    if isinstance(value, dict):
+        return {
+            child_key: _redact_context_for_gemini(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_context_for_gemini(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_context_for_gemini(item) for item in value)
+    if isinstance(value, str):
+        return _redact_text_for_gemini(value)
+    return value
+
+
+def _redacted_json_default(value) -> str:
+    return _redact_text_for_gemini(str(value))
 
 
 class GeminiUnavailableError(RuntimeError):
@@ -203,7 +294,10 @@ def generate_investigation_explanation(
 
     api_call_start = perf_counter()
     try:
-        contents = json.dumps(context, default=str)
+        contents = json.dumps(
+            _redact_context_for_gemini(context),
+            default=_redacted_json_default,
+        )
         config = types.GenerateContentConfig(
             system_instruction=_SYSTEM_INSTRUCTION,
             response_mime_type="application/json",

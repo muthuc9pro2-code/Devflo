@@ -31,6 +31,7 @@ from app.services.artifact_detector import ArtifactFormat
 from app.services.gemini_service import GeminiUnavailableError
 from app.services.image_text_extractor import OcrProcessingError
 from app.services.source_archive import SourceInputError
+from app.services.source_index import SourceIndexLimitError
 from app.services.diagnostic_parser import parse_timestamp
 from app.services import gemini_service, image_text_extractor
 from app.tasks import analysis as analysis_task
@@ -1191,6 +1192,7 @@ def test_devflo_ai_unavailable_fallback_path_preserves_deterministic_result(monk
     [
         "acquisition",
         "index",
+        "index_limit",
         "manifest",
     ],
 )
@@ -1208,6 +1210,11 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
     _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(
+        analysis_task,
+        "_source_index_process_cache",
+        {},
+    )
     monkeypatch.setattr(
         analysis_task,
         "generate_investigation_explanation",
@@ -1260,6 +1267,16 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
                 RuntimeError("index construction failed")
             ),
         )
+    elif failure_stage == "index_limit":
+        monkeypatch.setattr(
+            source_archive,
+            "build_index",
+            lambda _root: (_ for _ in ()).throw(
+                SourceIndexLimitError(
+                    "Source path depth exceeds the supported index limit"
+                )
+            ),
+        )
     elif failure_stage == "manifest":
         monkeypatch.setattr(
             source_archive,
@@ -1284,6 +1301,8 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
     assert after_source.status == "processing"
     assert after_source.source_status == "unavailable"
     assert after_source.source_failure_reason
+    if failure_stage == "index_limit":
+        assert "path depth" in after_source.source_failure_reason
     db.close()
 
     diagnostic_path = _valid_generic_log(
@@ -1327,6 +1346,7 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
     "failure_stage",
     [
         "missing_ready_tree",
+        "ready_index_loader",
         "matcher",
     ],
 )
@@ -1337,12 +1357,18 @@ def test_optional_source_post_publication_failure_matrix_retains_evidence_and_co
     failure_stage,
 ):
     """Failures discovered by artifact workers after source was considered
-    ready are still optional. A missing published tree or a source matcher
-    exception must disable only source enrichment, never diagnostic parsing,
-    Evidence persistence, or deterministic finalization."""
+    ready are still optional. A missing published tree, a ready-index
+    load/rebuild exception, or a source matcher exception must disable only
+    source enrichment, never diagnostic parsing, Evidence persistence, or
+    deterministic finalization."""
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
     _use_sqlite_compatible_evidence_persistence(monkeypatch)
+    monkeypatch.setattr(
+        analysis_task,
+        "_source_index_process_cache",
+        {},
+    )
     monkeypatch.setattr(
         analysis_task,
         "generate_investigation_explanation",
@@ -1379,6 +1405,14 @@ def test_optional_source_post_publication_failure_matrix_retains_evidence_and_co
             analysis_task,
             "_load_ready_source_index_for_artifact",
             lambda _analysis, _generation: None,
+        )
+    elif failure_stage == "ready_index_loader":
+        monkeypatch.setattr(
+            analysis_task,
+            "load_ready_source_index",
+            lambda _analysis_id: (_ for _ in ()).throw(
+                OSError("published source index became unreadable")
+            ),
         )
     else:
         monkeypatch.setattr(

@@ -47,7 +47,7 @@ from app.services.source_archive import (
     load_ready_source_index,
     prepare_source,
 )
-from app.services.source_index import correlate_event
+from app.services.source_index import SourceIndexLimitError, correlate_event
 from app.services.investigation_router import (
     choose_investigation_path,
     InvestigationPath,
@@ -2535,6 +2535,9 @@ def _acquire_source_index(
     except SourceInputError:
         raise
 
+    except SourceIndexLimitError as error:
+        raise SourceInputError(str(error)) from error
+
     except Exception as error:
         logger.exception(
             "Analysis %s | optional source acquisition/indexing failed",
@@ -2574,7 +2577,16 @@ def _load_ready_source_index_for_artifact(analysis: Analysis, generation: int):
     if cached is not None:
         return cached
 
-    index = load_ready_source_index(analysis.id)
+    try:
+        index = load_ready_source_index(analysis.id)
+    except Exception:
+        logger.warning(
+            "Analysis %s | ready optional source index could not be loaded; "
+            "continuing without source enrichment",
+            analysis.id,
+            exc_info=True,
+        )
+        return None
     if index is None:
         return None
 

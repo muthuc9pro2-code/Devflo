@@ -1,3 +1,5 @@
+from copy import deepcopy
+import json
 from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 from google.genai import errors as genai_errors
@@ -394,3 +396,96 @@ def test_unconfigured_gemini_is_optional_and_never_constructs_sdk_client(monkeyp
         generate_investigation_explanation({"analysis_id": 1})
 
     client_constructor.assert_not_called()
+
+
+def test_gemini_request_redacts_obvious_secrets_without_mutating_context():
+    context = {
+        "analysis_id": 1,
+        "evidence": [
+            {
+                "representative_line": (
+                    "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"
+                ),
+                "attributes": {
+                    "api_key": "super-secret-key",
+                    "password": "database-password",
+                    "safe_field": "database timeout",
+                },
+            }
+        ],
+        "source": {
+            "snippet": (
+                "url=mysql://alice:s3cr3t@example.com/db?"
+                "token=query-secret&mode=rw\n"
+                "client_secret='source-secret'\n"
+                "AKIAABCDEFGHIJKLMNOP "
+                "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 "
+                "sk-abcdefghijklmnopqrstuvwxyz123456\n"
+                "raise RuntimeError('boom')"
+            ),
+        },
+        # Deliberately NOT PII redaction.
+        "contact": "alice@example.com",
+    }
+    original = deepcopy(context)
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = kwargs["contents"]
+    parsed = json.loads(sent)
+
+    for secret in (
+        "abcdefghijklmnopqrstuvwxyz",
+        "super-secret-key",
+        "s3cr3t",
+        "query-secret",
+        "database-password",
+        "source-secret",
+        "AKIAABCDEFGHIJKLMNOP",
+        "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+    ):
+        assert secret not in sent
+
+    assert "[REDACTED]" in sent
+    assert parsed["evidence"][0]["attributes"]["safe_field"] == "database timeout"
+    assert "mode=rw" in parsed["source"]["snippet"]
+    assert "raise RuntimeError('boom')" in parsed["source"]["snippet"]
+    # We explicitly are NOT building a general PII scrubber in this project.
+    assert parsed["contact"] == "alice@example.com"
+    # Gemini gets a redacted COPY. Deterministic context remains intact.
+    assert context == original
+
+
+def test_gemini_redaction_is_narrow_and_does_not_scrub_benign_security_words():
+    context = {
+        "evidence": [
+            {
+                "representative_line": (
+                    "token bucket exhausted; "
+                    "password authentication failed; "
+                    "secret rotation job completed"
+                )
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])
+
+    assert sent["evidence"][0]["representative_line"] == (
+        "token bucket exhausted; "
+        "password authentication failed; "
+        "secret rotation job completed"
+    )

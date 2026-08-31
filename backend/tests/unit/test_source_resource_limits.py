@@ -27,7 +27,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core import processing_config
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
-from app.services import source_archive
+from app.services import source_archive, source_index
 from app.services.gemini_service import GeminiUnavailableError
 from app.services.source_archive import (
     SourceInputError,
@@ -35,6 +35,12 @@ from app.services.source_archive import (
     _validate_cloned_source_tree,
     cleanup_prepared_source,
     prepare_source,
+)
+from app.services.source_index import (
+    SourceIndexLimitError,
+    build_index,
+    load_index_manifest,
+    save_index_manifest,
 )
 from app.tasks import analysis as analysis_task
 
@@ -46,6 +52,13 @@ def test_source_zip_resource_constants_are_unchanged():
     assert processing_config.MAX_SOURCE_ARCHIVE_BYTES == 200 * processing_config.MEBIBYTE
     assert processing_config.MAX_SOURCE_TOTAL_BYTES == 500 * processing_config.MEBIBYTE
     assert processing_config.MAX_SOURCE_FILES == 20_000
+    assert processing_config.MAX_SOURCE_RELATIVE_PATH_BYTES == 1024
+    assert processing_config.MAX_SOURCE_PATH_DEPTH == 32
+    assert processing_config.MAX_SOURCE_INDEX_SUFFIXES_PER_FILE == 8
+    assert (
+        processing_config.MAX_SOURCE_INDEX_MANIFEST_BYTES
+        == 64 * processing_config.MEBIBYTE
+    )
 
 
 # --- 2/3/4: clone timeout, flags, and environment --------------------------
@@ -164,6 +177,29 @@ def test_cloned_source_over_max_total_bytes_raises(tmp_path, monkeypatch):
         _validate_cloned_source_tree(root)
 
 
+def test_cloned_source_rejects_excessive_path_depth_before_indexing(tmp_path, monkeypatch):
+    monkeypatch.setattr(source_archive, "MAX_SOURCE_PATH_DEPTH", 3)
+    root = tmp_path / "tree"
+    path = root / "a" / "b" / "c" / "main.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("print('hi')\n")
+
+    with pytest.raises(SourceInputError, match="path depth"):
+        _validate_cloned_source_tree(root)
+
+
+def test_source_zip_rejects_excessive_path_depth_before_extraction(tmp_path, monkeypatch):
+    import zipfile
+
+    monkeypatch.setattr(source_archive, "MAX_SOURCE_PATH_DEPTH", 3)
+    archive = tmp_path / "deep.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("a/b/c/main.py", "print('hi')\n")
+
+    with pytest.raises(SourceInputError, match="path depth"):
+        source_archive.validate_source_zip(archive)
+
+
 def test_cloned_source_exactly_at_file_and_byte_limits_is_accepted(tmp_path, monkeypatch):
     monkeypatch.setattr(source_archive, "MAX_SOURCE_FILES", 4)
     monkeypatch.setattr(source_archive, "MAX_SOURCE_TOTAL_BYTES", 40)
@@ -256,6 +292,104 @@ def test_failed_zip_preparation_does_not_delete_the_staged_zip(tmp_path, monkeyp
         prepare_source("zip", str(archive), 504, 0)
 
     assert archive.exists()
+
+
+def test_source_index_rejects_path_depth_above_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 3)
+    path = tmp_path / "a" / "b" / "c" / "main.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("print('hi')\n")
+
+    with pytest.raises(SourceIndexLimitError, match="path depth"):
+        build_index(tmp_path)
+
+
+def test_source_index_rejects_relative_path_above_byte_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr(source_index, "MAX_SOURCE_RELATIVE_PATH_BYTES", 16)
+    path = tmp_path / "directory" / "very_long_name.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("print('hi')\n")
+
+    with pytest.raises(SourceIndexLimitError, match="path length"):
+        build_index(tmp_path)
+
+
+def test_source_index_builds_only_bounded_trailing_suffixes_per_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 20)
+    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 3)
+    path = tmp_path / "a" / "b" / "c" / "d" / "main.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("print('hi')\n")
+
+    index = build_index(tmp_path)
+
+    assert set(index.by_path) == {"a/b/c/d/main.py"}
+    assert set(index.by_suffix) == {"c/d/main.py", "d/main.py", "main.py"}
+
+
+def test_bounded_suffix_index_still_resolves_deep_stack_frame_paths(tmp_path, monkeypatch):
+    from app.services.log_praser import ParsedEvent, StackFrame
+    from app.services.source_index import correlate_event
+
+    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 20)
+    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 3)
+    path = tmp_path / "a" / "b" / "c" / "d" / "main.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("print('hi')\n")
+
+    index = build_index(tmp_path)
+
+    event = ParsedEvent(line_number=1, raw_line="ERROR failure")
+    event.stack_frames = [
+        StackFrame(file="/srv/worktree/a/b/c/d/main.py", line=1, function="run")
+    ]
+
+    matches = correlate_event(event, index)
+
+    assert len(matches) == 1
+    assert matches[0]["relative_path"] == "a/b/c/d/main.py"
+
+
+def test_source_index_manifest_write_is_bounded_before_publication(tmp_path, monkeypatch):
+    path = tmp_path / "app.py"
+    path.write_text("print('hi')\n")
+    index = build_index(tmp_path)
+    manifest = tmp_path / "index.json"
+    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_MANIFEST_BYTES", 8)
+
+    with pytest.raises(SourceIndexLimitError, match="manifest"):
+        save_index_manifest(index, manifest)
+
+    assert not manifest.exists()
+    assert not (tmp_path / "index.json.tmp").exists()
+
+
+def test_oversized_source_index_manifest_is_not_loaded(tmp_path, monkeypatch):
+    manifest = tmp_path / "index.json"
+    manifest.write_text("x" * 100, encoding="utf-8")
+    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_MANIFEST_BYTES", 10)
+
+    assert load_index_manifest(manifest, tmp_path) is None
+
+
+def test_manifest_cannot_reintroduce_unbounded_suffix_references(tmp_path, monkeypatch):
+    import json
+
+    manifest = tmp_path / "index.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "by_path": {"app.py": ["app.py", ".py", 1]},
+                "by_suffix": {"app.py": ["app.py", "app.py", "app.py"]},
+                "by_stem": {"app": ["app.py"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(source_index, "MAX_SOURCE_FILES", 1)
+    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 2)
+
+    assert load_index_manifest(manifest, tmp_path) is None
 
 
 # --- 13: cleanup_prepared_source() is idempotent ----------------------------

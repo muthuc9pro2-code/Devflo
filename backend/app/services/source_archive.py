@@ -18,6 +18,8 @@ from pathlib import Path
 from app.core.processing_config import (
     GITHUB_CLONE_TIMEOUT_SECONDS,
     MAX_SOURCE_FILES,
+    MAX_SOURCE_PATH_DEPTH,
+    MAX_SOURCE_RELATIVE_PATH_BYTES,
     MAX_SOURCE_TOTAL_BYTES,
     SOURCE_STORAGE_ROOT,
 )
@@ -37,6 +39,21 @@ class SourceInputError(ValueError):
 class SourceSubsystemError(RuntimeError):
     """A failure contained within optional source acquisition/indexing."""
 
+
+def _validate_source_path_shape(relative: str) -> None:
+    parts = [part for part in relative.split("/") if part and part != "."]
+    if len(parts) > MAX_SOURCE_PATH_DEPTH:
+        raise SourceInputError(
+            "Source path depth exceeds the supported index limit"
+        )
+    if (
+        len(relative.encode("utf-8", errors="surrogatepass"))
+        > MAX_SOURCE_RELATIVE_PATH_BYTES
+    ):
+        raise SourceInputError(
+            "Source path length exceeds the supported index limit"
+        )
+
 def validate_github_url(url: str) -> str:
     match = _GITHUB_URL.match((url or "").strip())
     if not match:
@@ -53,6 +70,7 @@ def _safe_members(zf: zipfile.ZipFile):
         relative = posixpath.normpath(member.filename.replace("\\", "/"))
         if relative == ".." or relative.startswith(("/", "../")) or ":" in relative:
             raise SourceInputError(f"Unsafe path in source ZIP: {member.filename}")
+        _validate_source_path_shape(relative)
         if stat.S_ISLNK(member.external_attr >> 16):
             raise SourceInputError(f"Symlink entries are not supported: {member.filename}")
         total += member.file_size
@@ -103,6 +121,8 @@ def _validate_cloned_source_tree(root: Path) -> None:
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         for name in dirnames:
             entry = Path(dirpath) / name
+            relative = entry.relative_to(root).as_posix()
+            _validate_source_path_shape(relative)
             if stat.S_ISLNK(entry.lstat().st_mode):
                 raise SourceInputError(
                     f"Symlink entries are not supported: {entry.relative_to(root)}"
@@ -110,6 +130,8 @@ def _validate_cloned_source_tree(root: Path) -> None:
 
         for filename in filenames:
             entry = Path(dirpath) / filename
+            relative = entry.relative_to(root).as_posix()
+            _validate_source_path_shape(relative)
             info = entry.lstat()
             if stat.S_ISLNK(info.st_mode):
                 raise SourceInputError(

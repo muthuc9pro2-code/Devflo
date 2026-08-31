@@ -9,6 +9,11 @@ from pathlib import Path
 
 from app.core.processing_config import (
     MAX_SOURCE_CONTEXT_FILE_BYTES,
+    MAX_SOURCE_FILES,
+    MAX_SOURCE_INDEX_MANIFEST_BYTES,
+    MAX_SOURCE_INDEX_SUFFIXES_PER_FILE,
+    MAX_SOURCE_PATH_DEPTH,
+    MAX_SOURCE_RELATIVE_PATH_BYTES,
     SOURCE_CONTEXT_CACHE_BYTES,
     SOURCE_CONTEXT_LINES,
 )
@@ -23,6 +28,26 @@ BINARY_EXTENSIONS = {
 }
 
 SourceFile = namedtuple("SourceFile", "relative_path basename extension size")
+
+
+class SourceIndexLimitError(ValueError):
+    """A source tree would amplify into an unreasonably large derived index."""
+
+
+def _validate_relative_path_for_index(relative_path: str) -> list[str]:
+    parts = [part for part in relative_path.split("/") if part]
+    if len(parts) > MAX_SOURCE_PATH_DEPTH:
+        raise SourceIndexLimitError(
+            "Source path depth exceeds the supported index limit"
+        )
+    if (
+        len(relative_path.encode("utf-8", errors="surrogatepass"))
+        > MAX_SOURCE_RELATIVE_PATH_BYTES
+    ):
+        raise SourceIndexLimitError(
+            "Source path length exceeds the supported index limit"
+        )
+    return parts
 
 @dataclass(slots=True)
 class SourceIndex:
@@ -76,12 +101,15 @@ def build_index(root: Path) -> SourceIndex:
             if extension in BINARY_EXTENSIONS:
                 continue
             relative_path = f"{relative_dir_posix}/{filename}" if relative_dir_posix else filename
+            parts = _validate_relative_path_for_index(relative_path)
             full_path = Path(dirpath) / filename
             index.by_path[relative_path] = SourceFile(relative_path, filename, extension, full_path.stat().st_size)
             index.by_stem.setdefault(Path(filename).stem, []).append(relative_path)
-            parts = relative_path.split("/")
-            for start in range(len(parts) - 1):
-                index.by_suffix.setdefault("/".join(parts[start + 1 :]), []).append(relative_path)
+            # Exact repository-relative matching remains available through by_path.
+            # Only the generated suffix variants are bounded.
+            first_suffix_start = max(1, len(parts) - MAX_SOURCE_INDEX_SUFFIXES_PER_FILE)
+            for start in range(first_suffix_start, len(parts)):
+                index.by_suffix.setdefault("/".join(parts[start:]), []).append(relative_path)
     return index
 
 
@@ -105,28 +133,94 @@ def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
         "by_suffix": index.by_suffix,
         "by_stem": index.by_stem,
     }
+    serialized = json.dumps(payload)
+    encoded = serialized.encode("utf-8")
+    if len(encoded) > MAX_SOURCE_INDEX_MANIFEST_BYTES:
+        raise SourceIndexLimitError(
+            "Source index manifest exceeds the supported size limit"
+        )
     temp_path = manifest_path.with_name(manifest_path.name + ".tmp")
-    temp_path.write_text(json.dumps(payload), encoding="utf-8")
+    temp_path.write_bytes(encoded)
     os.replace(temp_path, manifest_path)
 
 
 def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None":
-    """Reconstruct a SourceIndex from a manifest save_index_manifest wrote,
-    without re-walking the source tree. Returns None on any read/parse
-    error (missing file, corrupt JSON, unexpected shape) so the caller can
-    always safely fall back to build_index() - a stale/corrupt cache file
-    must never be fatal to source correlation."""
+    """Reconstruct a bounded SourceIndex from a persisted manifest.
+    Missing/corrupt/legacy-unbounded manifests are cache misses, never fatal:
+    callers may rebuild from the already-prepared canonical source tree.
+    """
     try:
+        if manifest_path.stat().st_size > MAX_SOURCE_INDEX_MANIFEST_BYTES:
+            logger.warning(
+                "Source index manifest %s exceeds the supported size limit; "
+                "rebuilding",
+                manifest_path,
+            )
+            return None
+
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        by_path = {
-            relative_path: SourceFile(relative_path, basename, extension, size)
-            for relative_path, (basename, extension, size) in payload["by_path"].items()
-        }
+        by_path_payload = payload["by_path"]
+        by_suffix = payload["by_suffix"]
+        by_stem = payload["by_stem"]
+
+        if not all(
+            isinstance(mapping, dict)
+            for mapping in (by_path_payload, by_suffix, by_stem)
+        ):
+            raise TypeError("Source index manifest mappings have an invalid shape")
+
+        if len(by_path_payload) > MAX_SOURCE_FILES:
+            logger.warning(
+                "Source index manifest %s contains too many files; rebuilding",
+                manifest_path,
+            )
+            return None
+
+        if any(not isinstance(paths, list) for paths in by_suffix.values()):
+            raise TypeError("Source index suffix lists have an invalid shape")
+
+        suffix_reference_count = sum(len(paths) for paths in by_suffix.values())
+        if suffix_reference_count > (
+            MAX_SOURCE_FILES * MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
+        ):
+            logger.warning(
+                "Source index manifest %s contains too many suffix "
+                "references; rebuilding",
+                manifest_path,
+            )
+            return None
+
+        if any(not isinstance(paths, list) for paths in by_stem.values()):
+            raise TypeError("Source index stem lists have an invalid shape")
+
+        stem_reference_count = sum(len(paths) for paths in by_stem.values())
+        if stem_reference_count > MAX_SOURCE_FILES:
+            logger.warning(
+                "Source index manifest %s contains too many stem "
+                "references; rebuilding",
+                manifest_path,
+            )
+            return None
+
+        by_path = {}
+        for relative_path, raw_source_file in by_path_payload.items():
+            if not isinstance(relative_path, str):
+                raise TypeError("Source index path keys must be strings")
+            _validate_relative_path_for_index(relative_path)
+            basename, extension, size = raw_source_file
+            if (
+                not isinstance(basename, str)
+                or not isinstance(extension, str)
+                or not isinstance(size, int)
+            ):
+                raise TypeError("Source index file metadata has an invalid shape")
+            by_path[relative_path] = SourceFile(relative_path, basename, extension, size)
+
         return SourceIndex(
             root=root,
             by_path=by_path,
-            by_suffix=payload["by_suffix"],
-            by_stem=payload["by_stem"],
+            by_suffix=by_suffix,
+            by_stem=by_stem,
         )
     except (OSError, ValueError, KeyError, TypeError):
         logger.warning(

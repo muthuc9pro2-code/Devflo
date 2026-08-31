@@ -65,6 +65,14 @@ ANALYSIS_REQUEST_BODY_LIMIT_DETAIL = (
 )
 MAX_SOURCE_TOTAL_BYTES = 500 * MEBIBYTE
 MAX_SOURCE_FILES = 20_000
+# Bound derived source-index amplification independently from the raw source
+# byte/file limits. Deep paths otherwise create one stored suffix per path
+# component, and the persisted JSON manifest can become much larger than the
+# repository bytes that produced it.
+MAX_SOURCE_RELATIVE_PATH_BYTES = 1024
+MAX_SOURCE_PATH_DEPTH = 32
+MAX_SOURCE_INDEX_SUFFIXES_PER_FILE = 8
+MAX_SOURCE_INDEX_MANIFEST_BYTES = 64 * MEBIBYTE
 MAX_SOURCE_CONTEXT_FILE_BYTES = 5 * MEBIBYTE
 
 SOURCE_CONTEXT_CACHE_BYTES = 32 * MEBIBYTE
