@@ -1,8 +1,10 @@
 """Deterministic stack-frame -> source-file correlation via one prebuilt index."""
+from bisect import bisect_left
 import json
 import logging
 import os
 import posixpath
+import uuid
 from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +13,6 @@ from app.core.processing_config import (
     MAX_SOURCE_CONTEXT_FILE_BYTES,
     MAX_SOURCE_FILES,
     MAX_SOURCE_INDEX_MANIFEST_BYTES,
-    MAX_SOURCE_INDEX_SUFFIXES_PER_FILE,
     MAX_SOURCE_PATH_DEPTH,
     MAX_SOURCE_RELATIVE_PATH_BYTES,
     SOURCE_CONTEXT_CACHE_BYTES,
@@ -29,7 +30,12 @@ BINARY_EXTENSIONS = {
 
 SourceFile = namedtuple("SourceFile", "relative_path basename extension size")
 
-_SOURCE_INDEX_MANIFEST_VERSION = 1
+# v1 persisted generated suffix/stem maps. v2 persists only canonical by_path
+# metadata. Derived lookup structures are reconstructed in memory so old or
+# corrupt derived maps can never change source-correlation semantics.
+_SOURCE_INDEX_MANIFEST_VERSION = 2
+_LEGACY_SOURCE_INDEX_MANIFEST_VERSIONS = {None, 1}
+_SUFFIX_COMPONENT_SEPARATOR = "\x00"
 
 
 class SourceIndexLimitError(ValueError):
@@ -37,7 +43,18 @@ class SourceIndexLimitError(ValueError):
 
 
 def _validate_relative_path_for_index(relative_path: str) -> list[str]:
-    parts = [part for part in relative_path.split("/") if part]
+    if not isinstance(relative_path, str) or "\x00" in relative_path:
+        raise SourceIndexLimitError("Unsafe source path in index")
+    normalized = posixpath.normpath(relative_path)
+    if (
+        not relative_path
+        or normalized in {".", ".."}
+        or normalized.startswith("../")
+        or normalized.startswith("/")
+        or normalized != relative_path
+    ):
+        raise SourceIndexLimitError("Unsafe source path in index")
+    parts = relative_path.split("/")
     if len(parts) > MAX_SOURCE_PATH_DEPTH:
         raise SourceIndexLimitError(
             "Source path depth exceeds the supported index limit"
@@ -52,34 +69,38 @@ def _validate_relative_path_for_index(relative_path: str) -> list[str]:
     return parts
 
 
-def _bounded_suffix_start_indices(part_count: int) -> tuple[int, ...]:
-    """Choose at most the configured suffix budget without sacrificing either
-    specificity or short-path fallback matching.
+def _reversed_path_key(parts: list[str]) -> str:
+    return _SUFFIX_COMPONENT_SEPARATOR.join(reversed(parts)) + _SUFFIX_COMPONENT_SEPARATOR
 
-    Exact repository-relative paths remain in ``by_path``. For deeper paths we
-    keep the most specific generated suffixes from the front and the shortest
-    fallbacks from the tail. This avoids spending the entire budget on generic
-    tails such as ``pkg/file.py`` while still retaining basename/short-path
-    matches used by abbreviated stack frames.
+
+def _derived_maps_from_paths(
+    by_path: dict[str, SourceFile],
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """Build bounded lookup structures from canonical source paths.
+
+    Exactly one reversed lookup key is retained per source file. Prefix
+    searches over those keys reproduce the old exhaustive proper-suffix index
+    without storing every materialized suffix.
     """
-    available = max(part_count - 1, 0)
-    budget = min(MAX_SOURCE_INDEX_SUFFIXES_PER_FILE, available)
-    if budget <= 0:
-        return ()
-    if available <= budget:
-        return tuple(range(1, part_count))
-    specific_count = (budget + 1) // 2
-    fallback_count = budget - specific_count
-    starts = list(range(1, 1 + specific_count))
-    if fallback_count:
-        starts.extend(range(part_count - fallback_count, part_count))
-    return tuple(starts)
+    suffix_entries: list[tuple[str, str]] = []
+    by_stem: dict[str, list[str]] = {}
+    for relative_path, source_file in by_path.items():
+        parts = relative_path.split("/")
+        suffix_entries.append((_reversed_path_key(parts), relative_path))
+        by_stem.setdefault(Path(source_file.basename).stem, []).append(relative_path)
+    suffix_entries.sort(key=lambda item: item[0])
+    return (
+        [key for key, _path in suffix_entries],
+        [path for _key, path in suffix_entries],
+        by_stem,
+    )
 
 @dataclass(slots=True)
 class SourceIndex:
     root: Path
     by_path: dict[str, SourceFile] = field(default_factory=dict)
-    by_suffix: dict[str, list[str]] = field(default_factory=dict)
+    _suffix_keys: list[str] = field(default_factory=list, repr=False)
+    _suffix_paths: list[str] = field(default_factory=list, repr=False)
     by_stem: dict[str, list[str]] = field(default_factory=dict)
     _context_cache: dict[str, list[str] | None] = field(
         default_factory=dict, repr=False
@@ -114,7 +135,7 @@ class SourceIndex:
 _MISSING = object()
 
 def build_index(root: Path) -> SourceIndex:
-    index = SourceIndex(root=root)
+    by_path: dict[str, SourceFile] = {}
     root_str = str(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [name for name in dirnames if name not in IGNORED_DIRS]
@@ -127,16 +148,23 @@ def build_index(root: Path) -> SourceIndex:
             if extension in BINARY_EXTENSIONS:
                 continue
             relative_path = f"{relative_dir_posix}/{filename}" if relative_dir_posix else filename
-            parts = _validate_relative_path_for_index(relative_path)
+            _validate_relative_path_for_index(relative_path)
+            if len(by_path) >= MAX_SOURCE_FILES:
+                raise SourceIndexLimitError(
+                    "Source file count exceeds the supported index limit"
+                )
             full_path = Path(dirpath) / filename
-            index.by_path[relative_path] = SourceFile(relative_path, filename, extension, full_path.stat().st_size)
-            index.by_stem.setdefault(Path(filename).stem, []).append(relative_path)
-            # Exact repository-relative matching remains available through by_path.
-            # Generated suffixes are bounded while retaining both high-specificity
-            # long suffixes and short fallback suffixes.
-            for start in _bounded_suffix_start_indices(len(parts)):
-                index.by_suffix.setdefault("/".join(parts[start:]), []).append(relative_path)
-    return index
+            by_path[relative_path] = SourceFile(
+                relative_path, filename, extension, full_path.stat().st_size
+            )
+    suffix_keys, suffix_paths, by_stem = _derived_maps_from_paths(by_path)
+    return SourceIndex(
+        root=root,
+        by_path=by_path,
+        _suffix_keys=suffix_keys,
+        _suffix_paths=suffix_paths,
+        by_stem=by_stem,
+    )
 
 
 def index_manifest_path(root: Path) -> Path:
@@ -144,37 +172,62 @@ def index_manifest_path(root: Path) -> Path:
 
 
 def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
-    """Persist the expensive-to-build structural index (by_path/by_suffix/
-    by_stem - never the bounded per-file context cache, which stays cheap
-    to (re)populate lazily from the already-prepared source tree) as plain
-    JSON - a safe, deterministic representation, never pickle/unsafe
-    deserialization of user-controlled data. Written atomically (temp file
-    + os.replace, which is atomic on POSIX) so a concurrent reader can
-    never observe a partially-written file."""
+    """Persist only canonical bounded source-file metadata as safe JSON.
+
+    Derived lookup structures are reconstructed from by_path. Each writer gets
+    its own sibling temporary file so multiple ready-source artifact workers
+    can safely refresh the same missing/corrupt manifest concurrently.
+    """
     payload = {
         "version": _SOURCE_INDEX_MANIFEST_VERSION,
         "by_path": {
             relative_path: [source_file.basename, source_file.extension, source_file.size]
             for relative_path, source_file in index.by_path.items()
         },
-        "by_suffix": index.by_suffix,
-        "by_stem": index.by_stem,
     }
-    serialized = json.dumps(payload)
-    encoded = serialized.encode("utf-8")
+    encoded = json.dumps(payload).encode("utf-8")
     if len(encoded) > MAX_SOURCE_INDEX_MANIFEST_BYTES:
         raise SourceIndexLimitError(
             "Source index manifest exceeds the supported size limit"
         )
-    temp_path = manifest_path.with_name(manifest_path.name + ".tmp")
-    temp_path.write_bytes(encoded)
-    os.replace(temp_path, manifest_path)
+    temp_path = manifest_path.with_name(
+        f"{manifest_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        temp_path.write_bytes(encoded)
+        os.replace(temp_path, manifest_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _source_file_from_manifest(relative_path: str, raw_source_file) -> SourceFile:
+    if not isinstance(relative_path, str):
+        raise TypeError("Source index path keys must be strings")
+    _validate_relative_path_for_index(relative_path)
+    if not isinstance(raw_source_file, (list, tuple)) or len(raw_source_file) != 3:
+        raise TypeError("Source index file metadata has an invalid shape")
+    basename, extension, size = raw_source_file
+    expected_basename = Path(relative_path).name
+    expected_extension = Path(expected_basename).suffix.lower()
+    if (
+        not isinstance(basename, str)
+        or not isinstance(extension, str)
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or basename != expected_basename
+        or extension != expected_extension
+    ):
+        raise TypeError("Source index file metadata has an invalid shape")
+    return SourceFile(relative_path, basename, extension, size)
 
 
 def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None":
-    """Reconstruct a bounded SourceIndex from a persisted manifest.
-    Missing/corrupt/legacy-unbounded manifests are cache misses, never fatal:
-    callers may rebuild from the already-prepared canonical source tree.
+    """Load canonical metadata and rebuild bounded lookup structures.
+
+    Unversioned/v1 manifests remain safe to adopt because only their validated
+    by_path metadata is trusted; their old suffix/stem maps are ignored.
+    Missing, corrupt, oversized, or unsupported manifests remain cache misses.
     """
     try:
         if manifest_path.stat().st_size > MAX_SOURCE_INDEX_MANIFEST_BYTES:
@@ -186,24 +239,24 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
             return None
 
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("Source index manifest must be an object")
 
-        if payload.get("version") != _SOURCE_INDEX_MANIFEST_VERSION:
+        version = payload.get("version")
+        if (
+            version != _SOURCE_INDEX_MANIFEST_VERSION
+            and version not in _LEGACY_SOURCE_INDEX_MANIFEST_VERSIONS
+        ):
             logger.warning(
-                "Source index manifest %s uses an unsupported legacy format; "
+                "Source index manifest %s uses an unsupported format version; "
                 "rebuilding",
                 manifest_path,
             )
             return None
 
         by_path_payload = payload["by_path"]
-        by_suffix = payload["by_suffix"]
-        by_stem = payload["by_stem"]
-
-        if not all(
-            isinstance(mapping, dict)
-            for mapping in (by_path_payload, by_suffix, by_stem)
-        ):
-            raise TypeError("Source index manifest mappings have an invalid shape")
+        if not isinstance(by_path_payload, dict):
+            raise TypeError("Source index by_path mapping has an invalid shape")
 
         if len(by_path_payload) > MAX_SOURCE_FILES:
             logger.warning(
@@ -212,95 +265,18 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
             )
             return None
 
-        by_path = {}
+        by_path: dict[str, SourceFile] = {}
         for relative_path, raw_source_file in by_path_payload.items():
-            if not isinstance(relative_path, str):
-                raise TypeError("Source index path keys must be strings")
-            _validate_relative_path_for_index(relative_path)
-            basename, extension, size = raw_source_file
-            if (
-                not isinstance(basename, str)
-                or not isinstance(extension, str)
-                or not isinstance(size, int)
-            ):
-                raise TypeError("Source index file metadata has an invalid shape")
-            by_path[relative_path] = SourceFile(relative_path, basename, extension, size)
-
-        suffixes_per_path: dict[str, int] = {}
-        suffix_reference_count = 0
-        for suffix, paths in by_suffix.items():
-            if not isinstance(suffix, str) or not isinstance(paths, list):
-                raise TypeError("Source index suffix mappings have an invalid shape")
-            seen_paths: set[str] = set()
-            for relative_path in paths:
-                if not isinstance(relative_path, str) or relative_path not in by_path:
-                    raise TypeError(
-                        "Source index suffix references an unknown source path"
-                    )
-                if relative_path in seen_paths:
-                    raise TypeError(
-                        "Source index suffix contains a duplicate source path"
-                    )
-                if relative_path != suffix and not relative_path.endswith(f"/{suffix}"):
-                    raise TypeError(
-                        "Source index suffix does not match its source path"
-                    )
-                seen_paths.add(relative_path)
-                suffix_reference_count += 1
-                suffixes_per_path[relative_path] = (
-                    suffixes_per_path.get(relative_path, 0) + 1
-                )
-                if suffixes_per_path[relative_path] > MAX_SOURCE_INDEX_SUFFIXES_PER_FILE:
-                    logger.warning(
-                        "Source index manifest %s exceeds the per-file suffix "
-                        "limit; rebuilding",
-                        manifest_path,
-                    )
-                    return None
-
-        if suffix_reference_count > (
-            len(by_path) * MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
-        ):
-            logger.warning(
-                "Source index manifest %s contains too many suffix "
-                "references; rebuilding",
-                manifest_path,
+            by_path[relative_path] = _source_file_from_manifest(
+                relative_path, raw_source_file
             )
-            return None
 
-        stem_reference_count = 0
-        for stem, paths in by_stem.items():
-            if not isinstance(stem, str) or not isinstance(paths, list):
-                raise TypeError("Source index stem mappings have an invalid shape")
-            seen_paths: set[str] = set()
-            for relative_path in paths:
-                if not isinstance(relative_path, str) or relative_path not in by_path:
-                    raise TypeError(
-                        "Source index stem references an unknown source path"
-                    )
-                if relative_path in seen_paths:
-                    raise TypeError(
-                        "Source index stem contains a duplicate source path"
-                    )
-                if Path(relative_path).stem != stem:
-                    raise TypeError(
-                        "Source index stem does not match its source path"
-                    )
-                seen_paths.add(relative_path)
-                stem_reference_count += 1
-
-        if stem_reference_count > len(by_path):
-            logger.warning(
-                "Source index manifest %s contains too many stem "
-                "references; rebuilding",
-                manifest_path,
-            )
-            return None
-
+        suffix_keys, suffix_paths, by_stem = _derived_maps_from_paths(by_path)
         return SourceIndex(
             root=root,
             by_path=by_path,
-            by_suffix=by_suffix,
+            _suffix_keys=suffix_keys,
+            _suffix_paths=suffix_paths,
             by_stem=by_stem,
         )
     except (OSError, ValueError, KeyError, TypeError):
@@ -312,19 +288,49 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
         return None
 
 
+def _lookup_proper_suffix(
+    index: SourceIndex, suffix_parts: list[str]
+) -> tuple[str | None, bool]:
+    """Return (unique_path, ambiguous) for one requested proper suffix.
+
+    The reversed-key prefix represents all repository paths ending in the
+    requested component sequence. A key exactly equal to the prefix represents
+    a source file whose COMPLETE relative path equals that suffix; the original
+    exhaustive index deliberately did not register a path as its own suffix,
+    so that entry is skipped.
+    """
+    prefix = _reversed_path_key(suffix_parts)
+    position = bisect_left(index._suffix_keys, prefix)
+    candidate: str | None = None
+    while (
+        position < len(index._suffix_keys)
+        and index._suffix_keys[position].startswith(prefix)
+    ):
+        key = index._suffix_keys[position]
+        if len(key) > len(prefix):
+            if candidate is not None:
+                return None, True
+            candidate = index._suffix_paths[position]
+        position += 1
+    return candidate, False
+
+
 def _match_frame(frame, index: SourceIndex, module: str | None) -> dict | None:
     normalized = posixpath.normpath(frame.file.replace("\\", "/")).lstrip("./") if frame.file else None
     if normalized:
         if normalized in index.by_path:
             return _build_match(index, normalized, normalized, frame, "exact")
         parts = normalized.split("/")
+        # Preserve the original exhaustive-suffix algorithm exactly:
+        # requested proper suffixes are examined longest -> shortest.
         for start in range(1, len(parts)):
-            candidates = index.by_suffix.get("/".join(parts[start:]))
-            if candidates:
-                if len(candidates) != 1:
-                    return None  # ambiguous: never fabricate a source location
+            candidate, ambiguous = _lookup_proper_suffix(index, parts[start:])
+            if ambiguous:
+                # Never fabricate a source location.
+                return None
+            if candidate is not None:
                 method = "basename" if start == len(parts) - 1 else "suffix"
-                return _build_match(index, candidates[0], normalized, frame, method)
+                return _build_match(index, candidate, normalized, frame, method)
     stem = (module or "").rsplit(".", 1)[-1] or None
     candidates = index.by_stem.get(stem) if stem else None
     if candidates and len(candidates) == 1:

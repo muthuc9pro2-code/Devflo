@@ -193,30 +193,29 @@ def _analysis_source_dir(analysis_id: int) -> Path:
 
 
 def cleanup_prepared_source(analysis_id: int) -> None:
-    """Idempotently removes every on-disk artifact prepare_source() may
-    have produced for one analysis: the prepared source directory itself,
-    its ready marker, its index manifest, any in-flight temp manifest left
-    by a crashed save_index_manifest(), and any generation-owned temporary
-    staging directory (<id>.tmp-<generation>-<uuid>) an acquisition that
-    never reached publication may have left behind. Safe to call when none
-    of these exist. Only ever called at a genuine terminal point (this
-    analysis is durably completed/cancelled/failed - see callers), so it
-    is always safe to remove every generation's staging leftovers here,
-    not just the current one's: no generation will ever run for this
-    analysis again. Genuine filesystem errors (e.g. a permission problem)
-    propagate as OSError rather than being swallowed here - callers decide
-    whether a cleanup failure is fatal (prepare_source's own failure path)
-    or best-effort (finalize's post-completion cleanup)."""
+    """Idempotently remove every on-disk source artifact for one Analysis.
+
+    This includes the canonical tree/marker/manifest, the old fixed manifest
+    temp name, new unique-writer manifest temps, and every generation-owned
+    temporary source directory. Called only at a genuine terminal lifecycle
+    point, so removing every generation's leftovers is safe.
+    """
     dest = _analysis_source_dir(analysis_id)
     marker = _ready_marker(dest)
     manifest_path = index_manifest_path(dest)
-    tmp_manifest_path = manifest_path.with_name(manifest_path.name + ".tmp")
+    legacy_tmp_manifest_path = manifest_path.with_name(manifest_path.name + ".tmp")
 
     if dest.exists():
         shutil.rmtree(dest)
     marker.unlink(missing_ok=True)
     manifest_path.unlink(missing_ok=True)
-    tmp_manifest_path.unlink(missing_ok=True)
+    legacy_tmp_manifest_path.unlink(missing_ok=True)
+
+    for tmp_manifest_path in manifest_path.parent.glob(f"{manifest_path.name}.tmp-*"):
+        if tmp_manifest_path.is_dir():
+            shutil.rmtree(tmp_manifest_path, ignore_errors=True)
+        else:
+            tmp_manifest_path.unlink(missing_ok=True)
 
     for stray_temp in dest.parent.glob(f"{dest.name}.tmp-*"):
         if stray_temp.is_dir():

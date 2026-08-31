@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from pathlib import Path
 from time import perf_counter, sleep
 from google import genai
 from google.genai import errors as genai_errors
@@ -18,68 +19,158 @@ _REQUEST_TIMEOUT_SECONDS = 60
 _RETRYABLE_CLIENT_ERROR_STATUS_CODES = {429}
 
 _REDACTED = "[REDACTED]"
-_SENSITIVE_NAME_PATTERN = (
-    r"(?:[A-Za-z0-9]+[._-])*(?:authorization|proxy[_-]?authorization|"
-    r"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
-    r"id[_-]?token|token|password|passwd|client[_-]?secret|secret|"
-    r"cookie|set[_-]?cookie)"
+
+_IDENTIFIER_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_IDENTIFIER_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_IDENTIFIER_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
+
+_SENSITIVE_METADATA_TOKENS = {
+    "algorithm", "alg", "available", "bucket", "configured", "count",
+    "day", "days", "duration", "enabled", "endpoint", "expire", "expires",
+    "expiry", "field", "file", "filename", "header", "hour", "hours",
+    "kind", "length", "minute", "minutes", "name", "path", "policy",
+    "prefix", "present", "rotated", "rotation", "second", "seconds",
+    "secure", "status", "suffix", "timeout", "ttl", "type", "uri", "url",
+}
+_SENSITIVE_KEY_QUALIFIERS = {
+    "access", "api", "auth", "credential", "encryption", "hmac", "jwt",
+    "master", "private", "secret", "signing", "webhook",
+}
+_CONFIG_LIKE_SOURCE_SUFFIXES = {
+    ".cfg", ".conf", ".env", ".ini", ".properties", ".toml", ".yaml", ".yml",
+}
+
+_QUOTED_KEY_VALUE = re.compile(
+    r'(?P<prefix>["\'](?P<key>[A-Za-z_][A-Za-z0-9_.-]*)["\']\s*:\s*)'
+    r'(?P<value>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)'
 )
-_SENSITIVE_CONTEXT_KEY = re.compile(
-    rf"(?i)^(?:{_SENSITIVE_NAME_PATTERN})$"
+_SENSITIVE_HEADER = re.compile(
+    r"(?im)^"
+    r"(?P<prefix>\s*(?:authorization|proxy[-_]?authorization|"
+    r"cookie|set[-_]?cookie)\s*:\s*)"
+    r"(?P<value>[^\r\n]+)$"
 )
-_HEADER_SECRET = re.compile(
-    r"(?im)\b(authorization|proxy[_-]?authorization|cookie|"
-    r"set[_-]?cookie)"
-    r"(\s*[:=]\s*)[^\r\n]+"
+_ASSIGNMENT_VALUE = re.compile(
+    r"(?i)"
+    r"(?P<prefix>\b(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)"
+    r'(?P<value>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`|[^\s,;&#]+)'
 )
-_QUOTED_KEY_SECRET = re.compile(
-    rf"(?i)([\"']{_SENSITIVE_NAME_PATTERN}[\"']\s*:\s*)"
-    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+_SOURCE_LITERAL_ASSIGNMENT = re.compile(
+    r"(?i)"
+    r"(?P<prefix>\b(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)"
+    r'(?P<value>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)'
 )
-_SECRET_ASSIGNMENT = re.compile(
-    rf"(?i)\b({_SENSITIVE_NAME_PATTERN})"
-    r"(\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&#]+)"
-)
-_SOURCE_SECRET_LITERAL_ASSIGNMENT = re.compile(
-    rf"(?i)(\b{_SENSITIVE_NAME_PATTERN}\s*[:=]\s*)"
-    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+_SOURCE_CONFIG_LINE_ASSIGNMENT = re.compile(
+    r"(?m)^"
+    r"(?P<prefix>\s*(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)"
+    r"(?P<value>[^\r\n#]+?)"
+    r"(?P<suffix>\s*(?:#.*)?)$"
 )
 _BEARER_TOKEN = re.compile(
-    r"(?i)\b(bearer\s+)"
-    r"([A-Za-z0-9._~+/=-]{8,})"
+    r"(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]{8,})"
 )
 _URL_USERINFO = re.compile(
-    r"(?i)\b([a-z][a-z0-9+.-]*://)"
-    r"([^/\s:@]+):([^@\s/]+)@"
+    r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]*):([^@\s/]+)@"
 )
-_URL_QUERY_SECRET = re.compile(
-    r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"auth[_-]?token|id[_-]?token|token|password|secret|"
-    r"client[_-]?secret)=)"
-    r"([^&#\s]+)"
+_URL_QUERY_PARAMETER = re.compile(
+    r"(?i)(?P<prefix>[?&](?P<key>[A-Za-z0-9_.~-]+)=)(?P<value>[^&#\s]+)"
+)
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY)-----.*?"
+    r"-----END (?P=label)-----",
+    re.DOTALL,
 )
 _STANDALONE_SECRET_PATTERNS = (
-    # AWS access-key id
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    # Google API key
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
-    # GitHub token families
     re.compile(r"\bgh[pousr]_[0-9A-Za-z]{20,}\b"),
-    # Common sk-* API-key families
     re.compile(r"\bsk-[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{12,}\b"),
+    re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{16,}\b"),
+    re.compile(r"\bglpat-[0-9A-Za-z_-]{16,}\b"),
+    re.compile(
+        r"\beyJ[0-9A-Za-z_-]{5,}\.[0-9A-Za-z_-]{5,}\.[0-9A-Za-z_-]{5,}\b"
+    ),
 )
 
 
-def _redact_quoted_secret(match: re.Match) -> str:
-    value = match.group(2)
-    quote = value[0]
-    return f"{match.group(1)}{quote}{_REDACTED}{quote}"
+def _identifier_tokens(name: str) -> tuple[str, ...]:
+    separated = _IDENTIFIER_ACRONYM_BOUNDARY.sub(" ", str(name))
+    separated = _IDENTIFIER_CAMEL_BOUNDARY.sub(" ", separated)
+    separated = _IDENTIFIER_SEPARATOR.sub(" ", separated)
+    return tuple(token.lower() for token in separated.split() if token)
+
+
+def _is_sensitive_name(name: str) -> bool:
+    tokens = _identifier_tokens(name)
+    if not tokens:
+        return False
+    token_set = set(tokens)
+    # Metadata ABOUT credentials is useful and not itself secret.
+    if token_set & _SENSITIVE_METADATA_TOKENS:
+        return False
+    collapsed = "".join(tokens)
+    if "authorization" in token_set or "cookie" in token_set:
+        return True
+    if "password" in token_set or "passwd" in token_set:
+        return True
+    if "token" in token_set or "secret" in token_set:
+        return True
+    if "key" in token_set and token_set & _SENSITIVE_KEY_QUALIFIERS:
+        return True
+    if collapsed.endswith(
+        (
+            "apikey", "password", "passwd", "accesstoken", "refreshtoken",
+            "authtoken", "idtoken", "sessiontoken", "clientsecret",
+            "secretkey", "privatekey", "signingkey",
+        )
+    ):
+        return True
+    if token_set & {"pass", "pwd"} and token_set & {
+        "admin", "database", "db", "login", "mysql", "postgres",
+        "postgresql", "redis", "smtp", "user",
+    }:
+        return True
+    return False
+
+
+def _is_sensitive_query_name(name: str) -> bool:
+    tokens = _identifier_tokens(name)
+    return (
+        _is_sensitive_name(name)
+        or "credential" in tokens
+        or "signature" in tokens
+        or tokens == ("sig",)
+    )
+
+
+def _redacted_value(value: str) -> str:
+    if len(value) >= 2 and value[0] in {'"', "'", "`"} and value[-1] == value[0]:
+        return f"{value[0]}{_REDACTED}{value[0]}"
+    return _REDACTED
+
+
+def _redact_keyed_value(match: re.Match) -> str:
+    if not _is_sensitive_name(match.group("key")):
+        return match.group(0)
+    return f'{match.group("prefix")}{_redacted_value(match.group("value"))}'
+
+
+def _redact_query_parameter(match: re.Match) -> str:
+    if not _is_sensitive_query_name(match.group("key")):
+        return match.group(0)
+    return f'{match.group("prefix")}{_REDACTED}'
+
+
+def _redact_private_key_block(match: re.Match) -> str:
+    label = match.group("label")
+    return f"-----BEGIN {label}-----\n{_REDACTED}\n-----END {label}-----"
 
 
 def _redact_high_confidence_secret_shapes(text: str) -> str:
-    redacted = _URL_USERINFO.sub(r"\1[REDACTED]@", text)
-    redacted = _URL_QUERY_SECRET.sub(r"\1[REDACTED]", redacted)
+    redacted = _PRIVATE_KEY_BLOCK.sub(_redact_private_key_block, text)
+    redacted = _URL_USERINFO.sub(r"\1\2:[REDACTED]@", redacted)
+    redacted = _URL_QUERY_PARAMETER.sub(_redact_query_parameter, redacted)
     redacted = _BEARER_TOKEN.sub(r"\1[REDACTED]", redacted)
     for pattern in _STANDALONE_SECRET_PATTERNS:
         redacted = pattern.sub(_REDACTED, redacted)
@@ -87,68 +178,110 @@ def _redact_high_confidence_secret_shapes(text: str) -> str:
 
 
 def _redact_text_for_gemini(text: str) -> str:
-    # Diagnostic/log text may contain key=value, headers, or embedded JSON.
-    redacted = _QUOTED_KEY_SECRET.sub(_redact_quoted_secret, text)
-    redacted = _HEADER_SECRET.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
+    redacted = _QUOTED_KEY_VALUE.sub(_redact_keyed_value, text)
+    redacted = _SENSITIVE_HEADER.sub(
+        lambda match: f'{match.group("prefix")}{_REDACTED}',
         redacted,
     )
-    redacted = _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}{_REDACTED}",
-        redacted,
-    )
+    redacted = _ASSIGNMENT_VALUE.sub(_redact_keyed_value, redacted)
     return _redact_high_confidence_secret_shapes(redacted)
 
 
-def _redact_source_text_for_gemini(text: str) -> str:
-    """Redact only high-confidence secrets from source snippets.
+def _is_config_like_source_path(source_path: str | None) -> bool:
+    if not source_path:
+        return False
+    name = Path(source_path).name.lower()
+    if name == ".env" or name.startswith(".env."):
+        return True
+    return Path(name).suffix.lower() in _CONFIG_LIKE_SOURCE_SUFFIXES
 
-    Source code often contains safe credential references such as
-    ``password = os.getenv("DB_PASSWORD")``. Those are diagnostically useful
-    and must survive. Hardcoded sensitive literals and unmistakable token/URL
-    secret shapes are still removed.
-    """
-    redacted = _QUOTED_KEY_SECRET.sub(_redact_quoted_secret, text)
-    redacted = _SOURCE_SECRET_LITERAL_ASSIGNMENT.sub(_redact_quoted_secret, redacted)
+
+def _source_config_rhs_is_reference(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return True
+    if len(candidate) >= 2 and candidate[0] in {'"', "'", "`"} and candidate[-1] == candidate[0]:
+        candidate = candidate[1:-1].strip()
+    if candidate.startswith(("${", "$", "%")):
+        return True
+    return candidate.lower() in {"none", "null", "true", "false"}
+
+
+def _redact_config_source_assignment(match: re.Match) -> str:
+    if not _is_sensitive_name(match.group("key")):
+        return match.group(0)
+    value = match.group("value").strip()
+    if _source_config_rhs_is_reference(value):
+        return match.group(0)
+    return (
+        f'{match.group("prefix")}'
+        f'{_redacted_value(value)}'
+        f'{match.group("suffix")}'
+    )
+
+
+def _redact_source_text_for_gemini(text: str, *, source_path: str | None = None) -> str:
+    """Redact hardcoded source/config credentials without hiding references."""
+    redacted = _QUOTED_KEY_VALUE.sub(_redact_keyed_value, text)
+    if _is_config_like_source_path(source_path):
+        redacted = _SOURCE_CONFIG_LINE_ASSIGNMENT.sub(
+            _redact_config_source_assignment, redacted
+        )
+    else:
+        redacted = _SOURCE_LITERAL_ASSIGNMENT.sub(_redact_keyed_value, redacted)
     return _redact_high_confidence_secret_shapes(redacted)
 
 
 def _redact_context_for_gemini(
-    value, *, key: str | None = None, in_source_matches: bool = False
+    value,
+    *,
+    key: str | None = None,
+    in_source_matches: bool = False,
+    source_path: str | None = None,
 ):
     """Return a redacted copy of outbound Gemini context.
 
-    Deliberately narrow: obvious credential/token fields and high-confidence
-    secret shapes only. This is not a general PII detector, and deterministic
-    context/result objects are never mutated.
+    This deliberately targets obvious credentials/tokens/URL secrets only.
+    It is not a general PII scrubber, and the deterministic context/result is
+    never modified.
     """
-    if key is not None and _SENSITIVE_CONTEXT_KEY.search(str(key)):
+    if key is not None and _is_sensitive_name(str(key)):
         if value is None:
             return None
         return _REDACTED
     current_source_matches = in_source_matches or key == "source_matches"
     if isinstance(value, dict):
+        current_source_path = source_path
+        if current_source_matches:
+            relative_path = value.get("relative_path")
+            if isinstance(relative_path, str):
+                current_source_path = relative_path
         return {
             child_key: _redact_context_for_gemini(
                 child_value,
                 key=str(child_key),
                 in_source_matches=current_source_matches,
+                source_path=current_source_path,
             )
             for child_key, child_value in value.items()
         }
     if isinstance(value, list):
         return [
-            _redact_context_for_gemini(item, in_source_matches=current_source_matches)
+            _redact_context_for_gemini(
+                item, in_source_matches=current_source_matches, source_path=source_path
+            )
             for item in value
         ]
     if isinstance(value, tuple):
         return tuple(
-            _redact_context_for_gemini(item, in_source_matches=current_source_matches)
+            _redact_context_for_gemini(
+                item, in_source_matches=current_source_matches, source_path=source_path
+            )
             for item in value
         )
     if isinstance(value, str):
         if current_source_matches and key == "snippet":
-            return _redact_source_text_for_gemini(value)
+            return _redact_source_text_for_gemini(value, source_path=source_path)
         return _redact_text_for_gemini(value)
     return value
 

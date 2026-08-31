@@ -54,7 +54,7 @@ def test_source_zip_resource_constants_are_unchanged():
     assert processing_config.MAX_SOURCE_FILES == 20_000
     assert processing_config.MAX_SOURCE_RELATIVE_PATH_BYTES == 1024
     assert processing_config.MAX_SOURCE_PATH_DEPTH == 32
-    assert processing_config.MAX_SOURCE_INDEX_SUFFIXES_PER_FILE == 8
+    assert processing_config.MAX_SOURCE_INDEX_LOOKUP_KEYS_PER_FILE == 1
     assert (
         processing_config.MAX_SOURCE_INDEX_MANIFEST_BYTES
         == 64 * processing_config.MEBIBYTE
@@ -314,25 +314,23 @@ def test_source_index_rejects_relative_path_above_byte_bound(tmp_path, monkeypat
         build_index(tmp_path)
 
 
-def test_source_index_builds_only_bounded_trailing_suffixes_per_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 20)
-    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 3)
-    path = tmp_path / "a" / "b" / "c" / "d" / "main.py"
+def test_source_index_builds_one_reversed_lookup_key_per_file(tmp_path):
+    path = tmp_path / "a" / "b" / "c" / "main.py"
     path.parent.mkdir(parents=True)
     path.write_text("print('hi')\n")
 
     index = build_index(tmp_path)
 
-    assert set(index.by_path) == {"a/b/c/d/main.py"}
-    assert set(index.by_suffix) == {"b/c/d/main.py", "c/d/main.py", "main.py"}
+    assert set(index.by_path) == {"a/b/c/main.py"}
+    assert len(index._suffix_keys) == 1
+    assert len(index._suffix_paths) == 1
+    assert index._suffix_paths[0] == "a/b/c/main.py"
 
 
-def test_bounded_suffix_index_still_resolves_deep_stack_frame_paths(tmp_path, monkeypatch):
+def test_bounded_lookup_still_resolves_deep_stack_frame_paths(tmp_path):
     from app.services.log_praser import ParsedEvent, StackFrame
     from app.services.source_index import correlate_event
 
-    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 20)
-    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 3)
     path = tmp_path / "a" / "b" / "c" / "d" / "main.py"
     path.parent.mkdir(parents=True)
     path.write_text("print('hi')\n")
@@ -348,16 +346,13 @@ def test_bounded_suffix_index_still_resolves_deep_stack_frame_paths(tmp_path, mo
 
     assert len(matches) == 1
     assert matches[0]["relative_path"] == "a/b/c/d/main.py"
+    assert matches[0]["match_method"] == "suffix"
 
 
-def test_bounded_suffix_index_keeps_discriminating_long_suffixes_when_short_tails_collide(
-    tmp_path, monkeypatch
-):
+def test_bounded_lookup_disambiguates_shared_short_tails(tmp_path):
     from app.services.log_praser import ParsedEvent, StackFrame
     from app.services.source_index import correlate_event
 
-    monkeypatch.setattr(source_index, "MAX_SOURCE_PATH_DEPTH", 20)
-    monkeypatch.setattr(source_index, "MAX_SOURCE_INDEX_SUFFIXES_PER_FILE", 4)
     first = tmp_path / "x" / "one" / "a" / "b" / "c" / "d" / "main.py"
     second = tmp_path / "y" / "two" / "a" / "b" / "c" / "d" / "main.py"
     for path in (first, second):
@@ -365,11 +360,6 @@ def test_bounded_suffix_index_keeps_discriminating_long_suffixes_when_short_tail
         path.write_text("print('hi')\n")
 
     index = build_index(tmp_path)
-
-    # Short tails collide, so the bounded index must retain a discriminating
-    # long suffix as well as fallbacks.
-    assert len(index.by_suffix["main.py"]) == 2
-    assert len(index.by_suffix["one/a/b/c/d/main.py"]) == 1
 
     event = ParsedEvent(line_number=1, raw_line="ERROR failure")
     event.stack_frames = [
@@ -380,6 +370,66 @@ def test_bounded_suffix_index_keeps_discriminating_long_suffixes_when_short_tail
 
     assert len(matches) == 1
     assert matches[0]["relative_path"] == "x/one/a/b/c/d/main.py"
+
+
+def test_bounded_lookup_preserves_middle_suffix_semantics(tmp_path):
+    from app.services.log_praser import ParsedEvent, StackFrame
+    from app.services.source_index import correlate_event
+
+    first = tmp_path / "x" / "a" / "b" / "c" / "d" / "E" / "f" / "g" / "h" / "i" / "j" / "k" / "l" / "main.py"
+    second = tmp_path / "y" / "a2" / "b2" / "c2" / "d2" / "Q" / "f" / "g" / "h" / "i" / "j" / "k" / "l" / "main.py"
+    for path in (first, second):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("print('hi')\n")
+
+    index = build_index(tmp_path)
+
+    event = ParsedEvent(line_number=1, raw_line="ERROR failure")
+    event.stack_frames = [
+        StackFrame(file="/srv/E/f/g/h/i/j/k/l/main.py", line=1, function="run")
+    ]
+
+    matches = correlate_event(event, index)
+
+    assert len(matches) == 1
+    assert matches[0]["relative_path"] == "x/a/b/c/d/E/f/g/h/i/j/k/l/main.py"
+
+
+def test_bounded_lookup_preserves_old_root_vs_nested_behavior(tmp_path):
+    from app.services.log_praser import ParsedEvent, StackFrame
+    from app.services.source_index import correlate_event
+
+    (tmp_path / "d.py").write_text("root\n")
+    nested = tmp_path / "j" / "d.py"
+    nested.parent.mkdir()
+    nested.write_text("nested\n")
+
+    index = build_index(tmp_path)
+
+    event = ParsedEvent(line_number=1, raw_line="ERROR failure")
+    event.stack_frames = [StackFrame(file="/build/d.py", line=1, function="run")]
+
+    matches = correlate_event(event, index)
+
+    assert matches[0]["relative_path"] == "j/d.py"
+    assert matches[0]["match_method"] == "basename"
+
+    exact_event = ParsedEvent(line_number=1, raw_line="ERROR failure")
+    exact_event.stack_frames = [StackFrame(file="d.py", line=1, function="run")]
+
+    exact_matches = correlate_event(exact_event, index)
+
+    assert exact_matches[0]["relative_path"] == "d.py"
+    assert exact_matches[0]["match_method"] == "exact"
+
+
+def test_source_index_enforces_file_count_itself(tmp_path, monkeypatch):
+    monkeypatch.setattr(source_index, "MAX_SOURCE_FILES", 2)
+    for filename in ("a.py", "b.py", "c.py"):
+        (tmp_path / filename).write_text("x\n")
+
+    with pytest.raises(SourceIndexLimitError, match="file count"):
+        build_index(tmp_path)
 
 
 def test_source_index_manifest_write_is_bounded_before_publication(tmp_path, monkeypatch):
@@ -393,7 +443,7 @@ def test_source_index_manifest_write_is_bounded_before_publication(tmp_path, mon
         save_index_manifest(index, manifest)
 
     assert not manifest.exists()
-    assert not (tmp_path / "index.json.tmp").exists()
+    assert list(tmp_path.glob("index.json.tmp-*")) == []
 
 
 def test_oversized_source_index_manifest_is_not_loaded(tmp_path, monkeypatch):
@@ -404,68 +454,83 @@ def test_oversized_source_index_manifest_is_not_loaded(tmp_path, monkeypatch):
     assert load_index_manifest(manifest, tmp_path) is None
 
 
-def test_unversioned_legacy_source_index_manifest_is_not_loaded(tmp_path):
+@pytest.mark.parametrize("legacy_version", [None, 1])
+def test_legacy_manifest_ignores_derived_maps_and_rebuilds_from_by_path(
+    tmp_path, legacy_version
+):
     import json
 
-    manifest = tmp_path / "index.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "by_path": {"app.py": ["app.py", ".py", 1]},
-                "by_suffix": {},
-                "by_stem": {"app": ["app.py"]},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_index_manifest(manifest, tmp_path) is None
-
-
-def test_manifest_cannot_reintroduce_more_than_per_file_suffix_budget(tmp_path):
-    import json
-
-    relative_path = "a/b/c/d/e/f/g/h/i/j/main.py"
-    parts = relative_path.split("/")
-    legacy_suffixes = {
-        "/".join(parts[start:]): [relative_path] for start in range(1, len(parts))
+    payload = {
+        "by_path": {
+            "a/main.py": ["main.py", ".py", 1],
+            "b/main.py": ["main.py", ".py", 1],
+        },
+        # Deliberately invalid old derived data. Must be ignored.
+        "by_suffix": {"wrong.py": ["missing.py"]},
+        "by_stem": {"wrong": ["missing.py"]},
     }
-    assert len(legacy_suffixes) > processing_config.MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
+    if legacy_version is not None:
+        payload["version"] = legacy_version
+
+    manifest = tmp_path / "index.json"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_index_manifest(manifest, tmp_path)
+
+    assert loaded is not None
+    assert set(loaded.by_path) == {"a/main.py", "b/main.py"}
+    assert len(loaded._suffix_keys) == 2
+    assert loaded.by_stem == {"main": ["a/main.py", "b/main.py"]}
+
+
+def test_v2_manifest_persists_only_canonical_by_path(tmp_path):
+    import json
+
+    path = tmp_path / "app" / "main.py"
+    path.parent.mkdir()
+    path.write_text("print('hi')\n")
+    index = build_index(tmp_path)
+    manifest = tmp_path / "index.json"
+
+    save_index_manifest(index, manifest)
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert set(payload) == {"version", "by_path"}
+    assert payload["version"] == source_index._SOURCE_INDEX_MANIFEST_VERSION
+
+    loaded = load_index_manifest(manifest, tmp_path)
+    assert loaded is not None
+    assert set(loaded.by_path) == {"app/main.py"}
+    assert len(loaded._suffix_keys) == 1
+
+
+def test_future_manifest_version_is_cache_miss(tmp_path):
+    import json
 
     manifest = tmp_path / "index.json"
     manifest.write_text(
         json.dumps(
             {
-                "version": source_index._SOURCE_INDEX_MANIFEST_VERSION,
-                "by_path": {relative_path: ["main.py", ".py", 1]},
-                "by_suffix": legacy_suffixes,
-                "by_stem": {"main": [relative_path]},
+                "version": source_index._SOURCE_INDEX_MANIFEST_VERSION + 100,
+                "by_path": {"app.py": ["app.py", ".py", 1]},
             }
         ),
         encoding="utf-8",
-    )
-    # Far below the old global 20_000 * 8 ceiling. Rejection therefore must
-    # genuinely be per-file.
-    assert len(legacy_suffixes) < (
-        processing_config.MAX_SOURCE_FILES
-        * processing_config.MAX_SOURCE_INDEX_SUFFIXES_PER_FILE
     )
 
     assert load_index_manifest(manifest, tmp_path) is None
 
 
 @pytest.mark.parametrize(
-    ("by_suffix", "by_stem"),
+    "metadata",
     [
-        ({"app.py": ["missing.py"]}, {"app": ["app.py"]}),
-        ({"other.py": ["app.py"]}, {"app": ["app.py"]}),
-        ({}, {"app": ["missing.py"]}),
-        ({}, {"wrong": ["app.py"]}),
+        ["wrong.py", ".py", 1],
+        ["app.py", ".txt", 1],
+        ["app.py", ".py", -1],
+        ["app.py", ".py", True],
     ],
 )
-def test_manifest_derived_indexes_cannot_reference_or_mislabel_source_paths(
-    tmp_path, by_suffix, by_stem
-):
+def test_manifest_rejects_inconsistent_file_metadata(tmp_path, metadata):
     import json
 
     manifest = tmp_path / "index.json"
@@ -473,15 +538,80 @@ def test_manifest_derived_indexes_cannot_reference_or_mislabel_source_paths(
         json.dumps(
             {
                 "version": source_index._SOURCE_INDEX_MANIFEST_VERSION,
-                "by_path": {"app.py": ["app.py", ".py", 1]},
-                "by_suffix": by_suffix,
-                "by_stem": by_stem,
+                "by_path": {"app.py": metadata},
             }
         ),
         encoding="utf-8",
     )
 
     assert load_index_manifest(manifest, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["../outside.py", "/absolute.py", "a/../b.py"],
+)
+def test_manifest_rejects_paths_that_escape_or_alias_source_root(
+    tmp_path, relative_path
+):
+    import json
+
+    basename = Path(relative_path).name
+    manifest = tmp_path / "index.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": source_index._SOURCE_INDEX_MANIFEST_VERSION,
+                "by_path": {
+                    relative_path: [
+                        basename,
+                        Path(basename).suffix.lower(),
+                        1,
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_index_manifest(manifest, tmp_path) is None
+
+
+def test_concurrent_manifest_writers_use_distinct_temp_files(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "app" / "main.py"
+    path.parent.mkdir()
+    path.write_text("print('hi')\n")
+    index = build_index(tmp_path)
+    manifest = tmp_path / "index.json"
+
+    real_replace = source_index.os.replace
+    barrier = threading.Barrier(2)
+    replace_sources = []
+    capture_lock = threading.Lock()
+
+    def synchronized_replace(source, destination):
+        if Path(destination) == manifest:
+            with capture_lock:
+                replace_sources.append(Path(source).name)
+            barrier.wait(timeout=5)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(source_index.os, "replace", synchronized_replace)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(save_index_manifest, index, manifest) for _ in range(2)
+        ]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert len(replace_sources) == 2
+    assert len(set(replace_sources)) == 2
+    assert list(tmp_path.glob("index.json.tmp-*")) == []
+    assert load_index_manifest(manifest, tmp_path) is not None
 
 
 # --- 13: cleanup_prepared_source() is idempotent ----------------------------
@@ -503,15 +633,21 @@ def test_cleanup_prepared_source_removes_everything_then_stays_a_no_op(tmp_path,
     marker.touch()
     manifest = tmp_path / "sources" / "77.index.json"
     manifest.write_text("{}")
-    manifest_tmp = tmp_path / "sources" / "77.index.json.tmp"
-    manifest_tmp.write_text("{}")
+    legacy_manifest_tmp = tmp_path / "sources" / "77.index.json.tmp"
+    legacy_manifest_tmp.write_text("{}")
+    writer_tmp_a = tmp_path / "sources" / "77.index.json.tmp-100-a"
+    writer_tmp_b = tmp_path / "sources" / "77.index.json.tmp-200-b"
+    writer_tmp_a.write_text("{}")
+    writer_tmp_b.write_text("{}")
 
     cleanup_prepared_source(77)
 
     assert not dest.exists()
     assert not marker.exists()
     assert not manifest.exists()
-    assert not manifest_tmp.exists()
+    assert not legacy_manifest_tmp.exists()
+    assert not writer_tmp_a.exists()
+    assert not writer_tmp_b.exists()
 
     cleanup_prepared_source(77)  # idempotent: calling again on an already-clean state
 

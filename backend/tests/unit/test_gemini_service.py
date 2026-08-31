@@ -536,9 +536,15 @@ def test_gemini_source_redaction_preserves_references_but_removes_hardcoded_lite
                             "authorization = request.headers.get(\"Authorization\")\n"
                             "password = os.getenv(\"DB_PASSWORD\")\n"
                             "api_key = settings.API_KEY\n"
+                            "SECRET_KEY = Settings.SECRET_KEY\n"
+                            "RESEND_API_KEY = os.getenv(\"RESEND_API_KEY\")\n"
+                            "dbPassword = config.dbPassword\n"
                             "cookie = request.headers.get(\"Cookie\")\n"
                             "password = \"actual-password-secret\"\n"
-                            "client_secret = 'actual-client-secret'"
+                            "client_secret = 'actual-client-secret'\n"
+                            "SECRET_KEY = \"actual-secret-key\"\n"
+                            "dbPassword = 'actual-db-secret'\n"
+                            "stripeSecretKey = `sk_test_1234567890123456`"
                         ),
                     }
                 ]
@@ -559,8 +565,168 @@ def test_gemini_source_redaction_preserves_references_but_removes_hardcoded_lite
     assert 'authorization = request.headers.get("Authorization")' in snippet
     assert 'password = os.getenv("DB_PASSWORD")' in snippet
     assert "api_key = settings.API_KEY" in snippet
+    assert "SECRET_KEY = Settings.SECRET_KEY" in snippet
+    assert 'RESEND_API_KEY = os.getenv("RESEND_API_KEY")' in snippet
+    assert "dbPassword = config.dbPassword" in snippet
     assert 'cookie = request.headers.get("Cookie")' in snippet
+
     assert "actual-password-secret" not in snippet
     assert "actual-client-secret" not in snippet
+    assert "actual-secret-key" not in snippet
+    assert "actual-db-secret" not in snippet
+    assert "sk_test_1234567890123456" not in snippet
+
     assert 'password = "[REDACTED]"' in snippet
     assert "client_secret = '[REDACTED]'" in snippet
+    assert 'SECRET_KEY = "[REDACTED]"' in snippet
+    assert "dbPassword = '[REDACTED]'" in snippet
+    assert "stripeSecretKey = `[REDACTED]`" in snippet
+
+
+def test_gemini_redaction_covers_devflo_env_credentials_without_scrubbing_metadata():
+    context = {
+        "config_dump": {
+            "SECRET_KEY": "secret-key-value",
+            "GEMINI_API_KEY": "gemini-key-value",
+            "RESEND_API_KEY": "resend-key-value",
+            "AWS_SECRET_ACCESS_KEY": "aws-secret",
+            "JWT_SECRET_KEY": "jwt-secret",
+            "STRIPE_SECRET_KEY": "stripe-secret",
+            "HMAC_KEY": "hmac-secret",
+            "MASTER_KEY": "master-secret",
+            "JWT_KEY": "jwt-key",
+            "AUTH_KEY": "auth-key",
+            "dbPassword": "db-password",
+            "DBPASSWORD": "db-password-2",
+            "DB_PASS": "db-pass",
+            "APIKEY": "api-key",
+            "githubToken": "github-token",
+            "sessionToken": "session-token",
+            "DATABASE_URL": (
+                "mysql+pymysql://user:db-password@db-host:3306/devflo"
+            ),
+            "REDIS_EVENTS_URL": "redis://:redis-password@redis:6379/0",
+            "ACCESS_TOKEN_EXPIRE_MINUTES": 30,
+            "REFRESH_TOKEN_EXPIRE_DAYS": 7,
+            "PASSWORD_RESET_TOKEN_EXPIRE_MINUTES": 15,
+            "COOKIE_SECURE": False,
+            "api_key_name": "provider-key-name",
+        }
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])["config_dump"]
+
+    for key in (
+        "SECRET_KEY",
+        "GEMINI_API_KEY",
+        "RESEND_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "JWT_SECRET_KEY",
+        "STRIPE_SECRET_KEY",
+        "HMAC_KEY",
+        "MASTER_KEY",
+        "JWT_KEY",
+        "AUTH_KEY",
+        "dbPassword",
+        "DBPASSWORD",
+        "DB_PASS",
+        "APIKEY",
+        "githubToken",
+        "sessionToken",
+    ):
+        assert sent[key] == "[REDACTED]"
+
+    assert sent["DATABASE_URL"] == "mysql+pymysql://user:[REDACTED]@db-host:3306/devflo"
+    assert sent["REDIS_EVENTS_URL"] == "redis://:[REDACTED]@redis:6379/0"
+    assert sent["ACCESS_TOKEN_EXPIRE_MINUTES"] == 30
+    assert sent["REFRESH_TOKEN_EXPIRE_DAYS"] == 7
+    assert sent["PASSWORD_RESET_TOKEN_EXPIRE_MINUTES"] == 15
+    assert sent["COOKIE_SECURE"] is False
+    assert sent["api_key_name"] == "provider-key-name"
+
+
+def test_gemini_source_redaction_handles_env_files_and_preserves_substitutions():
+    context = {
+        "evidence": [
+            {
+                "source_matches": [
+                    {
+                        "relative_path": ".env",
+                        "snippet": (
+                            "SECRET_KEY=hardcoded-secret\n"
+                            "GEMINI_API_KEY=\"${GEMINI_API_KEY}\"\n"
+                            "RESEND_API_KEY=re_hardcoded_secret\n"
+                            "ACCESS_TOKEN_EXPIRE_MINUTES=30\n"
+                            "REFRESH_TOKEN_EXPIRE_DAYS=7\n"
+                            "COOKIE_SECURE=false\n"
+                            "DATABASE_URL=mysql://user:dbpass@db/devflo\n"
+                            "REDIS_EVENTS_URL=redis://:redispass@redis:6379/0"
+                        ),
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    snippet = json.loads(kwargs["contents"])["evidence"][0]["source_matches"][0]["snippet"]
+
+    assert "SECRET_KEY=[REDACTED]" in snippet
+    assert 'GEMINI_API_KEY="${GEMINI_API_KEY}"' in snippet
+    assert "RESEND_API_KEY=[REDACTED]" in snippet
+    assert "ACCESS_TOKEN_EXPIRE_MINUTES=30" in snippet
+    assert "REFRESH_TOKEN_EXPIRE_DAYS=7" in snippet
+    assert "COOKIE_SECURE=false" in snippet
+    assert "DATABASE_URL=mysql://user:[REDACTED]@db/devflo" in snippet
+    assert "REDIS_EVENTS_URL=redis://:[REDACTED]@redis:6379/0" in snippet
+
+
+def test_gemini_redaction_covers_private_keys_jwts_and_signed_urls_without_breaking_username_only_urls():
+    context = {
+        "evidence": [
+            {
+                "representative_line": (
+                    "repo=ssh://git@github.com/acme/project "
+                    "signed=https://example.com/object?"
+                    "X-Amz-Credential=credential-value&"
+                    "X-Amz-Signature=signature-value&"
+                    "Expires=60\n"
+                    "jwt=eyJabcdefghijk.abcdefghijk.abcdefghijk\n"
+                    "-----BEGIN PRIVATE KEY-----\n"
+                    "super-secret-private-key-material\n"
+                    "-----END PRIVATE KEY-----"
+                )
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    line = json.loads(kwargs["contents"])["evidence"][0]["representative_line"]
+
+    assert "ssh://git@github.com/acme/project" in line
+    assert "X-Amz-Credential=[REDACTED]" in line
+    assert "X-Amz-Signature=[REDACTED]" in line
+    assert "Expires=60" in line
+    assert "eyJabcdefghijk.abcdefghijk.abcdefghijk" not in line
+    assert "super-secret-private-key-material" not in line
+    assert "-----BEGIN PRIVATE KEY-----" in line
+    assert "-----END PRIVATE KEY-----" in line
