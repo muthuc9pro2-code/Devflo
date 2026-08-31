@@ -1879,3 +1879,107 @@ def test_recovery_matrix_unsupported_artifact_remains_terminal(
     assert stuck_after.status == "pending"
     assert stuck_after.processed_bytes == 100
     assert stuck_after.last_processed_line == 5
+
+
+def test_recovered_text_artifact_resumes_global_line_number_from_committed_checkpoint(
+    monkeypatch, tmp_path,
+):
+    """Production-shaped recovery -> new generation -> artifact resume.
+    Recovery already preserves processed_bytes/last_processed_line. The
+    redispatched artifact task must rebuild the parser's GLOBAL baseline from
+    both artifact.position and that preserved local-line checkpoint; otherwise
+    the first post-crash record is renumbered as line 1 of the artifact again.
+    """
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
+    monkeypatch.setattr(analysis_task, "_last_heartbeat_write", {})
+    monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
+    monkeypatch.setattr(analysis_task, "publish_artifact_outcome", lambda *a, **k: None)
+
+    lines = [
+        b"2026-01-01T00:00:00Z INFO service=api request started\n",
+        b"2026-01-01T00:00:01Z INFO service=api request still healthy\n",
+        b"2026-01-01T00:00:02Z ERROR service=api ConnectionError: resumed failure\n",
+    ]
+    artifact_path = tmp_path / "resume.log"
+    artifact_path.write_bytes(b"".join(lines))
+    checkpoint_bytes = len(lines[0]) + len(lines[1])
+
+    db = session_factory()
+    alice = _user(db)
+    analysis = _stale_analysis(
+        db, alice, status="processing", age_seconds=301, processing_generation=1,
+    )
+    artifact = _artifact(
+        db, analysis, position=2, status="processing", detected_format="generic",
+        original_filename="resume.log", saved_file_path=str(artifact_path),
+        size_bytes=artifact_path.stat().st_size,
+        processed_bytes=checkpoint_bytes, last_processed_line=2,
+    )
+    analysis_id = analysis.id
+    artifact_id = artifact.id
+    db.close()
+
+    redispatched = []
+    monkeypatch.setattr(
+        analysis_task.process_analysis, "delay", lambda aid: redispatched.append(aid),
+    )
+
+    assert analysis_task.recover_stale_analyses.run() == 1
+    assert redispatched == [analysis_id]
+
+    db = session_factory()
+    recovered_analysis = db.query(Analysis).filter(Analysis.id == analysis_id).one()
+    recovered_artifact = (
+        db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).one()
+    )
+    assert recovered_analysis.status == "pending"
+    assert recovered_artifact.status == "pending"
+    assert recovered_artifact.processed_bytes == checkpoint_bytes
+    assert recovered_artifact.last_processed_line == 2
+    db.close()
+
+    # Let the real process_analysis claim the recovered parent and establish
+    # the next generation, but intercept Celery publication. The artifact task
+    # itself is invoked synchronously below using that real new generation.
+    monkeypatch.setattr(analysis_task, "group", lambda _sigs: object())
+    monkeypatch.setattr(
+        analysis_task, "chord",
+        lambda _group, _callback: type("_Workflow", (), {"apply_async": lambda self: None})(),
+    )
+    monkeypatch.setattr(analysis_task._process_artifact_task, "si", lambda *a, **k: object())
+    monkeypatch.setattr(analysis_task._finalize_analysis_task, "s", lambda *a, **k: object())
+
+    analysis_task.process_analysis.run(analysis_id)
+
+    db = session_factory()
+    current = db.query(Analysis).filter(Analysis.id == analysis_id).one()
+    assert current.status == "processing"
+    assert current.processing_generation == 2
+    db.close()
+
+    persisted_line_numbers = []
+
+    def capture_persisted_events(*, db, analysis_id, events, artifact_id=None):
+        persisted_line_numbers.extend(
+            event.line_number for event in events if event is not None
+        )
+
+    monkeypatch.setattr(analysis_task, "persist_evidence_batch", capture_persisted_events)
+
+    parsed = analysis_task._process_artifact_task.run(analysis_id, artifact_id, 2)
+
+    assert parsed == 1
+    assert persisted_line_numbers == [
+        2 * analysis_task._GLOBAL_LINE_NUMBER_STRIDE + 3
+    ]
+
+    db = session_factory()
+    completed_artifact = (
+        db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact_id).one()
+    )
+    assert completed_artifact.status == "completed"
+    assert completed_artifact.last_processed_line == 3
+    db.close()

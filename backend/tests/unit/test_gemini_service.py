@@ -382,3 +382,15 @@ def test_automatic_function_calling_disabled_even_after_a_retry(monkeypatch):
 
     _, kwargs = generate_content.call_args
     assert kwargs["config"].automatic_function_calling.disable is True
+
+
+def test_unconfigured_gemini_is_optional_and_never_constructs_sdk_client(monkeypatch):
+    monkeypatch.setattr(gemini_service.Settings, "GEMINI_API_KEY", None)
+    monkeypatch.setattr(gemini_service._client, "_resolved_client", None)
+    client_constructor = MagicMock()
+    monkeypatch.setattr(gemini_service.genai, "Client", client_constructor)
+
+    with pytest.raises(GeminiUnavailableError, match="not configured"):
+        generate_investigation_explanation({"analysis_id": 1})
+
+    client_constructor.assert_not_called()

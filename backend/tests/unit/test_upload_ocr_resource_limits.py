@@ -6,8 +6,8 @@ CPU-heavy work; MAX_OCR_IMAGE_BYTES/MAX_OCR_IMAGE_PIXELS bound one image's
 compressed size and decoded pixel count. All four are independent of the
 existing, unchanged MAX_INVESTIGATION_UPLOAD_BYTES (1 GiB combined budget).
 
-Proves both POST /analysis/upload and POST /image/extract-text run the SAME
-shared validator (image_text_extractor.validate_ocr_image) - no second,
+Proves POST /analysis/upload and the OCR engine use the SAME shared
+validator (image_text_extractor.validate_ocr_image) - no second,
 independently-drifting image validation implementation - and that RapidOCR
 itself is never the first place an oversized/absurd image is discovered.
 """
@@ -16,12 +16,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException
 from PIL import Image
-from starlette.datastructures import Headers
 
 from app.api import analysis as analysis_api
-from app.api import image as image_api
 from app.core.processing_config import MAX_OCR_IMAGE_PIXELS
 from app.services import image_text_extractor
 
@@ -38,14 +36,6 @@ def _png_bytes(width: int, height: int, mode: str = "RGB") -> bytes:
     buffer = BytesIO()
     Image.new(mode, (width, height), 0).save(buffer, format="PNG")
     return buffer.getvalue()
-
-
-def _fastapi_upload(filename: str, content: bytes, content_type: str) -> UploadFile:
-    return UploadFile(
-        file=BytesIO(content),
-        filename=filename,
-        headers=Headers({"content-type": content_type}),
-    )
 
 
 # --- 1-2: MAX_DIAGNOSTIC_ARTIFACTS -----------------------------------------
@@ -219,34 +209,23 @@ def test_safe_small_image_still_reaches_ocr(tmp_path, monkeypatch):
     ocr_spy = Mock(return_value=([], None))
     monkeypatch.setattr(image_text_extractor, "_ocr", ocr_spy)
 
-    image_text_extractor.extract_text_from_image(str(path))
+    image_text_extractor.extract_text_from_image_with_confidence(str(path))
 
     ocr_spy.assert_called_once_with(str(path))
 
 
-# --- 8: /image/extract-text and /analysis/upload share one validator -------
+# --- 8: upload path and OCR engine share one validator ---------------------
 
 
-def test_upload_and_standalone_endpoint_share_the_same_validator_and_constants():
-    assert analysis_api.validate_ocr_image is image_text_extractor.validate_ocr_image
-    assert image_api.validate_ocr_image is image_text_extractor.validate_ocr_image
+def test_analysis_upload_and_ocr_engine_share_the_same_validator_and_constants():
+    assert (
+        analysis_api.validate_ocr_image
+        is image_text_extractor.validate_ocr_image
+    )
     assert (
         analysis_api.MAX_OCR_IMAGE_BYTES
-        == image_api.MAX_OCR_IMAGE_BYTES
         == image_text_extractor.MAX_OCR_IMAGE_BYTES
     )
-
-
-@pytest.mark.asyncio
-async def test_standalone_endpoint_rejects_the_same_oversized_pixel_image_as_upload():
-    width = 6000
-    height = (MAX_OCR_IMAGE_PIXELS // width) + 100
-    content = _png_bytes(width, height, mode="1")
-
-    with pytest.raises(HTTPException) as error:
-        await image_api.extract_image_text(_fastapi_upload("huge.png", content, "image/png"))
-
-    assert error.value.status_code == 413
 
 
 # --- 9: OCR engine call count -----------------------------------------------

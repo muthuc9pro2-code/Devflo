@@ -22,7 +22,7 @@ The deterministic stages (parsing through root-cause prioritization) are the
 system of record. Gemini is only asked to explain an already-complete
 deterministic result — it never decides root cause on its own, and its
 context is a bounded, structured summary rather than raw diagnostic dumps.
-If Gemini is unavailable, the deterministic result still completes.
+If Gemini is unconfigured or unavailable, the deterministic result still completes.
 
 ## Supported diagnostic input
 

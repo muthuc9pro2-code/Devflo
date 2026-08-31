@@ -96,12 +96,13 @@ def validate_ocr_image(file_path: str | Path) -> None:
 
 def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
     """Single shared entry point into the RapidOCR engine: each result is
-    RapidOCR's own (box, text, confidence) triple. Both public functions
-    below read from this same call - there is no second/parallel OCR path.
+    RapidOCR's own (box, text, confidence) triple. The public extraction
+    function below reads from this same call - there is no second/parallel
+    OCR path.
     validate_ocr_image() runs here too (defense-in-depth) even though
-    callers upstream (app/api/analysis.py, app/api/image.py) already
-    validate before staging/dispatch - so there is no RapidOCR path,
-    present or future, that can bypass the resource-limit gate."""
+    upload handling (app/api/analysis.py) already validates before dispatch,
+    so there is no RapidOCR path, present or future, that can bypass the
+    resource-limit gate."""
     path = Path(file_path)
 
     if path.suffix.lower() not in _ALLOWED_IMAGE_EXTENSIONS:
@@ -128,13 +129,9 @@ def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
         raise OcrProcessingError("Image OCR could not be completed") from error
 
 
-def extract_text_from_image(file_path: str) -> str:
-    return "\n".join(text for text, _confidence in _run_ocr(file_path))
-
-
 def extract_text_from_image_with_confidence(file_path: str) -> tuple[str, float | None]:
-    """Same extraction as extract_text_from_image(), plus the real RapidOCR
-    confidence - never invented/defaulted. Multiple OCR-detected lines are
+    """Return normalized OCR text plus the real RapidOCR confidence -
+    never invented/defaulted. Multiple OCR-detected lines are
     combined into one diagnostic record further down the existing pipeline
     (diagnostic_adapters._stream_image_events already treats one image as
     one event, unchanged here), so their per-line confidences are reduced

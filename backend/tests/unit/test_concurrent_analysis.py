@@ -265,6 +265,7 @@ def test_artifact_task_failure_marks_analysis_failed_and_reraises(monkeypatch):
         analysis_id=9,
         position=0,
         status="processing",
+        last_processed_line=0,
     )
 
     # The authoritative claim reads current scalar/column state under

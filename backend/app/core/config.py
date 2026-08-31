@@ -30,7 +30,7 @@ class AppSettings(BaseSettings):
 
     FRONTEND_URL: str
 
-    GEMINI_API_KEY: str
+    GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-3.5-flash-lite"
 
     @field_validator("SECRET_KEY")
@@ -45,6 +45,14 @@ class AppSettings(BaseSettings):
                 "SECRET_KEY must contain at least 32 bytes and must not be a placeholder"
             )
         return value
+
+    @field_validator("GEMINI_API_KEY", mode="before")
+    @classmethod
+    def normalize_optional_gemini_api_key(cls, value):
+        if value is None:
+            return None
+        candidate = str(value).strip()
+        return candidate or None
 
     model_config = SettingsConfigDict(
         env_file=".env",

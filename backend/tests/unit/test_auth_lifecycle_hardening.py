@@ -12,7 +12,6 @@ from sqlalchemy.orm import sessionmaker
 from resend.exceptions import ResendError
 
 from app.api import auth as auth_api
-from app.api import image as image_api
 from app.api.dependencies import get_current_verified_user
 from app.crud import user as user_crud
 from app.db.database import Base
@@ -399,19 +398,21 @@ def test_stale_unverified_cleanup_uses_latest_verification_activity(monkeypatch)
 
 
 @pytest.fixture
-def image_client():
+def api_client():
     with TestClient(app) as client:
         yield client
     app.dependency_overrides.clear()
 
 
-def test_standalone_ocr_rejects_anonymous_request(image_client):
-    response = image_client.post(
+def test_standalone_ocr_endpoint_is_not_exposed(api_client):
+    assert "/image/extract-text" not in app.openapi()["paths"]
+
+    response = api_client.post(
         "/image/extract-text",
         files={"image": ("tiny.png", b"image", "image/png")},
     )
 
-    assert response.status_code == 401
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -425,77 +426,44 @@ def test_standalone_ocr_rejects_anonymous_request(image_client):
     ],
 )
 def test_analysis_routes_reject_anonymous_direct_backend_requests(
-    image_client,
+    api_client,
     method,
     path,
 ):
-    response = getattr(image_client, method)(path)
+    response = getattr(api_client, method)(path)
 
     assert response.status_code == 401
 
 
-def test_standalone_ocr_rejects_unverified_user(image_client):
-    def reject_unverified():
-        raise HTTPException(status_code=403, detail="Email not verified")
-
-    app.dependency_overrides[get_current_verified_user] = reject_unverified
-    response = image_client.post(
-        "/image/extract-text",
-        files={"image": ("tiny.png", b"image", "image/png")},
-    )
-
-    assert response.status_code == 403
-
-
-def test_standalone_ocr_allows_verified_user_through_auth_layer(
-    image_client,
-    monkeypatch,
-):
-    app.dependency_overrides[get_current_verified_user] = lambda: SimpleNamespace(
-        id=1,
-        is_verified=True,
-    )
-    monkeypatch.setattr(image_api, "validate_ocr_image", Mock())
-    monkeypatch.setattr(image_api, "extract_text_from_image", Mock(return_value="text"))
-
-    response = image_client.post(
-        "/image/extract-text",
-        files={"image": ("tiny.png", b"image", "image/png")},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"extracted_text": "text"}
-
-
-def test_verify_email_is_post_only_and_excessive_token_is_rejected(image_client):
+def test_verify_email_is_post_only_and_excessive_token_is_rejected(api_client):
     verification_operations = app.openapi()["paths"]["/auth/verify-email"]
 
     assert set(verification_operations) == {"post"}
-    response = image_client.post(
+    response = api_client.post(
         "/auth/verify-email",
         json={"token": "x" * 4097},
     )
     assert response.status_code == 422
 
-    query_only = image_client.post("/auth/verify-email?token=legacy-query-token")
+    query_only = api_client.post("/auth/verify-email?token=legacy-query-token")
     assert query_only.status_code == 422
 
 
-def test_reset_password_status_is_post_only_and_excessive_token_is_rejected(image_client):
+def test_reset_password_status_is_post_only_and_excessive_token_is_rejected(api_client):
     status_operations = app.openapi()["paths"]["/auth/reset-password-status"]
 
     assert set(status_operations) == {"post"}
-    response = image_client.post(
+    response = api_client.post(
         "/auth/reset-password-status",
         json={"token": "x" * 4097},
     )
     assert response.status_code == 422
 
-    query_only = image_client.post("/auth/reset-password-status?token=legacy-query-token")
+    query_only = api_client.post("/auth/reset-password-status?token=legacy-query-token")
     assert query_only.status_code == 422
 
 
-def test_auth_me_is_not_cacheable(image_client):
+def test_auth_me_is_not_cacheable(api_client):
     app.dependency_overrides[get_current_verified_user] = lambda: SimpleNamespace(
         id=1,
         username="verified_user",
@@ -503,17 +471,17 @@ def test_auth_me_is_not_cacheable(image_client):
         is_verified=True,
     )
 
-    response = image_client.get("/auth/me")
+    response = api_client.get("/auth/me")
 
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
 
 
-def test_refresh_rejection_http_response_expires_stale_auth_cookies(image_client):
-    image_client.cookies.set("access_token", "stale-access", path="/")
-    image_client.cookies.set("refresh_token", "malformed-refresh", path="/")
+def test_refresh_rejection_http_response_expires_stale_auth_cookies(api_client):
+    api_client.cookies.set("access_token", "stale-access", path="/")
+    api_client.cookies.set("refresh_token", "malformed-refresh", path="/")
 
-    response = image_client.post("/auth/refresh")
+    response = api_client.post("/auth/refresh")
 
     assert response.status_code == 401
     set_cookie_headers = response.headers.get_list("set-cookie")

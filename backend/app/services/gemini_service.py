@@ -176,8 +176,14 @@ class _LazyGeminiClient:
         self._resolved_client = None
 
     def get(self):
+        api_key = Settings.GEMINI_API_KEY
+        if api_key is None:
+            raise GeminiUnavailableError(
+                "Gemini is not configured; "
+                "deterministic analysis remains available"
+            )
         if self._resolved_client is None:
-            self._resolved_client = genai.Client(api_key=Settings.GEMINI_API_KEY)
+            self._resolved_client = genai.Client(api_key=api_key)
         return self._resolved_client
 
     @property
@@ -209,6 +215,8 @@ def generate_investigation_explanation(
             ),
         )
         models = _client.models
+    except GeminiUnavailableError:
+        raise
     except Exception as exc:
         logger.warning("Gemini client initialization failed: %s", exc)
         raise GeminiUnavailableError(str(exc)) from exc

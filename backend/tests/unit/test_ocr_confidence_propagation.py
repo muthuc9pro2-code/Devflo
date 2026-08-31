@@ -30,7 +30,7 @@ def _write_tiny_png(path):
     """A real, tiny, decodable image on disk - item 1's shared
     validate_ocr_image() now runs inside _run_ocr() itself (defense in
     depth) before any mocked/real RapidOCR call, so tests exercising
-    _run_ocr()/extract_text_from_image[_with_confidence] need a genuine
+    _run_ocr()/extract_text_from_image_with_confidence need a genuine
     file at the given path rather than an arbitrary placeholder string."""
     buffer = BytesIO()
     Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
@@ -64,7 +64,7 @@ def test_extract_with_confidence_reuses_the_same_ocr_call_and_returns_mean_confi
     fake_results = [
         (None, "ERROR something failed", 0.95),
         (None, "  at handler (App.tsx:42)", 0.61),
-        (None, "   ", 0.99),  # blank text after strip -> excluded, like extract_text_from_image already does
+        (None, "   ", 0.99),  # blank text after strip -> excluded by the shared OCR extraction path
     ]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
     image_path = _write_tiny_png(tmp_path / "shot.png")
@@ -76,14 +76,15 @@ def test_extract_with_confidence_reuses_the_same_ocr_call_and_returns_mean_confi
     assert confidence == (0.95 + 0.61) / 2
 
 
-def test_extract_text_from_image_output_is_unchanged_by_the_new_function(monkeypatch, tmp_path):
-    """Backward compatibility: the pre-existing plain-text function must
-    return byte-identical output to before this change."""
+def test_extract_with_confidence_preserves_joined_ocr_text(monkeypatch, tmp_path):
     fake_results = [(None, "line one", 0.9), (None, "line two", 0.5)]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
     image_path = _write_tiny_png(tmp_path / "shot.png")
 
-    assert image_text_extractor.extract_text_from_image(image_path) == "line one\nline two"
+    text, confidence = image_text_extractor.extract_text_from_image_with_confidence(image_path)
+
+    assert text == "line one\nline two"
+    assert confidence == pytest.approx(0.7)
 
 
 def test_no_usable_confidence_returns_none_not_fabricated(monkeypatch, tmp_path):
@@ -121,7 +122,7 @@ def test_rapidocr_initialization_failure_is_converted_after_validation(monkeypat
     )
 
     with pytest.raises(image_text_extractor.OcrProcessingError):
-        image_text_extractor.extract_text_from_image(image_path)
+        image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
 
 def test_rapidocr_inference_failure_is_converted(monkeypatch, tmp_path):
@@ -133,7 +134,7 @@ def test_rapidocr_inference_failure_is_converted(monkeypatch, tmp_path):
     monkeypatch.setattr(image_text_extractor, "_ocr", fail_inference)
 
     with pytest.raises(image_text_extractor.OcrProcessingError):
-        image_text_extractor.extract_text_from_image(image_path)
+        image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
 
 @pytest.mark.parametrize(
@@ -156,7 +157,7 @@ def test_malformed_rapidocr_results_are_converted(
     )
 
     with pytest.raises(image_text_extractor.OcrProcessingError):
-        image_text_extractor.extract_text_from_image(image_path)
+        image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
 
 # --- diagnostic_adapters: confidence lands on the ParsedEvent -------------

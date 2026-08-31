@@ -701,7 +701,15 @@ def _process_artifact_task(analysis_id: int, artifact_id: int, generation: int) 
                 remove_prepared_source=False,
             )
 
-        global_line_number = artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
+        # The adapter resumes local/byte position from the artifact's durable
+        # checkpoint. Its global baseline must resume from the SAME logical
+        # position; otherwise a recovered artifact restarts global Evidence
+        # numbering at this artifact's stride origin and can reorder later
+        # deterministic selection/correlation.
+        global_line_number = (
+            artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
+            + artifact.last_processed_line
+        )
 
         return _process_artifact(
             db=db,

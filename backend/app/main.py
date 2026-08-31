@@ -6,7 +6,7 @@ import logging
 from app.core.logger import setup_logging
 from contextlib import asynccontextmanager
 from app.api.v1.health import router as health_router
-from app.api import auth, analysis, image, analysis_stream
+from app.api import auth, analysis, analysis_stream
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -46,7 +46,6 @@ async def handle_database_unavailable(request: Request, exc: OperationalError) -
 app.include_router(health_router)
 app.include_router(auth.router)
 app.include_router(analysis.router)
-app.include_router(image.router)
 app.include_router(analysis_stream.router)
 
 @app.get("/")
