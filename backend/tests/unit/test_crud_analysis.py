@@ -1,7 +1,7 @@
 from unittest.mock import Mock
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.crud import analysis as crud_analysis
@@ -161,3 +161,95 @@ def test_create_analysis_rejects_fourth_nonterminal_analysis_and_rolls_back():
 
     assert db.query(Analysis).count() == before
     db.close()
+
+
+def test_duplicate_cleanup_performs_no_database_read_after_commit(tmp_path, monkeypatch):
+    """Duplicate-file cleanup after durable creation must be filesystem-only.
+
+    SQLAlchemy expires ORM instances on commit by default. A stale implementation
+    that reads duplicate.saved_file_path after commit therefore performs an
+    implicit SELECT and can re-enter the upload's pre-durable failure path if
+    the database disappears immediately after commit.
+    """
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    user = User(
+        username="duplicate-boundary-user",
+        email="duplicate-boundary@example.com",
+        hashed_password="x",
+        is_verified=True,
+    )
+    db.add(user)
+    db.commit()
+
+    canonical_path = tmp_path / "canonical.log"
+    duplicate_path = tmp_path / "duplicate.log"
+    canonical_path.write_bytes(b"same diagnostic bytes")
+    duplicate_path.write_bytes(b"same diagnostic bytes")
+
+    monkeypatch.setattr(crud_analysis, "_UPLOAD_ROOT", tmp_path.resolve())
+
+    post_commit = False
+
+    def mark_target_commit(_session):
+        nonlocal post_commit
+        post_commit = True
+
+    def reject_post_commit_sql(
+        _connection, _cursor, _statement, _parameters, _context, _executemany
+    ):
+        if post_commit:
+            raise AssertionError(
+                "create_analysis performed database I/O after durable commit"
+            )
+
+    event.listen(db, "after_commit", mark_target_commit)
+    event.listen(engine, "before_cursor_execute", reject_post_commit_sql)
+
+    try:
+        create_analysis(
+            db=db,
+            user_id=user.id,
+            filename="canonical.log",
+            saved_file_path=str(canonical_path),
+            artifacts=[
+                {
+                    "original_filename": "canonical.log",
+                    "saved_file_path": str(canonical_path),
+                    "size_bytes": canonical_path.stat().st_size,
+                    "detected_format": "generic",
+                    "content_sha256": "same-digest",
+                },
+                {
+                    "original_filename": "duplicate.log",
+                    "saved_file_path": str(duplicate_path),
+                    "size_bytes": duplicate_path.stat().st_size,
+                    "detected_format": "generic",
+                    "content_sha256": "same-digest",
+                },
+            ],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", reject_post_commit_sql)
+        event.remove(db, "after_commit", mark_target_commit)
+
+    assert canonical_path.exists()
+    assert not duplicate_path.exists()
+
+    verify_db = session_factory()
+    try:
+        rows = (
+            verify_db.query(AnalysisArtifact)
+            .order_by(AnalysisArtifact.position)
+            .all()
+        )
+        assert len(rows) == 2
+        assert rows[0].status == "pending"
+        assert rows[0].duplicate_of_artifact_id is None
+        assert rows[1].status == "duplicate"
+        assert rows[1].duplicate_of_artifact_id == rows[0].id
+    finally:
+        verify_db.close()
+        db.close()

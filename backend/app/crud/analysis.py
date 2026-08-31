@@ -154,6 +154,14 @@ def create_analysis(
             if model.status == "unsupported":
                 model.processed_bytes = model.size_bytes
 
+        # Capture filesystem cleanup paths before commit. SQLAlchemy expires
+        # ORM state on commit by default, so reading duplicate.saved_file_path
+        # afterward could otherwise trigger an implicit database refresh in
+        # the post-commit durability window.
+        duplicate_staged_paths = [
+            duplicate.saved_file_path for duplicate, _canonical in duplicates
+        ]
+
         # Durability boundary: do not perform any database read after this
         # commit inside create_analysis(). If the commit succeeds but the DB
         # connection disappears immediately afterward, callers must treat the
@@ -164,8 +172,8 @@ def create_analysis(
         db.rollback()
         raise
 
-    for duplicate, _canonical in duplicates:
-        _delete_staged_upload(duplicate.saved_file_path)
+    for duplicate_staged_path in duplicate_staged_paths:
+        _delete_staged_upload(duplicate_staged_path)
 
     return analysis
 
