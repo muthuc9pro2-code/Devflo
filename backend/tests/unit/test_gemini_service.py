@@ -730,3 +730,154 @@ def test_gemini_redaction_covers_private_keys_jwts_and_signed_urls_without_break
     assert "super-secret-private-key-material" not in line
     assert "-----BEGIN PRIVATE KEY-----" in line
     assert "-----END PRIVATE KEY-----" in line
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "snippet", "secret_fragments", "safe_fragment"),
+    [
+        (
+            ".env",
+            'SECRET_KEY="env-secret-one\nenv-secret-two"\nSAFE=value',
+            ("env-secret-one", "env-secret-two"),
+            "SAFE=value",
+        ),
+        (
+            "config.yaml",
+            (
+                "SECRET_KEY: |\n"
+                "  yaml-secret-one\n"
+                "  yaml-secret-two\n"
+                "SAFE: ok"
+            ),
+            ("yaml-secret-one", "yaml-secret-two"),
+            "SAFE: ok",
+        ),
+        (
+            "nested.yml",
+            (
+                "SECRET_KEY:\n"
+                "  primary: nested-secret-one\n"
+                "  secondary: nested-secret-two\n"
+                "SAFE: ok"
+            ),
+            ("nested-secret-one", "nested-secret-two"),
+            "SAFE: ok",
+        ),
+        (
+            "config.toml",
+            (
+                'SECRET_KEY = """toml-secret-one\n'
+                'toml-secret-two"""\n'
+                'SAFE = "ok"'
+            ),
+            ("toml-secret-one", "toml-secret-two"),
+            'SAFE = "ok"',
+        ),
+        (
+            "app.properties",
+            (
+                "SECRET_KEY=properties-secret-one\\\n"
+                "properties-secret-two\n"
+                "SAFE=ok"
+            ),
+            ("properties-secret-one", "properties-secret-two"),
+            "SAFE=ok",
+        ),
+        (
+            "settings.ini",
+            (
+                "SECRET_KEY=ini-secret-one\n"
+                "  ini-secret-two\n"
+                "SAFE=ok"
+            ),
+            ("ini-secret-one", "ini-secret-two"),
+            "SAFE=ok",
+        ),
+    ],
+)
+def test_gemini_source_redaction_removes_complete_multiline_config_values(
+    relative_path, snippet, secret_fragments, safe_fragment
+):
+    context = {
+        "evidence": [
+            {"source_matches": [{"relative_path": relative_path, "snippet": snippet}]}
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])["evidence"][0]["source_matches"][0]["snippet"]
+
+    for secret_fragment in secret_fragments:
+        assert secret_fragment not in sent
+    assert safe_fragment in sent
+    assert "[REDACTED]" in sent
+
+
+def test_gemini_env_redaction_does_not_treat_hash_inside_secret_as_a_comment():
+    context = {
+        "evidence": [
+            {
+                "source_matches": [
+                    {
+                        "relative_path": ".env",
+                        "snippet": 'SECRET_KEY="before#after"\nSAFE=value',
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])["evidence"][0]["source_matches"][0]["snippet"]
+
+    assert "before" not in sent
+    assert "after" not in sent
+    assert "SECRET_KEY=[REDACTED]" in sent
+    assert "SAFE=value" in sent
+
+
+def test_gemini_source_redaction_handles_triple_quoted_secret_literals_without_hiding_references():
+    context = {
+        "evidence": [
+            {
+                "source_matches": [
+                    {
+                        "relative_path": "app/config.py",
+                        "snippet": (
+                            'SECRET_KEY = """python-secret-one\n'
+                            'python-secret-two"""\n'
+                            "SAFE_SECRET_REFERENCE = Settings.SECRET_KEY\n"
+                            'RESEND_API_KEY = os.getenv("RESEND_API_KEY")'
+                        ),
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])["evidence"][0]["source_matches"][0]["snippet"]
+
+    assert "python-secret-one" not in sent
+    assert "python-secret-two" not in sent
+    assert 'SECRET_KEY = """[REDACTED]"""' in sent
+    assert "SAFE_SECRET_REFERENCE = Settings.SECRET_KEY" in sent
+    assert 'RESEND_API_KEY = os.getenv("RESEND_API_KEY")' in sent

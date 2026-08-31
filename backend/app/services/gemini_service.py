@@ -57,14 +57,22 @@ _ASSIGNMENT_VALUE = re.compile(
 )
 _SOURCE_LITERAL_ASSIGNMENT = re.compile(
     r"(?i)"
-    r"(?P<prefix>\b(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)"
-    r'(?P<value>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)'
+    r"(?P<prefix>\b(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*)"
+    r'(?P<value>"(?!\"\")(?:\\.|[^"\\])*"|'
+    r"'(?!'')(?:\\.|[^'\\])*'|"
+    r"`(?:\\.|[^`\\])*`)"
 )
-_SOURCE_CONFIG_LINE_ASSIGNMENT = re.compile(
-    r"(?m)^"
-    r"(?P<prefix>\s*(?:export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)"
-    r"(?P<value>[^\r\n#]+?)"
-    r"(?P<suffix>\s*(?:#.*)?)$"
+_SOURCE_CONFIG_ASSIGNMENT_START = re.compile(
+    r"^(?P<prefix>[ \t]*(?:export[ \t]+)?"
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*)"
+    r"(?P<value>.*?)(?P<newline>\r?\n?)$"
+)
+_SOURCE_TRIPLE_LITERAL_ASSIGNMENT = re.compile(
+    r"(?is)(?P<prefix>\b(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)"
+    r"[ \t]*[:=][ \t]*)(?P<quote>\"{3}|'{3})(?P<value>.*?)(?P=quote)"
+)
+_YAML_BLOCK_SCALAR = re.compile(
+    r"^[|>](?:[1-9][+-]?|[+-][1-9]?)?$"
 )
 _BEARER_TOKEN = re.compile(
     r"(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]{8,})"
@@ -207,26 +215,176 @@ def _source_config_rhs_is_reference(value: str) -> bool:
     return candidate.lower() in {"none", "null", "true", "false"}
 
 
-def _redact_config_source_assignment(match: re.Match) -> str:
+def _redact_source_triple_literal(match: re.Match) -> str:
     if not _is_sensitive_name(match.group("key")):
         return match.group(0)
-    value = match.group("value").strip()
-    if _source_config_rhs_is_reference(value):
-        return match.group(0)
-    return (
-        f'{match.group("prefix")}'
-        f'{_redacted_value(value)}'
-        f'{match.group("suffix")}'
-    )
+    quote = match.group("quote")
+    return f'{match.group("prefix")}{quote}{_REDACTED}{quote}'
+
+
+def _line_ending(line: str) -> str:
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def _leading_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _has_unescaped_closing_quote(text: str, quote: str, *, start: int) -> bool:
+    escaped = False
+    for character in text[start:]:
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == quote:
+            return True
+    return False
+
+
+def _config_value_end(
+    lines: list[str], start_index: int, value: str, base_indent: int
+) -> int:
+    """Return the final physical line owned by one config value."""
+    stripped = value.strip()
+
+    # TOML/Python-style triple-quoted value.
+    for marker in ('"""', "'''"):
+        if not stripped.startswith(marker):
+            continue
+        if marker in stripped[len(marker):]:
+            return start_index
+        for index in range(start_index + 1, len(lines)):
+            if marker in lines[index]:
+                return index
+        # Unterminated literal: safest outbound behavior is to remove the
+        # rest of this snippet.
+        return len(lines) - 1
+
+    # .env / config quoted multiline literal.
+    if stripped[:1] in {'"', "'", "`"}:
+        quote = stripped[0]
+        if not _has_unescaped_closing_quote(stripped, quote, start=1):
+            for index in range(start_index + 1, len(lines)):
+                if _has_unescaped_closing_quote(lines[index], quote, start=0):
+                    return index
+            return len(lines) - 1
+
+    # YAML:
+    #
+    # SECRET_KEY: |
+    #   first
+    #   second
+    #
+    # and folded '>' equivalents.
+    yaml_marker = stripped.split("#", 1)[0].strip()
+    if _YAML_BLOCK_SCALAR.fullmatch(yaml_marker):
+        end = start_index
+        for index in range(start_index + 1, len(lines)):
+            candidate = lines[index].rstrip("\r\n")
+            if not candidate.strip():
+                end = index
+                continue
+            if _leading_indent(candidate) <= base_indent:
+                break
+            end = index
+        return end
+
+    # Java properties / shell-style continuation.
+    if stripped.endswith("\\"):
+        end = start_index
+        for index in range(start_index + 1, len(lines)):
+            end = index
+            if not lines[index].rstrip("\r\n").rstrip().endswith("\\"):
+                break
+        return end
+
+    # INI continuation or YAML nested value:
+    #
+    # SECRET_KEY:
+    #   primary: ...
+    #   secondary: ...
+    #
+    # If a sensitive key owns an indented block, remove the block.
+    end = start_index
+    for index in range(start_index + 1, len(lines)):
+        candidate = lines[index].rstrip("\r\n")
+        if not candidate.strip():
+            end = index
+            continue
+        if _leading_indent(candidate) <= base_indent:
+            break
+        end = index
+    return end
+
+
+def _redact_config_like_source(text: str) -> str:
+    """Redact complete logical values from config-like source snippets."""
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = _SOURCE_CONFIG_ASSIGNMENT_START.match(line)
+        if match is None or not _is_sensitive_name(match.group("key")):
+            output.append(line)
+            index += 1
+            continue
+        value = match.group("value")
+        end_index = _config_value_end(lines, index, value, _leading_indent(line))
+        if not value.strip():
+            # SECRET_KEY=
+            #
+            # has no credential value. SECRET_KEY:
+            #   actual: value
+            #
+            # does, because it owns an indented block.
+            if end_index == index:
+                output.append(line)
+                index += 1
+                continue
+        elif _source_config_rhs_is_reference(value):
+            # Examples:
+            #
+            # SECRET_KEY=${SECRET_KEY}
+            # GEMINI_API_KEY="$GEMINI_API_KEY"
+            #
+            # These are references, not credential values.
+            output.append(line)
+            index += 1
+            continue
+        # Deliberately discard the entire RHS, including comments.
+        #
+        # Trying to preserve '# comment' without parsing the complete quote
+        # grammar can leak:
+        #
+        # SECRET_KEY="abc#def"
+        #
+        # as '#def'.
+        output.append(f'{match.group("prefix")}{_REDACTED}{match.group("newline")}')
+        # Keep physical line count so the snippet remains structurally
+        # useful without retaining any continuation bytes.
+        for skipped in lines[index + 1: end_index + 1]:
+            output.append(_line_ending(skipped))
+        index = end_index + 1
+    return "".join(output)
 
 
 def _redact_source_text_for_gemini(text: str, *, source_path: str | None = None) -> str:
     """Redact hardcoded source/config credentials without hiding references."""
     redacted = _QUOTED_KEY_VALUE.sub(_redact_keyed_value, text)
+    # Must happen before the ordinary one-line literal matcher.
+    redacted = _SOURCE_TRIPLE_LITERAL_ASSIGNMENT.sub(
+        _redact_source_triple_literal, redacted
+    )
     if _is_config_like_source_path(source_path):
-        redacted = _SOURCE_CONFIG_LINE_ASSIGNMENT.sub(
-            _redact_config_source_assignment, redacted
-        )
+        redacted = _redact_config_like_source(redacted)
     else:
         redacted = _SOURCE_LITERAL_ASSIGNMENT.sub(_redact_keyed_value, redacted)
     return _redact_high_confidence_secret_shapes(redacted)
