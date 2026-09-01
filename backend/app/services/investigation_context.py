@@ -978,6 +978,7 @@ def build_fallback_llm_context(
     fallback_artifacts: list[Any],
     *,
     artifacts: list[Any] | None = None,
+    source_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context: dict[str, Any] = {
         "analysis_id": analysis_id,
@@ -997,6 +998,8 @@ def build_fallback_llm_context(
 
     if artifacts is not None:
         context["artifacts"] = _artifacts_outcome_list(artifacts, {})
+    if source_context is not None:
+        context["source_context"] = source_context
 
     return context
 
@@ -1009,6 +1012,7 @@ def build_simple_llm_context(
     evidence_counts_by_artifact: dict[int, int] | None = None,
     artifacts: list[Any] | None = None,
     supplemental_artifacts: list[Any] | None = None,
+    source_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
 
     real_total_evidence_count = (
@@ -1065,6 +1069,8 @@ def build_simple_llm_context(
             "evidence-based reasoning unless the structured evidence itself "
             "already establishes the connection."
         )
+    if source_context is not None:
+        context["source_context"] = source_context
 
     return context
 
@@ -1104,6 +1110,7 @@ def build_llm_context(
     evidence_counts_by_artifact: dict[int, int] | None = None,
     artifacts: list[Any] | None = None,
     supplemental_artifacts: list[Any] | None = None,
+    source_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     real_total_evidence_count = (
         total_evidence_count if total_evidence_count is not None else len(evidence_rows)
@@ -1306,6 +1313,8 @@ def build_llm_context(
             "itself already establishes the connection."
         )
 
+    if source_context is not None:
+        context["source_context"] = source_context
     _enforce_correlated_context_byte_budget(context)
     return context
 

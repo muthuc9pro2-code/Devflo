@@ -106,6 +106,35 @@ def test_generate_investigation_explanation_returns_structured_response():
     generate_content.assert_called_once()
 
 
+def test_gemini_request_preserves_ready_zero_match_source_context():
+    context = {
+        "analysis_id": 1,
+        "source_context": {
+            "status": "ready",
+            "match_count": 0,
+        },
+        "evidence": [],
+    }
+
+    with patch(
+        "app.services.gemini_service._client.models.generate_content",
+        return_value=_mock_response(),
+    ) as generate_content:
+        generate_investigation_explanation(context)
+
+    _, kwargs = generate_content.call_args
+    sent = json.loads(kwargs["contents"])
+    assert sent["source_context"] == {
+        "status": "ready",
+        "match_count": 0,
+    }
+
+    instruction = kwargs["config"].system_instruction
+    assert "source_context" in instruction
+    assert 'status="ready", match_count=0' in instruction
+    assert 'Do not describe this state as "no source' in instruction
+
+
 def test_generate_investigation_explanation_disables_automatic_function_calling():
     """Devflo never registers tools/functions on this request, so there is
     nothing for Automatic Function Calling to dispatch - it must be

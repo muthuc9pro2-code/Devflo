@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from app.api import analysis as analysis_api
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
+from app.schemas.gemini import GeminiInvestigationResponse
 from app.services.gemini_service import GeminiUnavailableError
 from app.tasks import analysis as analysis_task
 
@@ -34,7 +35,24 @@ def _raise_gemini_unavailable(_context):
     raise GeminiUnavailableError("temporarily unavailable")
 
 
-def _seed_source_analysis(session_factory, *, source_kind, evidence_kwargs: list[dict]) -> int:
+_FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
+    title="t",
+    summary="s",
+    probable_root_causes=[],
+    what_happened=[],
+    source_code_findings=[],
+    recommended_actions=[],
+    uncertainties=[],
+)
+
+
+def _seed_source_analysis(
+    session_factory,
+    *,
+    source_kind,
+    evidence_kwargs: list[dict],
+    fallback_context=None,
+) -> int:
     db = session_factory()
     user = User(username="t", email="t@example.com", hashed_password="x", is_verified=True)
     db.add(user)
@@ -67,6 +85,7 @@ def _seed_source_analysis(session_factory, *, source_kind, evidence_kwargs: list
         status="completed",
         last_processed_line=1,
         processed_bytes=10,
+        fallback_context=fallback_context,
     )
     db.add(artifact)
     db.commit()
@@ -98,6 +117,17 @@ def _quiet(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
 
 
+def _capture_gemini_context(monkeypatch):
+    captured = {}
+
+    def _fake(context):
+        captured["context"] = context
+        return _FAKE_GEMINI_RESULT
+
+    monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _fake)
+    return captured
+
+
 _SOURCE_MATCH = [
     {
         "relative_path": "app/main.py",
@@ -117,6 +147,7 @@ _SOURCE_MATCH = [
 def test_source_zip_with_matches_reports_match_count(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet(monkeypatch)
+    captured = _capture_gemini_context(monkeypatch)
     analysis_id = _seed_source_analysis(
         session_factory,
         source_kind="zip",
@@ -136,6 +167,7 @@ def test_source_zip_with_matches_reports_match_count(monkeypatch):
     assert source["status"] == "ready"
     assert source["match_count"] == 1  # only one of the two evidence rows matched
     assert source["failure_reason"] is None
+    assert "source_context" not in captured["context"]
 
 
 # --- 2/3: source ready but zero matches (ZIP and GitHub) -------------------
@@ -144,6 +176,7 @@ def test_source_zip_with_matches_reports_match_count(monkeypatch):
 def test_source_zip_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet(monkeypatch)
+    captured = _capture_gemini_context(monkeypatch)
     analysis_id = _seed_source_analysis(
         session_factory,
         source_kind="zip",
@@ -163,6 +196,40 @@ def test_source_zip_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
     assert source["status"] == "ready"  # prepared successfully - NOT "unavailable"
     assert source["match_count"] == 0
     assert source["failure_reason"] is None
+    assert captured["context"]["source_context"] == {
+        "status": "ready",
+        "match_count": 0,
+    }
+
+
+def test_correlated_zero_match_source_context_reaches_gemini(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet(monkeypatch)
+    captured = _capture_gemini_context(monkeypatch)
+    analysis_id = _seed_source_analysis(
+        session_factory,
+        source_kind="zip",
+        evidence_kwargs=[
+            {
+                "service": "payment-api",
+                "trace_id": "trace-1",
+                "source_matches": None,
+            },
+            {
+                "service": "database",
+                "trace_id": "trace-1",
+                "source_matches": [],
+            },
+        ],
+    )
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
+
+    assert captured["context"]["investigation_path"] == "correlated"
+    assert captured["context"]["source_context"] == {
+        "status": "ready",
+        "match_count": 0,
+    }
 
 
 def test_github_source_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
@@ -221,6 +288,7 @@ def test_invalid_zip_content_gives_a_specific_safe_reason_and_diagnostics_contin
 def test_no_source_supplied_omits_the_source_key_entirely(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet(monkeypatch)
+    captured = _capture_gemini_context(monkeypatch)
     analysis_id = _seed_source_analysis(
         session_factory,
         source_kind=None,
@@ -242,3 +310,27 @@ def test_no_source_supplied_omits_the_source_key_entirely(monkeypatch):
     db.close()
 
     assert "source" not in analysis.result_snapshot
+    assert "source_context" not in captured["context"]
+
+
+def test_unstructured_fallback_carries_ready_zero_match_source_context(monkeypatch):
+    session_factory = _db_with_schema(monkeypatch)
+    _quiet(monkeypatch)
+    captured = _capture_gemini_context(monkeypatch)
+    analysis_id = _seed_source_analysis(
+        session_factory,
+        source_kind="zip",
+        evidence_kwargs=[],
+        fallback_context={
+            "kind": "text",
+            "text": "payment worker stopped after restart",
+        },
+    )
+
+    analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
+
+    assert captured["context"]["context_kind"] == "unstructured_fallback"
+    assert captured["context"]["source_context"] == {
+        "status": "ready",
+        "match_count": 0,
+    }

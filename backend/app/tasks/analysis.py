@@ -82,6 +82,23 @@ logger = logging.getLogger(__name__)
 _GLOBAL_LINE_NUMBER_STRIDE = 10**9
 
 
+def _ready_zero_match_source_context(
+    source_outcome: dict | None,
+) -> dict[str, int | str] | None:
+    """Tiny Gemini-only marker for the one ambiguous source state.
+
+    Real matched source already reaches Gemini through Evidence.source_matches.
+    No-source and unavailable-source outcomes stay deterministic/frontend-only.
+    """
+    if (
+        source_outcome is not None
+        and source_outcome["status"] == "ready"
+        and source_outcome["match_count"] == 0
+    ):
+        return {"status": "ready", "match_count": 0}
+    return None
+
+
 def _safe_rollback(db: Session) -> None:
     try:
         db.rollback()
@@ -1440,10 +1457,13 @@ def _finalize_analysis_task(
                     fallback_artifacts,
                     artifacts=zero_evidence_artifacts,
                 )
+                source_outcome = build_source_outcome_payload(analysis)
+                source_context = _ready_zero_match_source_context(source_outcome)
                 fallback_llm_context = build_fallback_llm_context(
                     analysis_id,
                     fallback_artifacts,
                     artifacts=zero_evidence_artifacts,
+                    source_context=source_context,
                 )
                 if not _finalizer_owns_generation(db, analysis_id, generation):
                     logger.info(
@@ -1479,7 +1499,6 @@ def _finalize_analysis_task(
                     final_ai_analysis = None
 
                 _bump_processing_heartbeat(analysis_id, generation)
-                source_outcome = build_source_outcome_payload(analysis)
                 if source_outcome is not None:
                     fallback_payload["source"] = source_outcome
 
@@ -1700,6 +1719,8 @@ def _finalize_analysis_task(
                 progress=99,
             )
 
+            source_outcome = build_source_outcome_payload(analysis, evidence_rows)
+            source_context = _ready_zero_match_source_context(source_outcome)
             llm_context = build_llm_context(
                 correlation_run,
                 evidence_rows,
@@ -1707,6 +1728,7 @@ def _finalize_analysis_task(
                 evidence_counts_by_artifact=evidence_counts_by_artifact,
                 artifacts=artifact_outcomes,
                 supplemental_artifacts=supplemental_artifacts,
+                source_context=source_context,
             )
 
             if not _finalizer_owns_generation(db, analysis_id, generation):
@@ -1740,7 +1762,6 @@ def _finalize_analysis_task(
                 final_ai_analysis = None
 
             _bump_processing_heartbeat(analysis_id, generation)
-            source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 correlation_payload["source"] = source_outcome
 
@@ -1809,6 +1830,8 @@ def _finalize_analysis_task(
                 supplemental_artifacts=simple_supplemental_artifacts,
             )
 
+            source_outcome = build_source_outcome_payload(analysis, evidence_rows)
+            source_context = _ready_zero_match_source_context(source_outcome)
             # Mirrors the CORRELATED branch's llm_context above.
             simple_llm_context = build_simple_llm_context(
                 analysis_id,
@@ -1817,6 +1840,7 @@ def _finalize_analysis_task(
                 evidence_counts_by_artifact=evidence_counts_by_artifact,
                 artifacts=simple_artifacts,
                 supplemental_artifacts=simple_supplemental_artifacts,
+                source_context=source_context,
             )
 
             if not _finalizer_owns_generation(db, analysis_id, generation):
@@ -1851,7 +1875,6 @@ def _finalize_analysis_task(
                 final_ai_analysis = None
 
             _bump_processing_heartbeat(analysis_id, generation)
-            source_outcome = build_source_outcome_payload(analysis, evidence_rows)
             if source_outcome is not None:
                 simple_payload["source"] = source_outcome
 
