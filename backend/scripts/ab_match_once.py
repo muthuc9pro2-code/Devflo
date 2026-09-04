@@ -1,9 +1,3 @@
-"""Interleaved A/B: OLD (duplicate regex in gate+normalize) vs NEW (match
-once, reuse) for web_server, syslog, serverless - alternating within one
-process so system load drift cancels out. Uses the real current fixtures
-and the real current normalize_text_event()/level helpers; only the
-gate+normalize entry points are reconstructed to the pre-change shape.
-"""
 import statistics
 import sys
 import time
@@ -11,15 +5,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import detect_artifact  # noqa: E402
-from app.services.diagnostic_parser import level_from_http_status, normalize_level, normalize_text_event, parse_timestamp  # noqa: E402
-from app.services.artifact_detector import ArtifactFormat  # noqa: E402
+import app.services.diagnostic_adapters as da
+from app.services.artifact_detector import detect_artifact
+from app.services.diagnostic_parser import level_from_http_status, normalize_level, normalize_text_event, parse_timestamp
+from app.services.artifact_detector import ArtifactFormat
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 
 
-# ---- OLD reconstructions (duplicate regex, no match reuse) ----
 
 def old_web_server_may_be_important(raw_text: str) -> bool:
     access_match = da.WEB_ACCESS_RE.search(raw_text)
@@ -123,7 +116,6 @@ for fmt_name, fixture_name in FIXTURES.items():
     path = FIXTURE_DIR / fixture_name
     fmt = detect_artifact(path, filename=path.name)
     lines = path.read_text(errors='replace').splitlines()
-    # cap to keep the A/B loop fast while still representative
     lines = lines[:60000]
 
     results = {"old": [], "new": []}

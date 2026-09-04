@@ -18,13 +18,6 @@ def choose_investigation_path(
     indexes: CorrelationIndexes | None = None,
     preparation: CorrelationPreparation | None = None,
 ) -> InvestigationPath:
-    """Choose SIMPLE/CORRELATED from the same correlation semantics.
-
-    The production finalizer passes a fully prepared relationship set, so
-    routing is O(1) and run_correlation() can reuse that exact set without a
-    second candidate traversal.  The indexes/evidence fallback is retained
-    for compatibility with direct callers and focused tests.
-    """
     if preparation is not None:
         return (
             InvestigationPath.CORRELATED

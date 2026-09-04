@@ -13,10 +13,6 @@ class AnalysisResponse(BaseModel):
 
 
 class AnalysisHistoryItem(BaseModel):
-    """One History row - deliberately narrow: never saved_file_path,
-    source_reference, raw evidence, the correlation graph, or the complete
-    Gemini payload. title/summary are Gemini's own (already bounded)
-    output when available, never a persisted/fabricated short title."""
 
     analysis_id: int
     status: str

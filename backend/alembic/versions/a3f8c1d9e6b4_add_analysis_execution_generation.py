@@ -1,22 +1,11 @@
-"""add analysis processing/finalization generation fencing
-
-Revision ID: a3f8c1d9e6b4
-Revises: e9f5a7b2c3d4
-Create Date: 2026-08-29 00:00:00.000000
-
-"""
-
 from collections.abc import Sequence
-
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "a3f8c1d9e6b4"
 down_revision: str | Sequence[str] | None = "e9f5a7b2c3d4"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
-
 
 def upgrade() -> None:
     op.add_column(
@@ -32,7 +21,6 @@ def upgrade() -> None:
         "analyses",
         sa.Column("finalization_generation", sa.Integer(), nullable=True),
     )
-
 
 def downgrade() -> None:
     op.drop_column("analyses", "finalization_generation")

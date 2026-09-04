@@ -1,14 +1,3 @@
-"""Differential test: normalize_text_event() OLD body (pre general-fast-path
-reorder) vs the CURRENT implementation, across a large battery of `defaults`
-combinations x raw_text shapes.
-
-This targets the general optimization in normalize_text_event() itself (the
-early short-circuit when `defaults` already fully covers a record), which
-every non-JSON-native format's normalizer funnels through. Not a pytest
-test - a one-off correctness gate, run manually:
-
-    .venv/bin/python scripts/verify_normalize_text_event_equivalence.py
-"""
 
 from __future__ import annotations
 
@@ -19,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import app.services.diagnostic_parser as dp  # noqa: E402
+import app.services.diagnostic_parser as dp
 
 new_normalize_text_event = dp.normalize_text_event
 
@@ -138,9 +127,6 @@ def main() -> int:
                 if old_d[key] != new_d.get(key):
                     print(f"    {key}: old={old_d[key]!r} new={new_d.get(key)!r}")
 
-    # 1. Exhaustive: every raw_text x "all fields present" defaults, varying
-    #    level/timestamp/exception combinations - the exact boundary of the
-    #    new fast path.
     base_full_defaults = {key: f"val-{key}" for key in DEFAULT_FIELD_KEYS}
     for raw_text in RAW_TEXTS:
         for level in LEVEL_VALUES:
@@ -156,9 +142,6 @@ def main() -> int:
                             defaults["http_status"] = http_status
                             check(raw_text, defaults, "full_fields")
 
-    # 2. Partial defaults: randomly drop 1-4 of the text fields to None,
-    #    ensuring the slow path (and its boundary with the fast path) is
-    #    also exercised, not just the "fully covered" case.
     for _ in range(3000):
         raw_text = rng.choice(RAW_TEXTS)
         defaults = {key: f"val-{key}" for key in DEFAULT_FIELD_KEYS}
@@ -172,8 +155,6 @@ def main() -> int:
         defaults["http_status"] = rng.choice(HTTP_STATUS_VALUES)
         check(raw_text, defaults, "partial_fields")
 
-    # 3. No defaults at all (the historically well-tested slow path) as a
-    #    sanity control - must still match trivially.
     for raw_text in RAW_TEXTS:
         check(raw_text, {}, "no_defaults")
         check(raw_text, None, "none_defaults")

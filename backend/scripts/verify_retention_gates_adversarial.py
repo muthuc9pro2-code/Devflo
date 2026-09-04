@@ -1,13 +1,3 @@
-"""Adversarial battery for the per-format retention gates: hand-written
-edge cases per format (boundary status codes, misleading substrings, unusual
-casing, malformed shapes) checked directly against each format's real
-normalizer to prove the gate never says "skip" when the real parse would
-have produced an important event.
-
-Not a pytest test - a one-off correctness gate, run manually:
-
-    .venv/bin/python scripts/verify_retention_gates_adversarial.py
-"""
 
 from __future__ import annotations
 
@@ -16,9 +6,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import ArtifactFormat  # noqa: E402
-from app.services.event_filter import IMPORTANT_LEVELS  # noqa: E402
+import app.services.diagnostic_adapters as da
+from app.services.artifact_detector import ArtifactFormat
+from app.services.event_filter import IMPORTANT_LEVELS
 
 CASES: dict[ArtifactFormat, list[str]] = {
     ArtifactFormat.WEB_SERVER: [
@@ -34,7 +24,7 @@ CASES: dict[ArtifactFormat, list[str]] = {
         "[Wed Aug 12 10:11:22.123456 2026] [core:notice] [pid 123] child init",
         "not a recognized web log shape at all",
         "not recognized but contains error keyword",
-        "budget getter target practice",  # 'get ' substring false positive check
+        "budget getter target practice",
     ],
     ArtifactFormat.SYSLOG: [
         "<191>1 2026-08-12T10:11:19Z host1 app 1 - - debug level facility 23 severity 7",
@@ -140,7 +130,6 @@ def main() -> int:
                     f"VIOLATION [{artifact_format.value}]: gate=False but "
                     f"actual level={event.level!r} (raw_text={raw_text!r})"
                 )
-            # Also report (non-fatal) over-conservatism for visibility.
             elif gate_says_important and not actually_important:
                 print(
                     f"(info, safe) over-conservative [{artifact_format.value}]: "

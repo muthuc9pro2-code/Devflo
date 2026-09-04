@@ -1,13 +1,3 @@
-"""Historical interleaved A/B for the Phase-1 context-cache optimization.
-
-The benchmark compares the old Path-keyed context cache with the new
-relative-path-string cache.
-
-Source correlation later moved from a materialized by_suffix map to bounded
-reversed lookup keys. This script therefore reconstructs the historical suffix
-map locally for BOTH sides, keeping the benchmark about its original variable
-instead of silently benchmarking a newer matcher too.
-"""
 import posixpath
 import statistics
 import sys
@@ -17,12 +7,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.processing_config import (  # noqa: E402
+from app.core.processing_config import (
     MAX_SOURCE_CONTEXT_FILE_BYTES,
     SOURCE_CONTEXT_LINES,
 )
-from app.services.log_praser import ParsedEvent, StackFrame  # noqa: E402
-from app.services.source_index import SourceIndex, build_index  # noqa: E402
+from app.services.log_praser import ParsedEvent, StackFrame
+from app.services.source_index import SourceIndex, build_index
 
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ROOT = SCRATCH / "synthetic_extracted"

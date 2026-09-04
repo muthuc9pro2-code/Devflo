@@ -1,22 +1,11 @@
-"""add analysis artifacts and diagnostic evidence fields
-
-Revision ID: 4a8c2f1d9e70
-Revises: 9ca196c91d66
-Create Date: 2026-08-12 00:00:00.000000
-
-"""
-
 from collections.abc import Sequence
-
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "4a8c2f1d9e70"
 down_revision: str | Sequence[str] | None = "9ca196c91d66"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
-
 
 def upgrade() -> None:
     op.create_table(
@@ -140,10 +129,6 @@ def upgrade() -> None:
         nullable=False,
     )
 
-    # The legacy unique key contains nullable trace/request columns. MySQL
-    # permits multiple otherwise-identical rows whenever either value is NULL,
-    # while the new non-null correlation key intentionally coalesces them. Roll
-    # those valid legacy duplicates up before creating the stricter key.
     op.execute(sa.text("DROP TEMPORARY TABLE IF EXISTS evidence_upgrade_rollup"))
     op.execute(
         sa.text(
@@ -208,7 +193,6 @@ def upgrade() -> None:
         "evidence",
         ["analysis_id", "first_seen", "id"],
     )
-
 
 def downgrade() -> None:
     op.drop_index("ix_evidence_analysis_first_seen_id", table_name="evidence")

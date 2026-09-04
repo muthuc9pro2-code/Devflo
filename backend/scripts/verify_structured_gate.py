@@ -1,22 +1,3 @@
-"""Differential equivalence test for structured_event_may_be_important(),
-the retention gate for JSON-lines/JSON-document/BROWSER records.
-
-Same technique as verify_retention_gates.py: run stream_artifact_events()
-with the gate ACTIVE vs FORCED OFF (always parse) over every record in the
-JSON and BROWSER 10 MiB fixtures, and assert:
-  1. Records the gate parsed are byte-for-byte identical either way.
-  2. Records the gate skipped genuinely aren't important (no evidence loss).
-
-Also runs a hand-written adversarial battery of structured payload shapes
-directly against structured_event_may_be_important() vs
-normalize_structured_event(), including the specific risk case this gate's
-design had to account for: a status-derived level of INFO where the message
-text itself carries a competing level word.
-
-Not a pytest test - a one-off correctness gate, run manually:
-
-    .venv/bin/python scripts/verify_structured_gate.py
-"""
 
 from __future__ import annotations
 
@@ -26,10 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import detect_artifact  # noqa: E402
-from app.services.diagnostic_parser import normalize_structured_event, structured_event_may_be_important  # noqa: E402
-from app.services.event_filter import IMPORTANT_LEVELS  # noqa: E402
+import app.services.diagnostic_adapters as da
+from app.services.artifact_detector import detect_artifact
+from app.services.diagnostic_parser import normalize_structured_event, structured_event_may_be_important
+from app.services.event_filter import IMPORTANT_LEVELS
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 
@@ -123,7 +104,7 @@ ADVERSARIAL_CASES = [
     {"response": {"status": 503}, "message": "gateway"},
     {"elb_status_code": "200", "message": "plain"},
     {"elb_status_code": "200", "message": "contains warn keyword"},
-    {},  # nothing at all
+    {},
     {"message": "just a plain message with no signals"},
     {"message": "plain message mentioning error nonetheless"},
     {"body": "raw body text status 200"},

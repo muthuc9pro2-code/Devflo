@@ -1,23 +1,3 @@
-"""Final mixed multi-format benchmark: one analysis with all 13 supported
-ArtifactFormats as separate artifacts, run through the REAL production
-pipeline (process_analysis) against the real MySQL database, under three
-source scenarios:
-  (A) diagnostics only, no source
-  (B) diagnostics + source ZIP
-  (C) diagnostics + GitHub URL (real network clone)
-
-Source prep (clone/extract + build_index) is timed separately from pure
-diagnostic ingestion by wrapping _prepare_source_index - process_analysis's
-own "ingestion completed in Xs" log line currently bundles both together,
-so this is the only way to see them apart without touching production
-logging.
-
-Self-cleaning: uses the same __bench_pipeline__ throwaway user pattern as
-scripts/bench_pipeline.py and scripts/bench_batching.py.
-
-Usage:
-    .venv/bin/python scripts/bench_mixed_final.py
-"""
 from __future__ import annotations
 
 import logging
@@ -29,9 +9,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.db.database import sessionLocal  # noqa: E402
-from app.models import Analysis, AnalysisArtifact, Evidence, User  # noqa: E402
-import app.tasks.analysis as analysis_task  # noqa: E402
+from app.db.database import sessionLocal
+from app.models import Analysis, AnalysisArtifact, Evidence, User
+import app.tasks.analysis as analysis_task
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"

@@ -1,8 +1,3 @@
-"""Exact fast-path vs fallback split per format: wraps _may_be_important /
-structured_event_may_be_important to count True (sent to full parser) vs
-False (fast-rejected, never fully parsed) while running the real, current
-stream_artifact_events() over each 10 MiB fixture.
-"""
 from __future__ import annotations
 
 import sys
@@ -10,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import detect_artifact  # noqa: E402
+import app.services.diagnostic_adapters as da
+from app.services.artifact_detector import detect_artifact
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 

@@ -1,16 +1,11 @@
-"""add analysis_artifacts content_sha256 and duplicate_of_artifact_id"""
-
 from collections.abc import Sequence
-
 import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "9b3d7a1c5f6e"
 down_revision: str | Sequence[str] | None = "e1a7c9f4b3d2"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
-
 
 def upgrade() -> None:
     op.add_column(
@@ -34,7 +29,6 @@ def upgrade() -> None:
         ["id"],
         ondelete="SET NULL",
     )
-
 
 def downgrade() -> None:
     op.drop_constraint(

@@ -1,9 +1,3 @@
-"""Profile source ZIP preparation, extraction, indexing, and stack-frame
-correlation independently from diagnostic ingestion.
-
-Usage:
-    .venv/bin/python scripts/bench_source.py
-"""
 
 from __future__ import annotations
 
@@ -17,9 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.log_praser import ParsedEvent, StackFrame  # noqa: E402
-from app.services.source_archive import _extract_zip, validate_source_zip  # noqa: E402
-from app.services.source_index import build_index, correlate_event  # noqa: E402
+from app.services.log_praser import ParsedEvent, StackFrame
+from app.services.source_archive import _extract_zip, validate_source_zip
+from app.services.source_index import build_index, correlate_event
 
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 REPO_DIR = SCRATCH / "synthetic_repo"
@@ -42,7 +36,6 @@ def generate_repo(n_dirs: int = N_DIRS, files_per_dir: int = FILES_PER_DIR, line
             file_path = dir_path / f"file_{f}.py"
             lines = [f"# module_{d}/file_{f}.py line {i}\ndef fn_{i}():\n    return {i}\n" for i in range(lines_per_file)]
             file_path.write_text("".join(lines))
-    # A couple of "hot" files that many stack frames will reference repeatedly.
     (REPO_DIR / "module_0" / "worker.py").write_text(
         "\n".join(f"def run_{i}():\n    pass" for i in range(500))
     )
@@ -101,9 +94,6 @@ def main() -> None:
     index = index_holder["index"]
     print(f"index: {len(index.by_path)} files indexed")
 
-    # Correlation: many events, each with a stack frame pointing at ONE of a
-    # small set of "hot" files (worst case for repeated re-reads without the
-    # context cache), interspersed with frames into many DIFFERENT files.
     hot_events = [
         ParsedEvent(
             line_number=i,

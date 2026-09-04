@@ -1,18 +1,3 @@
-"""Per-format batching benchmark: does the current INGESTION_RAW_BATCH_BYTES
-(10 MiB) / INGESTION_RAW_BATCH_ITEMS (20000) default actually beat smaller or
-larger batches for real DB commit/checkpoint cost? Runs the REAL production
-pipeline (app.tasks.analysis.process_analysis) against the real MySQL
-database this app uses, only varying the batch size create_batches() is
-called with (via monkeypatching app.tasks.analysis.create_batches to a
-partial - process_analysis itself is untouched).
-
-Self-cleaning: uses the same __bench_pipeline__ throwaway user/analysis
-pattern as scripts/bench_pipeline.py, deletes its own rows before each run
-and at the end. Never touches any other user's data.
-
-Usage:
-    .venv/bin/python scripts/bench_batching.py
-"""
 from __future__ import annotations
 
 import functools
@@ -24,10 +9,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.db.database import sessionLocal  # noqa: E402
-from app.models import Analysis, AnalysisArtifact, Evidence, User  # noqa: E402
-from app.services.batch_processor import create_batches as real_create_batches  # noqa: E402
-import app.tasks.analysis as analysis_task  # noqa: E402
+from app.db.database import sessionLocal
+from app.models import Analysis, AnalysisArtifact, Evidence, User
+from app.services.batch_processor import create_batches as real_create_batches
+import app.tasks.analysis as analysis_task
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 BENCH_USERNAME = "__bench_pipeline__"

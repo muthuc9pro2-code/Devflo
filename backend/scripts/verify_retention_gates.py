@@ -1,27 +1,3 @@
-"""Differential equivalence test for the per-format retention gates added in
-_may_be_important()/_build_text_artifact_event().
-
-For every record in every 10 MiB benchmark fixture (plus a hand-written
-adversarial battery per format), this compares:
-
-  A) gate ACTIVE (current code): stream_artifact_events() as shipped
-  B) gate FORCED OFF (_may_be_important monkeypatched to always return True):
-     every record fully parsed, exactly like before this optimization
-
-and asserts:
-
-  1. For every record the active gate chose to parse (event is not None),
-     its ParsedEvent is byte-for-byte identical to what the ungated parse
-     produced for that same record.
-  2. For every record the active gate skipped (event is None), the ungated
-     parse's event.level is NOT in IMPORTANT_LEVELS and it is not an
-     OpenTelemetry event carrying a trace/span id - i.e. it genuinely
-     would never have become evidence. No evidence is silently dropped.
-
-Not a pytest test - a one-off correctness gate, run manually:
-
-    .venv/bin/python scripts/verify_retention_gates.py
-"""
 
 from __future__ import annotations
 
@@ -31,9 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import app.services.diagnostic_adapters as da  # noqa: E402
-from app.services.artifact_detector import detect_artifact  # noqa: E402
-from app.services.event_filter import IMPORTANT_LEVELS  # noqa: E402
+import app.services.diagnostic_adapters as da
+from app.services.artifact_detector import detect_artifact
+from app.services.event_filter import IMPORTANT_LEVELS
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 

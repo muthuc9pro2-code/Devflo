@@ -1,14 +1,3 @@
-"""Peak memory measurement for representative formats at 10 MiB and 50 MiB,
-CPU-only (no DB), mirroring what a single _process_artifact() call does:
-stream_artifact_events -> create_batches -> per-batch retention filter +
-fingerprinting. Each fixture is measured in its own fresh subprocess so
-resource.getrusage's peak-RSS high-water-mark isn't contaminated by a
-previous fixture's peak in the same run.
-
-Usage:
-    .venv/bin/python scripts/bench_memory.py                 # measure all
-    .venv/bin/python scripts/bench_memory.py --child <fixture-path> <format>  # internal
-"""
 from __future__ import annotations
 
 import resource

@@ -68,11 +68,6 @@ def _require_analysis_capacity(
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_verified_user)],
 ) -> None:
-    # Cheap early rejection before the endpoint copies multipart temp files
-    # into Devflo's own staging directory.
-    #
-    # This is not trusted as the race-safe decision. create_analysis()
-    # repeats the check under the User lock.
     if user_has_analysis_capacity(db, current_user.id):
         return
     raise HTTPException(
@@ -132,19 +127,6 @@ def upload_file(
             try:
                 source_reference = validate_github_url(github_url)
             except SourceInputError:
-                # Optional source enrichment: a malformed repository URL
-                # detected synchronously here must degrade the exact same
-                # way a later async acquisition failure already does (see
-                # _prepare_source_task) - never abort otherwise-valid
-                # diagnostic artifacts over it. source_kind stays "github"
-                # so History/the final result can still say what kind of
-                # source was attempted. Deliberately distinct wording from
-                # _prepare_source_task's "could not be accessed or
-                # prepared": this is a malformed URL Devflo can reliably
-                # detect without ever attempting to reach GitHub - a later
-                # genuine access/clone failure (private repo, network,
-                # nonexistent repo, etc.) is a different, less certain
-                # class of failure and must not be conflated with this one.
                 source_status = "unavailable"
                 source_failure_reason = "Invalid GitHub repository URL."
         elif source_zip:
@@ -162,10 +144,6 @@ def upload_file(
                 validate_source_zip(source_path)
                 source_reference = str(source_path)
             except (UploadTooLarge, SourceInputError) as error:
-                # Same degradation as the github_url branch above. The
-                # invalid/oversized staged ZIP is reclaimed immediately -
-                # it will never be used, and the diagnostic artifacts
-                # staged below are entirely unaffected by it.
                 source_status = "unavailable"
                 source_failure_reason = (
                     f"Uploaded source ZIP could not be prepared: {error}"
@@ -180,14 +158,6 @@ def upload_file(
             storage_filename = _safe_storage_filename(original_filename)
             saved_path = UPLOAD_DIR / (f"{upload_group}_{position}_{storage_filename}")
             staged_paths.append(saved_path)
-
-            # MIME/extension is only an early resource hint here - a normal
-            # 50 MiB PNG should not first be fully written to disk before
-            # being rejected. The artifact detector below remains the
-            # authoritative format decision, and a disguised image that
-            # slips past this hint is still caught by the real
-            # size/pixel validation (validate_ocr_image) once
-            # detect_artifact_sample() confirms IMAGE.
             looks_like_image = (
                 Path(original_filename).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
                 or (upload.content_type or "").split(";", 1)[0].strip().lower()
@@ -279,8 +249,6 @@ def upload_file(
             )
 
         if not any(row["detected_format"] is not None for row in artifact_rows):
-            # Every uploaded file was unsupported - nothing to analyze at
-            # all, same outcome as today's single-unsupported-file case.
             _remove_staged_uploads(staged_paths)
             unsupported_names = ", ".join(
                 row["original_filename"] for row in artifact_rows
@@ -320,23 +288,8 @@ def upload_file(
         _remove_staged_uploads(staged_paths)
         raise
 
-    # create_analysis() returns only after the Analysis and AnalysisArtifact
-    # rows are durably committed. Keep this refresh intentionally OUTSIDE the
-    # staging-cleanup try/except above: if the DB connection disappears in
-    # this post-commit read window, the request may fail, but the staged raw
-    # inputs must remain for Beat recovery rather than being deleted as if
-    # creation had rolled back.
     db.refresh(analysis)
 
-    # unsupported/duplicate are already deterministically resolved at this
-    # point (staging classified unsupported; create_analysis's within-
-    # analysis content-hash grouping established the canonical artifact for
-    # any duplicate) - publish those outcomes now rather than making the
-    # frontend wait for final correlation. Reuses the exact same
-    # build_artifact_outcome_payload() the final investigation_result.
-    # artifacts[] uses, so there is only ever one status/message
-    # representation. Evidence-bearing artifacts are NOT published here -
-    # only once their ingestion actually completes (_process_artifact).
     created_artifacts = list(analysis.artifacts)
     filename_by_artifact_id = {
         artifact.id: artifact.original_filename for artifact in created_artifacts
@@ -352,16 +305,6 @@ def upload_file(
                     ),
                 },
             )
-
-    # create_analysis() has already durably committed the Analysis and its
-    # AnalysisArtifact rows above - from the caller's perspective the
-    # upload has already succeeded. A broker/producer error enqueuing the
-    # follow-up Celery task must not turn that into an HTTP failure: the
-    # frontend would then plausibly retry the whole (up to 1 GiB) upload,
-    # creating a second durable Analysis for the same investigation. The
-    # durably-pending row is instead picked up naturally by
-    # recover_stale_analyses's own pending-queue-age recovery once the
-    # broker is reachable again.
     try:
         process_analysis.delay(analysis.id)
     except Exception:
@@ -471,24 +414,6 @@ def get_analysis_detail(
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_verified_user)],
 ) -> Response:
-    """The durable REST counterpart to the live SSE stream - the exact
-    same current-state contract (compute_current_analysis_state) a History
-    click can use without ever opening an SSE connection: a processing
-    analysis returns persisted byte progress, a completed one returns the
-    persisted result_snapshot (or the legacy recompute fallback for a
-    pre-migration row), a failed one just reports its status. No Gemini
-    call and no correlation rerun either way when a snapshot exists.
-
-    Ownership is enforced by filtering on BOTH analysis_id and
-    current_user.id in one query - a mismatched owner and a nonexistent id
-    are indistinguishable (both 404), so this endpoint never confirms
-    whether another user's analysis id exists.
-
-    Returned as a raw Response (json.dumps(..., default=str), not a
-    pydantic response_model) so this matches the SSE stream's own
-    serialization byte-for-byte - the same datetime/etc. coercion, not
-    just the same field names.
-    """
     analysis = (
         db.query(Analysis)
         .filter(Analysis.id == analysis_id, Analysis.user_id == current_user.id)
@@ -511,20 +436,6 @@ def cancel_analysis(
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_verified_user)],
 ) -> dict:
-    """Explicit user cancellation - the ONLY user-triggered way an analysis
-    ever becomes "cancelled" (a closed browser tab/lost connection is
-    never cancellation; see AnalysisPage's durable reconnect design).
-
-    Runs entirely synchronously in this request - never depends on
-    obtaining a free Celery worker slot, and is never itself dispatched as
-    a Celery task: cancel_analysis_and_cleanup() commits the durable
-    "cancelled" tombstone before doing any cleanup, so even if every
-    worker is currently busy, this endpoint still durably wins.
-
-    Ownership enforced the same way as get_analysis_detail (both
-    analysis_id and current_user.id in one query - a mismatched owner and
-    a nonexistent id are indistinguishable, both 404).
-    """
     analysis = (
         db.query(Analysis)
         .filter(Analysis.id == analysis_id, Analysis.user_id == current_user.id)
@@ -545,14 +456,6 @@ def cancel_analysis(
         raise HTTPException(
             status_code=409, detail="Failed analyses cannot be cancelled"
         )
-
-    # analysis.status in ("pending", "processing") at the read above -
-    # cancellable as far as this request knows. cancel_analysis_and_cleanup
-    # re-checks under its own transaction and may still lose the race (a
-    # finalizer's completed/failed commit can land between the read above
-    # and here) - it returns None in that case rather than cancelling
-    # anything, so the response below must reflect what it actually
-    # observed, not the stale read above.
     previous_status = cancel_analysis_and_cleanup(db, analysis_id)
 
     if previous_status is None:
@@ -569,14 +472,8 @@ def cancel_analysis(
             raise HTTPException(
                 status_code=409, detail="Failed analyses cannot be cancelled"
             )
-        # Analysis vanished or is in an unexpected state - ownership was
-        # already confirmed above, so this only means the row is gone.
         raise HTTPException(status_code=404, detail="Analysis not found")
 
-    # Best-effort live notification only - DB is already
-    # authoritative regardless of whether this is ever delivered; a lost
-    # event is fully reconstructed by the next durable GET/reconnect via
-    # compute_current_analysis_state's "cancelled" branch.
     publish_analysis_event(analysis_id, "cancelled", {"analysis_id": analysis_id})
 
     return {"analysis_id": analysis_id, "status": "cancelled"}

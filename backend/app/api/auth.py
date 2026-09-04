@@ -1,6 +1,5 @@
 from datetime import UTC, datetime
 import logging
-
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError

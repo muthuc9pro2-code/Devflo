@@ -1,15 +1,3 @@
-"""Per-format CPU profiling/benchmarking harness for the ingestion pipeline.
-
-Runs stream_artifact_events() (no DB) for a given fixture, reports records,
-normalized/important counts, and timing; optionally runs cProfile for a
-function-level breakdown. This is the PRIMARY tool for phase-1 profiling and
-before/after comparisons per format.
-
-Usage:
-    .venv/bin/python scripts/profile_formats.py bench --iterations 5
-    .venv/bin/python scripts/profile_formats.py bench --format database --iterations 5
-    .venv/bin/python scripts/profile_formats.py profile --format database
-"""
 
 from __future__ import annotations
 
@@ -21,9 +9,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.artifact_detector import ArtifactFormat, detect_artifact  # noqa: E402
-from app.services.diagnostic_adapters import stream_artifact_events  # noqa: E402
-from app.services import event_filter  # noqa: E402
+from app.services.artifact_detector import ArtifactFormat, detect_artifact
+from app.services.diagnostic_adapters import stream_artifact_events
+from app.services import event_filter
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 

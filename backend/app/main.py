@@ -13,12 +13,6 @@ from app.api import auth, analysis, analysis_stream
 setup_logging()
 logger = logging.getLogger(__name__)
 
-# Only sqlalchemy.exc.OperationalError - the class PyMySQL/SQLAlchemy raise
-# for a genuinely unreachable/lost DB connection (connect timeout, "gone
-# away", connection refused). Deliberately narrow: ProgrammingError,
-# IntegrityError and other SQLAlchemy errors mean a real application bug or
-# expected constraint violation, not a service outage, and must keep
-# surfacing as their normal (existing) error handling, not a blanket 503.
 _SERVICE_UNAVAILABLE_DETAIL = "Devflo is temporarily unavailable. Please try again."
 _SERVICE_UNAVAILABLE_CODE = "service_unavailable"
 

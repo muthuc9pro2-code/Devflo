@@ -1,14 +1,3 @@
-"""Historical interleaved A/B for the Phase-1 build_index optimization.
-
-This benchmark intentionally owns its legacy by_path/by_suffix/by_stem shape
-instead of constructing the production SourceIndex. SourceIndex changed after
-this benchmark was recorded: bounded reversed lookup keys replaced the
-materialized suffix map.
-
-Keeping the historical structure local lets the old per-file
-Path.relative_to() and new per-directory os.path.relpath() implementations
-remain runnable and directly comparable.
-"""
 import os
 import statistics
 import sys
@@ -19,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.source_index import (  # noqa: E402
+from app.services.source_index import (
     BINARY_EXTENSIONS,
     IGNORED_DIRS,
     SourceFile,
@@ -85,7 +74,6 @@ def _assert_equivalent(old: BenchIndex, new: BenchIndex) -> None:
 
 
 def main() -> None:
-    # Semantic gate outside timing.
     _assert_equivalent(old_build_index(ROOT), new_build_index(ROOT))
 
     results = {"old": [], "new": []}

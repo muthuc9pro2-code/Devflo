@@ -1,15 +1,3 @@
-"""Benchmark harness for the ingestion / identity-resolution pipeline.
-
-Runs the REAL production code paths (app.tasks.analysis.process_analysis,
-app.services.diagnostic_adapters.stream_artifact_events, ...) against the
-frozen 10 MiB fixture at tests/fixtures/bench/generic_10mib.log and a real
-MySQL database (same one the app uses). Not part of the pytest suite -
-this is a manual/dev tool, invoked directly:
-
-    .venv/bin/python scripts/bench_pipeline.py full --iterations 5
-    .venv/bin/python scripts/bench_pipeline.py cpu --iterations 5
-    .venv/bin/python scripts/bench_pipeline.py profile
-"""
 
 from __future__ import annotations
 
@@ -24,10 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import text
 
-from app.db.database import sessionLocal  # noqa: E402
-from app.models import Analysis, AnalysisArtifact, Evidence, User  # noqa: E402
+from app.db.database import sessionLocal
+from app.models import Analysis, AnalysisArtifact, Evidence, User
 
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "tests/fixtures/bench/generic_10mib.log"
 BENCH_USERNAME = "__bench_pipeline__"
@@ -51,11 +39,6 @@ def _get_or_create_bench_user(db) -> User:
 
 
 def _reset_analysis(db, user_id: int) -> int:
-    """Create a fresh analysis+artifact row pointing at the frozen fixture.
-
-    Deletes any prior benchmark analyses so each run starts from a clean
-    slate (evidence table has no leftover rows for this analysis id).
-    """
 
     old = db.query(Analysis).filter(Analysis.user_id == user_id).all()
     for analysis in old:
@@ -98,8 +81,6 @@ def _reset_analysis(db, user_id: int) -> int:
 
 
 class _StageCapture(logging.Handler):
-    """Pulls the perf_counter stage timings straight out of the log args
-    process_analysis() already emits, instead of re-parsing message text."""
 
     def __init__(self):
         super().__init__(level=logging.INFO)
@@ -209,11 +190,6 @@ def run_full(iterations: int) -> None:
 
 
 def run_cpu_only(iterations: int) -> None:
-    """Pure-Python ingestion CPU cost, no DB involved at all.
-
-    Mirrors what _process_artifact / _persist_artifact_batch do before any
-    database call, broken into the phases the task asked to see separately.
-    """
 
     from app.services.artifact_detector import detect_artifact
     from app.services.diagnostic_adapters import stream_artifact_events

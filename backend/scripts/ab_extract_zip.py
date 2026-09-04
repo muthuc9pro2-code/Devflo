@@ -1,7 +1,3 @@
-"""Interleaved A/B: old Path.resolve()-based _extract_zip vs the
-os.path.realpath()-based version, alternating within one process so system
-load drift cancels out.
-"""
 import os
 import shutil
 import statistics
@@ -13,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.source_archive import SourceInputError, _safe_members  # noqa: E402
+from app.services.source_archive import SourceInputError, _safe_members
 
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ZIP_PATH = SCRATCH / "synthetic_source.zip"

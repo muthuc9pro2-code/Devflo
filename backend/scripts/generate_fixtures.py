@@ -1,14 +1,3 @@
-"""Generate VALID, representative ~N MiB benchmark fixtures for every
-ArtifactFormat, following the exact grammars validated by
-tests/fixtures/diagnostics/* and tests/unit/test_diagnostic_normalization.py.
-
-No malformed/concatenated-JSON tricks: OTLP and HAR are single valid JSON
-documents with large arrays, matching real OTLP/HAR exports.
-
-Usage:
-    .venv/bin/python scripts/generate_fixtures.py --size-mib 10
-    .venv/bin/python scripts/generate_fixtures.py --size-mib 50 --formats database,web_server
-"""
 
 from __future__ import annotations
 
@@ -29,11 +18,6 @@ def _target_bytes(size_mib: float) -> int:
     return int(size_mib * 1024 * 1024)
 
 
-# ---------------------------------------------------------------------------
-# GENERIC-family text formats: cycle through a repeating pattern of records,
-# most INFO/noise, a meaningful fraction WARNING/ERROR/CRITICAL, so retention
-# gating has something real to filter.
-# ---------------------------------------------------------------------------
 
 
 def gen_web_server(size_mib: float) -> bytes:
@@ -305,11 +289,6 @@ def gen_json_lines(size_mib: float) -> bytes:
     return "".join(lines).encode()
 
 
-# ---------------------------------------------------------------------------
-# Structured single-document formats: OTLP and HAR. Both are ONE valid JSON
-# document with a large array, matching real exports - never concatenated
-# JSON objects.
-# ---------------------------------------------------------------------------
 
 
 def gen_otlp(size_mib: float) -> bytes:

@@ -1,11 +1,3 @@
-"""Separate GitHub source acquisition into its two genuinely distinct costs:
-network clone time (not ours to optimize - bounded only by --depth 1 shallow
-clone, already in place) vs local CPU time (build_index, which we already
-optimized and which is the exact same code path ZIP-sourced analyses use).
-
-Usage:
-    .venv/bin/python scripts/bench_github_source.py <https-github-url>
-"""
 from __future__ import annotations
 
 import shutil
@@ -16,8 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.source_archive import _clone_github  # noqa: E402
-from app.services.source_index import build_index  # noqa: E402
+from app.services.source_archive import _clone_github
+from app.services.source_index import build_index
 
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 DEST = SCRATCH / "github_bench_clone"

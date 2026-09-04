@@ -1,15 +1,3 @@
-"""Differential test: vectorized BoundedJsonStream._scan vs the original
-byte-by-byte reference implementation it replaced.
-
-Feeds identical byte sequences through both scanners under many different
-read-chunk splits (since the vectorized version's cross-chunk state carrying
-is the riskiest part to get subtly wrong) and asserts identical outcomes:
-same bytes returned, same point at which (if at all) OversizedJsonScalarError
-is raised, and identical internal state after every read(). Not a pytest
-test - a one-off correctness gate, run manually:
-
-    .venv/bin/python scripts/verify_boundedjson_equivalence.py
-"""
 
 from __future__ import annotations
 
@@ -20,14 +8,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.utils.bounded_json import (  # noqa: E402
+from app.utils.bounded_json import (
     BoundedJsonStream,
     OversizedJsonScalarError,
 )
 
 
 class _ReferenceBoundedJsonStream:
-    """The original per-byte scanner, kept only as an equivalence oracle."""
 
     def __init__(self, stream, *, max_scalar_bytes):
         self._stream = stream
@@ -77,10 +64,6 @@ class _ReferenceBoundedJsonStream:
 
 
 def _drive(cls, data: bytes, max_scalar_bytes: int, chunk_sizes: list[int]):
-    """Feed `data` through `cls` using an explicit sequence of read() sizes.
-
-    Returns (consumed_bytes, raised: bool, raise_offset_or_None).
-    """
     stream = cls(BytesIO(data), max_scalar_bytes=max_scalar_bytes)
     consumed = b""
     offset = 0
@@ -106,8 +89,8 @@ def _random_chunk_plan(rng: random.Random) -> list[int]:
 
 ADVERSARIAL_CASES = [
     b'{"a": "' + b"x" * 500 + b'"}',
-    b'{"a": "' + b"\\" * 501 + b'"}',  # long run of escaped backslashes
-    b'{"a": "' + (b'\\"' * 260) + b'"}',  # many escaped quotes
+    b'{"a": "' + b"\\" * 501 + b'"}',
+    b'{"a": "' + (b'\\"' * 260) + b'"}',
     b"[" + b"1" * 500 + b"]",
     b"[" + b"-" * 500 + b"]",
     b"[1.5e+10, 2.3e-8, " + b"9" * 500 + b"]",
@@ -116,7 +99,7 @@ ADVERSARIAL_CASES = [
     b'{"a": "' + b"y" * 40 + b'", "b": ' + b"7" * 40 + b", \"c\": \"" + b"z" * 40 + b'"}',
     b'{"empty": "", "n": ""}',
     b"",
-    b'"' + b"a" * 300,  # unterminated string (truncated stream)
+    b'"' + b"a" * 300,
     b'{"a": "esc\\\\end", "b": 5' + b"0" * 300 + b"}",
     (b'{"k' + str(i).encode() + b'": "' + bytes([65 + (i % 26)]) * 30 + b'"}' for i in range(0)),
 ]
@@ -145,7 +128,6 @@ def main() -> int:
                 chunk_sizes = _random_chunk_plan(rng)
                 check(case, max_scalar_bytes, chunk_sizes, "adversarial")
 
-    # Purely random byte soup, biased toward the structurally interesting bytes.
     alphabet = b'"\\0123456789.eE+-abc{}[]: \n\t,'
     for _ in range(400):
         length = rng.randint(0, 400)
