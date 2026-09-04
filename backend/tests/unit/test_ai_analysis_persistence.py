@@ -1,21 +1,6 @@
-"""The Gemini AI explanation delivered live must survive a client
-refresh/reconnect after the analysis already completed:
-reconstruct_current_investigation_result (used by
-compute_current_analysis_state on reconnect) must attach the same
-persisted ai_analysis rather than requiring a second, non-deterministic,
-costly Gemini call.
-
-These tests exercise the real end-to-end path against a real (sqlite)
-database: _finalize_analysis_task.run(...) for live completion, then
-compute_current_analysis_state(db, analysis) for reconnect - only
-generate_investigation_explanation (the actual Gemini SDK boundary) is
-mocked.
-"""
 from datetime import datetime, timezone
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.schemas.gemini import GeminiInvestigationResponse
@@ -32,14 +17,12 @@ _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     uncertainties=[],
 )
 
-
 def _db_with_schema(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
     return session_factory
-
 
 def _seed_analysis(session_factory, *, evidence_rows_kwargs: list[dict]) -> int:
     db = session_factory()
@@ -86,14 +69,12 @@ def _seed_analysis(session_factory, *, evidence_rows_kwargs: list[dict]) -> int:
     db.close()
     return analysis_id
 
-
 def _mock_gemini(monkeypatch, calls: list):
     def fake(context):
         calls.append(context)
         return _FAKE_GEMINI_RESULT
 
     monkeypatch.setattr(analysis_task, "generate_investigation_explanation", fake)
-
 
 def test_live_correlated_completion_persists_ai_analysis(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
@@ -111,7 +92,7 @@ def test_live_correlated_completion_persists_ai_analysis(monkeypatch):
 
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
-    assert len(calls) == 1  # exactly one live Gemini call
+    assert len(calls) == 1
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -119,10 +100,7 @@ def test_live_correlated_completion_persists_ai_analysis(monkeypatch):
     assert analysis.ai_analysis == _FAKE_GEMINI_RESULT.model_dump()
     db.close()
 
-
 def test_live_simple_completion_persists_ai_analysis(monkeypatch):
-    """A single evidence row (no shared trace/request/span) takes the
-    SIMPLE path - ai_analysis must be persisted there too."""
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_analysis(
         session_factory,
@@ -143,7 +121,6 @@ def test_live_simple_completion_persists_ai_analysis(monkeypatch):
     assert analysis.ai_analysis == _FAKE_GEMINI_RESULT.model_dump()
     db.close()
 
-
 def test_reconnect_returns_persisted_ai_analysis_without_calling_gemini_again(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_analysis(
@@ -161,8 +138,6 @@ def test_reconnect_returns_persisted_ai_analysis_without_calling_gemini_again(mo
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
     assert len(live_calls) == 1
 
-    # Simulate reconnect: a fresh call into generate_investigation_explanation
-    # that would raise loudly if invoked - proves reconnect never calls it.
     def _must_not_be_called(context):
         raise AssertionError("reconnect must not call Gemini again")
 
@@ -176,7 +151,6 @@ def test_reconnect_returns_persisted_ai_analysis_without_calling_gemini_again(mo
     assert state["status"] == "completed"
     assert state["investigation_result"]["ai_analysis"] == _FAKE_GEMINI_RESULT.model_dump()
 
-
 def test_zero_evidence_analysis_has_no_ai_analysis(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_analysis(session_factory, evidence_rows_kwargs=[])
@@ -187,7 +161,7 @@ def test_zero_evidence_analysis_has_no_ai_analysis(monkeypatch):
 
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
-    assert calls == []  # no evidence -> no Gemini call at all, as before
+    assert calls == []
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
@@ -197,16 +171,10 @@ def test_zero_evidence_analysis_has_no_ai_analysis(monkeypatch):
 
     assert "ai_analysis" not in state["investigation_result"]
 
-
 def _raise_gemini_unavailable(context):
     raise GeminiUnavailableError("This model is currently experiencing high demand.")
 
-
 def test_live_correlated_completion_survives_gemini_unavailable(monkeypatch):
-    """A 503 from Gemini (after bounded retries, see test_gemini_service.py)
-    must not fail an otherwise-complete CORRELATED investigation - it must
-    still complete with the deterministic result, just without an
-    explanation."""
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_analysis(
         session_factory,
@@ -230,7 +198,6 @@ def test_live_correlated_completion_survives_gemini_unavailable(monkeypatch):
     assert "ai_analysis" not in analysis.result_snapshot
     db.close()
 
-
 def test_live_simple_completion_survives_gemini_unavailable(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_analysis(
@@ -250,7 +217,6 @@ def test_live_simple_completion_survives_gemini_unavailable(monkeypatch):
     assert analysis.result_snapshot["investigation_path"] == "simple"
     assert "ai_analysis" not in analysis.result_snapshot
     db.close()
-
 
 def test_reconnect_after_gemini_unavailable_completion_shows_deterministic_result_without_calling_gemini_again(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)

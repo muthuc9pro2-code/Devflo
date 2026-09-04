@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import shutil
 import statistics
 import sys
@@ -24,7 +22,6 @@ N_DIRS = 40
 FILES_PER_DIR = 50
 LINES_PER_FILE = 120
 
-
 def generate_repo(n_dirs: int = N_DIRS, files_per_dir: int = FILES_PER_DIR, lines_per_file: int = LINES_PER_FILE) -> None:
     if REPO_DIR.exists():
         shutil.rmtree(REPO_DIR)
@@ -43,7 +40,6 @@ def generate_repo(n_dirs: int = N_DIRS, files_per_dir: int = FILES_PER_DIR, line
         "\n".join(f"function handle_{i}() {{ return {i}; }}" for i in range(500))
     )
 
-
 def zip_repo() -> None:
     if ZIP_PATH.exists():
         ZIP_PATH.unlink()
@@ -51,7 +47,6 @@ def zip_repo() -> None:
         for path in REPO_DIR.rglob("*"):
             if path.is_file():
                 zf.write(path, path.relative_to(REPO_DIR))
-
 
 def bench(label: str, fn, iterations: int = 5) -> list[float]:
     times = []
@@ -61,7 +56,6 @@ def bench(label: str, fn, iterations: int = 5) -> list[float]:
         times.append(time.perf_counter() - t0)
     print(f"{label}: median={statistics.median(times):.4f}s all={[f'{t:.4f}' for t in times]}")
     return times
-
 
 def main() -> None:
     print("Generating synthetic repo...")
@@ -128,10 +122,8 @@ def main() -> None:
     bench("correlate_20000_repeated_hot_file", correlate_hot, iterations=3)
     bench("correlate_20000_unique_files", correlate_unique, iterations=3)
 
-
 def lines_per_file_default() -> int:
     return LINES_PER_FILE
-
 
 if __name__ == "__main__":
     main()

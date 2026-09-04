@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import logging
 import shutil
 import sys
@@ -37,7 +36,6 @@ ALL_FORMATS = [
     ("opentelemetry_10mib.json", "application/json"),
 ]
 
-
 def _get_or_create_bench_user(db) -> User:
     user = db.query(User).filter(User.username == BENCH_USERNAME).first()
     if user is not None:
@@ -48,7 +46,6 @@ def _get_or_create_bench_user(db) -> User:
     db.refresh(user)
     return user
 
-
 def _cleanup_all(db, user_id: int) -> None:
     old = db.query(Analysis).filter(Analysis.user_id == user_id).all()
     for analysis in old:
@@ -56,7 +53,6 @@ def _cleanup_all(db, user_id: int) -> None:
         db.query(AnalysisArtifact).filter(AnalysisArtifact.analysis_id == analysis.id).delete()
         db.delete(analysis)
     db.commit()
-
 
 def _make_mixed_analysis(db, user_id: int, source_kind: str | None, source_reference: str | None) -> int:
     _cleanup_all(db, user_id)
@@ -93,7 +89,6 @@ def _make_mixed_analysis(db, user_id: int, source_kind: str | None, source_refer
     db.commit()
     return analysis.id
 
-
 class _StageCapture(logging.Handler):
     def __init__(self):
         super().__init__(level=logging.INFO)
@@ -113,7 +108,6 @@ class _StageCapture(logging.Handler):
             self.stages["total"] = float(args[-1])
         elif "artifact_position=" in msg:
             self.artifact_lines.append(args)
-
 
 def run_scenario(label: str, source_kind: str | None, source_reference: str | None) -> None:
     db = sessionLocal()
@@ -166,7 +160,6 @@ def run_scenario(label: str, source_kind: str | None, source_reference: str | No
     db.close()
     print(f"evidence_rows: {count}")
 
-
 def main() -> None:
     if not ZIP_SOURCE.exists():
         print(f"WARNING: {ZIP_SOURCE} missing, regenerating via bench_source.py's generator")
@@ -187,7 +180,6 @@ def main() -> None:
     if root.exists():
         shutil.rmtree(root)
     print("\ncleaned up all bench rows and staged source directories")
-
 
 if __name__ == "__main__":
     main()

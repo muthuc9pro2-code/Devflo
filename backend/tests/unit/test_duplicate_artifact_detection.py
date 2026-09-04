@@ -1,33 +1,13 @@
-"""Content-based (SHA-256) duplicate-artifact detection.
-
-Covers the three layers this task touches:
-  - upload_staging.copy_upload: streaming digest, bounded memory.
-  - crud.analysis.create_analysis: within-analysis duplicate resolution
-    (first occurrence of a content hash stays canonical/pending, later
-    occurrences become status="duplicate" pointing at it).
-  - tasks.analysis.process_analysis: duplicate/unsupported artifacts are
-    excluded from Celery dispatch entirely - never processed, never
-    produce their own Evidence, never participate in correlation.
-
-No hash/duplicate concept existed anywhere in the repository before this
-change (confirmed by inspection - AnalysisArtifact had no such column), so
-this adds exactly one persisted identity: content_sha256 plus
-duplicate_of_artifact_id, reusing the existing `status` column/vocabulary
-rather than a second tracking system.
-"""
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.crud.analysis import create_analysis
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, User
 from app.services.upload_staging import copy_upload
 from app.tasks import analysis as analysis_task
-
 
 def _sqlite_session():
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -39,14 +19,7 @@ def _sqlite_session():
     db.commit()
     return session_factory, db, user
 
-
-# --- copy_upload: streaming SHA-256, bounded memory ------------------------
-
-
 class _TrackedReadFile:
-    """Fails the test if anything ever asks for more than chunk_bytes at
-    once - the only way to prove "never load the whole artifact into RAM"
-    from a unit test."""
 
     def __init__(self, content: bytes, chunk_bytes: int):
         self._buffer = content
@@ -63,9 +36,8 @@ class _TrackedReadFile:
         self._offset += len(chunk)
         return chunk
 
-
 def test_copy_upload_streams_in_bounded_chunks_and_computes_the_real_digest(tmp_path):
-    content = (b"ERROR database timeout\n" * 50_000)  # ~1.2MB, larger than any single chunk
+    content = (b"ERROR database timeout\n" * 50_000)
     chunk_bytes = 8192
     upload = SimpleNamespace(file=_TrackedReadFile(content, chunk_bytes))
     target = tmp_path / "large.log"
@@ -79,7 +51,6 @@ def test_copy_upload_streams_in_bounded_chunks_and_computes_the_real_digest(tmp_
     assert upload.file.max_requested <= chunk_bytes
     assert target.read_bytes() == content
 
-
 def test_copy_upload_digest_differs_for_different_content(tmp_path):
     upload_a = SimpleNamespace(file=_TrackedReadFile(b"content A", 64))
     upload_b = SimpleNamespace(file=_TrackedReadFile(b"content B", 64))
@@ -89,7 +60,6 @@ def test_copy_upload_digest_differs_for_different_content(tmp_path):
 
     assert digest_a != digest_b
 
-
 def test_copy_upload_digest_matches_for_identical_content_different_filenames(tmp_path):
     upload_a = SimpleNamespace(file=_TrackedReadFile(b"identical bytes here", 64))
     upload_b = SimpleNamespace(file=_TrackedReadFile(b"identical bytes here", 64))
@@ -98,10 +68,6 @@ def test_copy_upload_digest_matches_for_identical_content_different_filenames(tm
     _, _, digest_b = copy_upload(upload_b, tmp_path / "copy.log", 100, "x", 64)
 
     assert digest_a == digest_b
-
-
-# --- create_analysis: within-analysis duplicate resolution -----------------
-
 
 def test_identical_bytes_different_filename_is_flagged_duplicate():
     session_factory, db, user = _sqlite_session()
@@ -143,15 +109,9 @@ def test_identical_bytes_different_filename_is_flagged_duplicate():
     assert copy.duplicate_of_artifact_id == original.id
     db.close()
 
-
 def test_duplicate_staged_bytes_are_deleted_but_metadata_and_canonical_survive(
     tmp_path, monkeypatch
 ):
-    """Duplicate rows are marked "duplicate" in the
-    DB and their staged physical bytes are reclaimed. Only the
-    duplicate's file must be deleted - never the canonical's - and only
-    after the DB has durably established the relationship; all metadata
-    (filename, duplicate_of_artifact_id) must remain queryable."""
     from app.crud import analysis as crud_analysis
 
     monkeypatch.setattr(crud_analysis, "_UPLOAD_ROOT", tmp_path.resolve())
@@ -203,10 +163,7 @@ def test_duplicate_staged_bytes_are_deleted_but_metadata_and_canonical_survive(
     assert copy.original_filename == "copy.log"
     db.close()
 
-
 def test_duplicate_deletion_refuses_to_delete_outside_the_upload_root(tmp_path, monkeypatch):
-    """Safety: even if a saved_file_path somehow pointed outside the upload
-    root, the deletion helper must refuse rather than deleting it."""
     from app.crud import analysis as crud_analysis
 
     monkeypatch.setattr(crud_analysis, "_UPLOAD_ROOT", (tmp_path / "uploads").resolve())
@@ -217,7 +174,6 @@ def test_duplicate_deletion_refuses_to_delete_outside_the_upload_root(tmp_path, 
     crud_analysis._delete_staged_upload(str(outside_path))
 
     assert outside_path.exists()
-
 
 def test_identical_filename_different_bytes_is_not_duplicate():
     session_factory, db, user = _sqlite_session()
@@ -255,7 +211,6 @@ def test_identical_filename_different_bytes_is_not_duplicate():
     assert all(row.duplicate_of_artifact_id is None for row in rows)
     db.close()
 
-
 def test_multiple_different_artifacts_remain_unchanged():
     session_factory, db, user = _sqlite_session()
 
@@ -286,11 +241,7 @@ def test_multiple_different_artifacts_remain_unchanged():
     assert [row.duplicate_of_artifact_id for row in rows] == [None, None, None]
     db.close()
 
-
 def test_unsupported_artifacts_are_excluded_from_duplicate_grouping():
-    """Two unsupported artifacts with identical bytes must not be linked
-    as duplicate-of-each-other - duplicate detection only applies to
-    artifacts that would otherwise be processed."""
     session_factory, db, user = _sqlite_session()
     digest = hashlib.sha256(b"binary junk").hexdigest()
 
@@ -329,15 +280,7 @@ def test_unsupported_artifacts_are_excluded_from_duplicate_grouping():
     assert all(row.duplicate_of_artifact_id is None for row in rows)
     db.close()
 
-
-# --- Celery dispatch: duplicates/unsupported never processed ---------------
-
-
 def test_duplicate_and_unsupported_artifacts_are_excluded_from_dispatch(monkeypatch):
-    """3/4/9. The original (canonical) artifact is dispatched normally; the
-    duplicate and an unsupported artifact are not - proving a duplicate
-    cannot produce independent evidence or participate in correlation,
-    because it is never even handed to the ingestion pipeline."""
     session_factory, db, user = _sqlite_session()
     analysis = Analysis(
         user_id=user.id, original_filename="a", saved_file_path="a", status="pending"
@@ -386,12 +329,9 @@ def test_duplicate_and_unsupported_artifacts_are_excluded_from_dispatch(monkeypa
     dispatched_ids = {
         call.args[1] for call in analysis_task._process_artifact_task.si.call_args_list
     }
-    assert dispatched_ids == {original_id}  # only the canonical artifact
-
+    assert dispatched_ids == {original_id}
 
 def test_finalize_does_not_block_on_duplicate_or_unsupported_artifacts(monkeypatch):
-    """A duplicate/unsupported artifact never reaches status="completed" -
-    finalize must not wait for it forever."""
     session_factory, db, user = _sqlite_session()
     analysis = Analysis(
         user_id=user.id, original_filename="a", saved_file_path="a", status="processing"
@@ -431,8 +371,6 @@ def test_finalize_does_not_block_on_duplicate_or_unsupported_artifacts(monkeypat
 
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
-    # Reached the zero-evidence completion path (no Evidence rows at all
-    # here) instead of being stuck skipping finalize forever.
     assert len(investigation_calls) == 1
     db2 = session_factory()
     try:

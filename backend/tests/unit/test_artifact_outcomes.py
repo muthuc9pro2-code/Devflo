@@ -1,23 +1,7 @@
-"""Per-artifact outcome information added to the existing correlation
-payload (frontend contract): a supported artifact that was fully processed
-but retained zero diagnostic evidence must be distinguishable from one that
-found evidence, without ever being mislabeled "unrelated" and without
-disturbing the existing zero-evidence-whole-analysis path, correlation
-results, or SSE progress semantics.
-
-Covers both the pure `build_correlation_payload()` contract (mirroring
-test_investigation_context.py's style, with a real run_correlation()) and an
-end-to-end real-sqlite `_finalize_analysis_task` run proving the production
-wiring: a zero-evidence artifact never blocks the analysis, never removes
-other artifacts' evidence, and shows up in the published investigation_result
-payload (the single authoritative final SSE event - see analysis_events.py).
-"""
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.schemas.gemini import GeminiInvestigationResponse
@@ -29,14 +13,10 @@ from app.services.investigation_context import (
 )
 from app.tasks import analysis as analysis_task
 
-# Unit tests must never require the real Gemini API/network/
-# quota - this is the same fixed, deterministic result every mocked
-# _finalize_analysis_task run in this file uses instead.
 _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     title="t", summary="s", probable_root_causes=[], what_happened=[],
     source_code_findings=[], recommended_actions=[], uncertainties=[],
 )
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -57,7 +37,6 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
 def _artifact_row(
     artifact_id: int,
     filename: str,
@@ -72,10 +51,6 @@ def _artifact_row(
         status=status,
         duplicate_of_artifact_id=duplicate_of_artifact_id,
     )
-
-
-# --- 1/2: build_correlation_payload artifact outcomes ----------------------
-
 
 def test_artifact_with_evidence_is_reported_processed_with_no_message():
     base = datetime.now(timezone.utc)
@@ -98,7 +73,6 @@ def test_artifact_with_evidence_is_reported_processed_with_no_message():
     assert outcome_by_id[101]["source_format"] == "web_server"
     assert "message" not in outcome_by_id[101]
 
-
 def test_zero_evidence_artifact_is_reported_processed_with_neutral_message():
     base = datetime.now(timezone.utc)
     rows = [_evidence(1, artifact_id=101, service="a", first_seen=base)]
@@ -120,10 +94,6 @@ def test_zero_evidence_artifact_is_reported_processed_with_neutral_message():
         "No meaningful diagnostic evidence was extracted from this artifact."
     )
 
-
-# --- 3/4: multiple artifacts, one zero-evidence, does not disturb others ---
-
-
 def test_zero_evidence_artifact_does_not_alter_other_artifacts_evidence():
     base = datetime.now(timezone.utc)
     rows = [
@@ -142,8 +112,6 @@ def test_zero_evidence_artifact_does_not_alter_other_artifacts_evidence():
     without_artifacts = build_correlation_payload(run, rows)
     with_artifacts = build_correlation_payload(run, rows, artifacts=artifacts)
 
-    # Adding artifact outcomes is purely additive: every other field (the
-    # real, correlated evidence graph) is byte-identical either way.
     for key in ("evidence_count", "component_count", "evidence_artifact_count", "components"):
         assert with_artifacts[key] == without_artifacts[key]
 
@@ -158,10 +126,6 @@ def test_zero_evidence_artifact_does_not_alter_other_artifacts_evidence():
     assert outcome_by_id[104]["evidence_count"] == 0
     assert outcome_by_id[104]["message"]
 
-
-# --- 5: zero evidence is never described as "unrelated" --------------------
-
-
 def test_zero_evidence_message_never_claims_unrelated():
     rows = [_evidence(1, artifact_id=101)]
     run = run_correlation(analysis_id=1, evidence_rows=rows)
@@ -174,17 +138,7 @@ def test_zero_evidence_message_never_claims_unrelated():
     assert "corrupt" not in zero["message"].lower()
     assert "unsupported" not in zero["message"].lower()
 
-
-# --- 6: evidence in a separate/weakly-connected component isn't "zero" -----
-
-
 def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
-    """A third artifact's evidence has no shared trace/request/etc. with
-    the main incident and so lands in its own connected component - it must
-    still be reported as evidence_count > 0, never conflated with "no
-    evidence extracted" - and is deterministically
-    reported as not_linked to the primary (artifact 101+102) incident
-    rather than silently indistinguishable from it."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
@@ -195,7 +149,7 @@ def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
         ),
     ]
     run = run_correlation(analysis_id=1, evidence_rows=rows)
-    assert len(run.result.components) == 2  # confirms the fixture is genuinely disconnected
+    assert len(run.result.components) == 2
 
     artifacts = [
         _artifact_row(101, "database.log", "database"),
@@ -208,15 +162,10 @@ def test_evidence_in_a_separate_correlation_component_is_not_zero_evidence():
     assert outcome_by_id[103]["evidence_count"] == 1
     assert outcome_by_id[103]["relationship_status"] == "not_linked"
     assert outcome_by_id[103]["message"] == "Not linked to the correlated incident evidence."
-    # The primary (larger, cross-artifact) incident's own members are
-    # correctly reported as linked to it, not as isolated.
     assert outcome_by_id[101]["relationship_status"] == "linked"
     assert outcome_by_id[102]["relationship_status"] == "linked"
 
-
 def test_artifact_with_evidence_split_across_primary_and_isolated_is_partially_linked():
-    """One artifact contributes evidence to BOTH the primary incident and
-    a separate isolated component - the partially_linked case."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
@@ -224,8 +173,6 @@ def test_artifact_with_evidence_split_across_primary_and_isolated_is_partially_l
             2, artifact_id=102, trace_id="trace-1", service="api",
             first_seen=base + timedelta(milliseconds=10),
         ),
-        # Same artifact (101) also contributes a second, genuinely
-        # unrelated evidence row, far apart in time, sharing nothing.
         _evidence(
             3, artifact_id=101, fingerprint="fp-unrelated", service="unrelated-svc",
             first_seen=base + timedelta(hours=6),
@@ -245,12 +192,7 @@ def test_artifact_with_evidence_split_across_primary_and_isolated_is_partially_l
     assert "linked" in outcome_by_id[101]["message"].lower()
     assert outcome_by_id[102]["relationship_status"] == "linked"
 
-
 def test_scenario_e_four_related_artifacts_plus_one_unrelated_log():
-    """nginx + application + database + OTel share a real incident; a
-    fifth, genuinely unrelated batch-job log must not strengthen that
-    incident's root score and is reported not_linked, without losing its
-    own retained evidence."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="gateway", source_format="cloud_gateway", first_seen=base),
@@ -275,25 +217,18 @@ def test_scenario_e_four_related_artifacts_plus_one_unrelated_log():
     for artifact_id in (101, 102, 103, 104):
         assert outcome_by_id[artifact_id]["relationship_status"] == "linked"
     assert outcome_by_id[105]["relationship_status"] == "not_linked"
-    assert outcome_by_id[105]["evidence_count"] == 1  # retained, not deleted
+    assert outcome_by_id[105]["evidence_count"] == 1
 
-    # The unrelated artifact's evidence must not appear in the primary
-    # incident's own component/root candidates.
     primary_component = max(payload["components"], key=lambda c: len(c["nodes"]))
     linked_artifact_ids = {node["artifact_id"] for node in primary_component["nodes"]}
     assert 105 not in linked_artifact_ids
 
-    # Its evidence is genuinely present, just in the other component.
     component_ids_with_artifact_103 = [
         component["id"]
         for component in payload["components"]
         if any(node["artifact_id"] == 103 for node in component["nodes"])
     ]
     assert component_ids_with_artifact_103
-
-
-# --- backward compatibility: artifacts param stays fully optional ---------
-
 
 def test_artifacts_key_omitted_entirely_when_not_provided():
     rows = [_evidence(1, artifact_id=101)]
@@ -302,10 +237,6 @@ def test_artifacts_key_omitted_entirely_when_not_provided():
     payload = build_correlation_payload(run, rows)
 
     assert "artifacts" not in payload
-
-
-# --- end-to-end: real sqlite finalize run, mixed-evidence artifacts -------
-
 
 def _sqlite_analysis_with_mixed_evidence(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -360,7 +291,6 @@ def _sqlite_analysis_with_mixed_evidence(monkeypatch):
             first_seen=base + timedelta(milliseconds=15),
             last_seen=base + timedelta(milliseconds=15),
         ),
-        # artifacts[2] ("random.log") intentionally has NO Evidence rows.
     ]
     db.add_all(evidence_rows)
     db.commit()
@@ -369,7 +299,6 @@ def _sqlite_analysis_with_mixed_evidence(monkeypatch):
     artifact_ids = [artifact.id for artifact in artifacts]
     db.close()
     return analysis_id, artifact_ids
-
 
 def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkeypatch):
     analysis_id, artifact_ids = _sqlite_analysis_with_mixed_evidence(monkeypatch)
@@ -392,7 +321,6 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
 
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
-    # The overall analysis still succeeds normally.
     session_factory = analysis_task.sessionLocal
     db = session_factory()
     try:
@@ -401,14 +329,10 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
     finally:
         db.close()
 
-    # investigation_result is the single authoritative final SSE event -
-    # published exactly once for this analysis.
     assert len(investigation_results) == 1
     payload = investigation_results[0]
     assert payload["investigation_path"] == "correlated"
 
-    # The real evidence from the two contributing artifacts
-    # is untouched - correlated normally, not diluted by the zero-evidence one.
     assert payload["evidence_count"] == 2
     assert payload["evidence_artifact_count"] == 2
 
@@ -423,8 +347,6 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
     assert outcome_by_id[otel_id]["evidence_count"] == 1
     assert "message" not in outcome_by_id[otel_id]
 
-    # Zero-evidence artifact reported neutrally, never as
-    # failed/unsupported/unrelated.
     zero = outcome_by_id[random_id]
     assert zero["source_file"] == "random.log"
     assert zero["evidence_count"] == 0
@@ -434,18 +356,10 @@ def test_finalize_publishes_artifact_outcomes_for_mixed_evidence_analysis(monkey
     )
     assert "unrelated" not in zero["message"].lower()
 
-    # Existing SSE progress semantics (never 100) untouched.
     assert 100 not in published_progress
     assert published_progress
 
-
 def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
-    """When NO artifact produced any evidence at all, the
-    existing early-return "no meaningful diagnostic evidence found" path
-    must still fire, publishing the zero_evidence-shaped investigation_result
-    (never a correlated-shaped one) - this task only adds per-artifact
-    outcomes to the CORRELATED payload, it does not invent one for the
-    whole-analysis-zero-evidence path."""
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
@@ -492,18 +406,11 @@ def test_finalize_zero_evidence_whole_analysis_path_is_unchanged(monkeypatch):
     finally:
         db.close()
 
-
-# --- unsupported/duplicate outcomes, all four distinguishable in one shape -
-
-
 def test_all_four_outcome_kinds_are_distinguishable_in_the_simple_payload():
-    """Part 3: processed-with-evidence, processed-zero-evidence, unsupported,
-    and duplicate must each carry the correct filename/message and be
-    unambiguously distinguishable by `status`."""
     rows = [_evidence(1, artifact_id=1, source_format="web_server")]
     artifacts = [
-        _artifact_row(1, "nginx.log", "web_server"),  # processed, has evidence
-        _artifact_row(2, "random.log", "generic"),  # processed, zero evidence
+        _artifact_row(1, "nginx.log", "web_server"),
+        _artifact_row(2, "random.log", "generic"),
         _artifact_row(3, "something.xyz", None, status="unsupported"),
         _artifact_row(
             4, "nginx-copy.log", "web_server", status="duplicate",
@@ -539,11 +446,9 @@ def test_all_four_outcome_kinds_are_distinguishable_in_the_simple_payload():
     assert duplicate["duplicate_of_source_file"] == "nginx.log"
     assert "nginx.log" in duplicate["message"]
 
-    # Every status is a distinct, unambiguous value.
     assert {o["status"] for o in payload["artifacts"]} == {
         "processed", "unsupported", "duplicate",
     }
-
 
 def test_unsupported_and_duplicate_outcomes_available_in_correlated_payload():
     base = datetime.now(timezone.utc)
@@ -568,10 +473,8 @@ def test_unsupported_and_duplicate_outcomes_available_in_correlated_payload():
     assert outcome_by_id[103]["status"] == "unsupported"
     assert outcome_by_id[104]["status"] == "duplicate"
     assert outcome_by_id[104]["duplicate_of_source_file"] == "nginx.log"
-    # Correlation itself is untouched by outcome bookkeeping.
     assert payload["evidence_count"] == 2
     assert payload["component_count"] == 1
-
 
 def test_unsupported_and_duplicate_outcomes_available_in_zero_evidence_payload():
     artifacts = [
@@ -590,13 +493,7 @@ def test_unsupported_and_duplicate_outcomes_available_in_zero_evidence_payload()
     assert outcome_by_id[3]["status"] == "duplicate"
     assert outcome_by_id[3]["duplicate_of_source_file"] == "random.log"
 
-
 def test_duplicate_never_counts_as_evidence_or_strengthens_correlation():
-    """5. Even if a duplicate row's evidence_count were somehow non-zero
-    (it never is in production, since duplicates are never dispatched for
-    ingestion), the outcome payload hardcodes 0 for duplicates - they must
-    never be able to inflate evidence_count/correlation weight through
-    this contract."""
     rows = [_evidence(1, artifact_id=1, source_format="web_server")]
     artifacts = [
         _artifact_row(1, "nginx.log", "web_server"),
@@ -607,5 +504,5 @@ def test_duplicate_never_counts_as_evidence_or_strengthens_correlation():
 
     duplicate = next(a for a in payload["artifacts"] if a["artifact_id"] == 2)
     assert duplicate["evidence_count"] == 0
-    assert payload["evidence_count"] == 1  # only the real, canonical evidence
+    assert payload["evidence_count"] == 1
     assert payload["evidence_artifact_count"] == 1

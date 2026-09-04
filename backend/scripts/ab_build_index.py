@@ -17,14 +17,12 @@ from app.services.source_index import (
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ROOT = SCRATCH / "synthetic_extracted"
 
-
 @dataclass
 class BenchIndex:
     root: Path
     by_path: dict[str, SourceFile] = field(default_factory=dict)
     by_suffix: dict[str, list[str]] = field(default_factory=dict)
     by_stem: dict[str, list[str]] = field(default_factory=dict)
-
 
 def old_build_index(root: Path) -> BenchIndex:
     index = BenchIndex(root=root)
@@ -42,7 +40,6 @@ def old_build_index(root: Path) -> BenchIndex:
             for start in range(len(parts) - 1):
                 index.by_suffix.setdefault("/".join(parts[start + 1:]), []).append(relative_path)
     return index
-
 
 def new_build_index(root: Path) -> BenchIndex:
     index = BenchIndex(root=root)
@@ -66,12 +63,10 @@ def new_build_index(root: Path) -> BenchIndex:
                 index.by_suffix.setdefault("/".join(parts[start + 1:]), []).append(relative_path)
     return index
 
-
 def _assert_equivalent(old: BenchIndex, new: BenchIndex) -> None:
     assert old.by_path == new.by_path
     assert old.by_suffix == new.by_suffix
     assert old.by_stem == new.by_stem
-
 
 def main() -> None:
     _assert_equivalent(old_build_index(ROOT), new_build_index(ROOT))
@@ -95,7 +90,6 @@ def main() -> None:
     delta = old_median - new_median
     percent = delta / old_median * 100 if old_median else 0.0
     print(f"\ndelta: {delta:+.4f}s ({percent:+.1f}%)")
-
 
 if __name__ == "__main__":
     main()

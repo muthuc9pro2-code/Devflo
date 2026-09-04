@@ -29,7 +29,6 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 VERIFICATION_HANDOFF_COOKIE_PATH = "/auth/verification-session"
 logger = logging.getLogger(__name__)
 
-
 def _set_verification_handoff_cookie(
     response: Response,
     email: str,
@@ -45,7 +44,6 @@ def _set_verification_handoff_cookie(
         path=VERIFICATION_HANDOFF_COOKIE_PATH,
     )
 
-
 def _delete_verification_handoff_cookie(response: Response) -> None:
     response.delete_cookie(
         key="verification_handoff",
@@ -55,17 +53,14 @@ def _delete_verification_handoff_cookie(response: Response) -> None:
         samesite="lax",
     )
 
-
 def _delete_auth_cookies(response: Response) -> None:
     response.delete_cookie(key="access_token", path="/")
     response.delete_cookie(key="refresh_token", path="/")
-
 
 def _refresh_rejection(detail: str) -> JSONResponse:
     response = JSONResponse(status_code=401, content={"detail": detail})
     _delete_auth_cookies(response)
     return response
-
 
 def _send_verification_email_or_503(email: str, token: str) -> None:
     try:
@@ -77,21 +72,11 @@ def _send_verification_email_or_503(email: str, token: str) -> None:
             detail="Unable to send verification email. Please try again.",
         ) from None
 
-
 def _send_password_reset_email_background(email: str, token: str) -> None:
-    """Runs after the neutral /forgot-password response has already been
-    sent (see BackgroundTasks usage below) - never inline in the request
-    path. The email provider's round-trip latency (whether it succeeds,
-    fails, or is skipped entirely because no account matched) must never
-    be observable in how long the HTTP response itself takes: that timing
-    is exactly the side channel an attacker could otherwise use to
-    enumerate which email addresses have an account, defeating the whole
-    point of the response's identical wording for every input."""
     try:
         send_password_reset_email(email=email, token=token)
     except ResendError:
         logger.error("Password reset email delivery failed")
-
 
 @router.post("/register", response_model=RegisterResponse)
 def register(
@@ -158,7 +143,6 @@ def register(
         "email": created_user.email
     }
 
-
 @router.post("/verify-email")
 def verify_email(
     request: VerifyEmailRequest,
@@ -194,7 +178,6 @@ def verify_email(
     db.commit()
 
     return {"message": "Email verified successfully"}
-
 
 @router.post("/verification-session")
 def complete_verification_session(
@@ -269,7 +252,6 @@ def complete_verification_session(
 
     return {"status": "authenticated"}
 
-
 @router.post("/login", response_model=LoginResponse)
 def login(
     response: Response,
@@ -310,7 +292,6 @@ def login(
     _delete_verification_handoff_cookie(response)
 
     return {"message": "Login successful"}
-
 
 @router.post("/refresh")
 def refresh_token(request: Request, response: Response, db: Session = Depends(get_db)):
@@ -385,8 +366,6 @@ def forgot_password(
 
     if user and user.is_verified:
         reset_token = create_password_reset_token(user.email, user.token_version)
-        # Backgrounded so the email provider's latency never leaks into
-        # this response's timing (see _send_password_reset_email_background).
         background_tasks.add_task(
             _send_password_reset_email_background,
             email=user.email,
@@ -461,11 +440,6 @@ def reset_password_status(
     request: ResetPasswordStatusRequest,
     db: Session = Depends(get_db),
 ):
-    """Read-only classification for a password-reset link, used purely to
-    drive frontend UX (e.g. an already-used link should show the success
-    screen instead of a password form). Never authorizes or performs a
-    reset - POST /auth/reset-password independently re-validates
-    everything from scratch."""
     try:
         payload = decode_password_reset_token(request.token)
     except (jwt.PyJWTError, ValueError):

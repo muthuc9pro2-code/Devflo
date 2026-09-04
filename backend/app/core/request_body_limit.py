@@ -1,11 +1,8 @@
 from collections.abc import Awaitable, Callable
 from typing import Any
-
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
-
 from app.core.processing_config import ANALYSIS_REQUEST_BODY_LIMIT_DETAIL
-
 
 class _RequestBodyLimitExceeded(HTTPException):
     def __init__(self) -> None:
@@ -14,18 +11,7 @@ class _RequestBodyLimitExceeded(HTTPException):
             detail=ANALYSIS_REQUEST_BODY_LIMIT_DETAIL,
         )
 
-
 class RequestBodyLimitMiddleware:
-    """Bound the raw body of one expensive HTTP upload route.
-
-    Content-Length is used for an immediate rejection when available, but the
-    ASGI receive stream is also counted so chunked requests or a dishonest
-    Content-Length cannot bypass the ceiling.
-
-    The middleware runs before FastAPI's multipart parser, so the parser cannot
-    first spool an arbitrarily large upload and only then discover Devflo's
-    application-level size limits.
-    """
 
     def __init__(
         self,
@@ -76,7 +62,6 @@ class RequestBodyLimitMiddleware:
             content={"detail": ANALYSIS_REQUEST_BODY_LIMIT_DETAIL},
         )
         await response(scope, receive, send)
-
 
 def _content_length(scope) -> int | None:
     for name, value in scope.get("headers", []):

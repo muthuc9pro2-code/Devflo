@@ -84,18 +84,12 @@ def detect_artifact_stream(stream: BinaryIO, *, filename: str | None=None, mime_
 
 _ROTATION_SUFFIX_PATTERN = re.compile(r"^\.\d+$")
 
-
 def _effective_suffix(filename: str) -> str:
-    """A purely numeric trailing suffix (access.log.1, error.log.2 - the
-    standard rotated-log naming convention) is not itself a format marker;
-    it shadows the real one. Falls back to the suffix before it so rotated
-    logs are recognized the same way their unrotated original would be."""
     path = Path(filename or "")
     suffixes = path.suffixes
     if len(suffixes) > 1 and _ROTATION_SUFFIX_PATTERN.match(suffixes[-1]):
         return suffixes[-2].lower()
     return path.suffix.lower()
-
 
 def _sample_is_text_like(sample: bytes) -> bool:
     if not sample or b"\x00" in sample:
@@ -105,7 +99,6 @@ def _sample_is_text_like(sample: bytes) -> bool:
     except UnicodeDecodeError:
         return False
     return True
-
 
 def is_supported_diagnostic_sample(
     sample: bytes,

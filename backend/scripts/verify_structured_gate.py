@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import dataclasses
 import sys
 from pathlib import Path
@@ -21,10 +19,8 @@ FORMAT_FIXTURES = {
 
 _real_gate = structured_event_may_be_important
 
-
 def _always_important(_data, inherited=None):
     return True
-
 
 def _as_dict(event) -> dict:
     if event is None:
@@ -33,7 +29,6 @@ def _as_dict(event) -> dict:
     data.pop("fingerprint", None)
     return data
 
-
 def _is_genuinely_unimportant(event) -> bool:
     if event is None:
         return True
@@ -41,7 +36,6 @@ def _is_genuinely_unimportant(event) -> bool:
         event.trace_id is not None or event.span_id is not None
     )
     return event.level not in IMPORTANT_LEVELS and not has_otel_identity
-
 
 def check_format(name: str, fixture_path: Path) -> tuple[int, int]:
     artifact_format = detect_artifact(fixture_path, filename=fixture_path.name)
@@ -85,7 +79,6 @@ def check_format(name: str, fixture_path: Path) -> tuple[int, int]:
                     print(f"    {key}: gated={gated_d[key]!r} ungated={ungated_d.get(key)!r}")
     return mismatches, evidence_loss
 
-
 ADVERSARIAL_CASES = [
     {"level": "INFO", "message": "all good"},
     {"level": "info", "message": "all good"},
@@ -109,7 +102,6 @@ ADVERSARIAL_CASES = [
     {"message": "plain message mentioning error nonetheless"},
     {"body": "raw body text status 200"},
 ]
-
 
 def main() -> int:
     total_mismatches = 0
@@ -140,7 +132,6 @@ def main() -> int:
         f"adversarial_total={len(ADVERSARIAL_CASES)} adversarial_violations={adversarial_violations}"
     )
     return 1 if (total_mismatches or total_loss or adversarial_violations) else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

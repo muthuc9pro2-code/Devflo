@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import sys
 from pathlib import Path
 
@@ -30,7 +29,6 @@ STRUCTURED_FORMATS = {
     "browser": "browser_10mib.har",
 }
 
-
 def measure_text(name: str, fixture_name: str) -> None:
     path = FIXTURE_DIR / fixture_name
     fmt = detect_artifact(path, filename=path.name)
@@ -51,7 +49,6 @@ def measure_text(name: str, fixture_name: str) -> None:
     total = counts["true"] + counts["false"]
     fast_pct = counts["false"] / total * 100 if total else 0.0
     print(f"{name:<14} records={len(records):<8} gate_calls={total:<8} fast_reject={counts['false']:<8} ({fast_pct:.1f}%) sent_to_full_parse={counts['true']:<8} ({100 - fast_pct:.1f}%)")
-
 
 def measure_structured(name: str, fixture_name: str) -> None:
     path = FIXTURE_DIR / fixture_name
@@ -74,13 +71,11 @@ def measure_structured(name: str, fixture_name: str) -> None:
     fast_pct = counts["false"] / total * 100 if total else 0.0
     print(f"{name:<14} records={len(records):<8} gate_calls={total:<8} fast_reject={counts['false']:<8} ({fast_pct:.1f}%) sent_to_full_parse={counts['true']:<8} ({100 - fast_pct:.1f}%)")
 
-
 def measure_ungated(name: str, fixture_name: str) -> None:
     path = FIXTURE_DIR / fixture_name
     fmt = detect_artifact(path, filename=path.name)
     records = list(da.stream_artifact_events(file_path=str(path), artifact_format=fmt, source_file=path.name))
     print(f"{name:<14} records={len(records):<8} no retention gate (100% sent to full parse by design)")
-
 
 for name, fixture in GATED_FORMATS.items():
     measure_text(name, fixture)

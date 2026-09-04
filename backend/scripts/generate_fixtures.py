@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -13,12 +11,8 @@ HOSTS = [f"host-{i}" for i in range(8)]
 ENDPOINTS = ["/orders", "/health", "/checkout", "/cart", "/products/{id}", "/users/{id}"]
 EXCEPTIONS = ["ConnectionError", "TimeoutError", "ValueError", "LookupError", "RuntimeError"]
 
-
 def _target_bytes(size_mib: float) -> int:
     return int(size_mib * 1024 * 1024)
-
-
-
 
 def gen_web_server(size_mib: float) -> bytes:
     lines = []
@@ -46,7 +40,6 @@ def gen_web_server(size_mib: float) -> bytes:
         total += len(line)
     return "".join(lines).encode()
 
-
 def gen_syslog(size_mib: float) -> bytes:
     lines = []
     target = _target_bytes(size_mib)
@@ -67,7 +60,6 @@ def gen_syslog(size_mib: float) -> bytes:
         lines.append(line)
         total += len(line)
     return "".join(lines).encode()
-
 
 def gen_container(size_mib: float) -> bytes:
     lines = []
@@ -92,7 +84,6 @@ def gen_container(size_mib: float) -> bytes:
         total += len(line)
     return "".join(lines).encode()
 
-
 def gen_database(size_mib: float) -> bytes:
     blocks = []
     target = _target_bytes(size_mib)
@@ -112,7 +103,6 @@ def gen_database(size_mib: float) -> bytes:
         total += len(block)
     return "".join(blocks).encode()
 
-
 def gen_ci_cd(size_mib: float) -> bytes:
     lines = []
     target = _target_bytes(size_mib)
@@ -130,7 +120,6 @@ def gen_ci_cd(size_mib: float) -> bytes:
         lines.append(line)
         total += len(line)
     return "".join(lines).encode()
-
 
 def gen_message_broker(size_mib: float) -> bytes:
     lines = []
@@ -153,7 +142,6 @@ def gen_message_broker(size_mib: float) -> bytes:
         lines.append(line)
         total += len(line)
     return "".join(lines).encode()
-
 
 def gen_serverless(size_mib: float) -> bytes:
     lines = []
@@ -181,7 +169,6 @@ def gen_serverless(size_mib: float) -> bytes:
         total += len(chunk)
     return "".join(lines).encode()
 
-
 def gen_cloud_gateway(size_mib: float) -> bytes:
     lines = []
     target = _target_bytes(size_mib)
@@ -200,7 +187,6 @@ def gen_cloud_gateway(size_mib: float) -> bytes:
         lines.append(line)
         total += len(line)
     return "".join(lines).encode()
-
 
 def gen_stack_trace(size_mib: float) -> bytes:
     blocks = []
@@ -222,7 +208,6 @@ def gen_stack_trace(size_mib: float) -> bytes:
         blocks.append(block)
         total += len(block)
     return "".join(blocks).encode()
-
 
 def gen_generic(size_mib: float) -> bytes:
     lines = []
@@ -263,7 +248,6 @@ def gen_generic(size_mib: float) -> bytes:
         total += len(line)
     return "".join(lines).encode()
 
-
 def gen_json_lines(size_mib: float) -> bytes:
     lines = []
     target = _target_bytes(size_mib)
@@ -287,9 +271,6 @@ def gen_json_lines(size_mib: float) -> bytes:
         lines.append(line)
         total += len(line)
     return "".join(lines).encode()
-
-
-
 
 def gen_otlp(size_mib: float) -> bytes:
     target = _target_bytes(size_mib)
@@ -357,7 +338,6 @@ def gen_otlp(size_mib: float) -> bytes:
     }
     return json.dumps(document).encode()
 
-
 def gen_browser_har(size_mib: float) -> bytes:
     target = _target_bytes(size_mib)
     entries = []
@@ -378,7 +358,6 @@ def gen_browser_har(size_mib: float) -> bytes:
         )
     document = {"log": {"version": "1.2", "entries": entries}}
     return json.dumps(document).encode()
-
 
 GENERATORS = {
     "generic": gen_generic,
@@ -412,7 +391,6 @@ EXTENSIONS = {
     "opentelemetry": "json",
 }
 
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--size-mib", type=float, default=10)
@@ -433,7 +411,6 @@ def main() -> int:
         print(f"{name}: {len(data):,} bytes -> {out_path}")
 
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

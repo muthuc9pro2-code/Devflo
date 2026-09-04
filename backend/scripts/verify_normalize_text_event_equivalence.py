@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import dataclasses
 import random
 import sys
@@ -11,7 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app.services.diagnostic_parser as dp
 
 new_normalize_text_event = dp.normalize_text_event
-
 
 def old_normalize_text_event(raw_text, line_number, *, source_file=None, source_format=None, defaults=None):
     defaults = defaults or {}
@@ -71,7 +68,6 @@ def old_normalize_text_event(raw_text, line_number, *, source_file=None, source_
         source_format=source_format,
     )
 
-
 RAW_TEXTS = [
     "GET /orders status=503 RuntimeError: failed",
     "plain informational text with no fields",
@@ -102,12 +98,10 @@ EXCEPTION_TYPE_VALUES = [None, "ConnectionError", ""]
 EXCEPTION_MESSAGE_VALUES = [None, "boom", ""]
 HTTP_STATUS_VALUES = [None, 200, 404, 502, "503"]
 
-
 def _as_dict(event) -> dict:
     data = dataclasses.asdict(event)
     data.pop("fingerprint", None)
     return data
-
 
 def main() -> int:
     rng = random.Random(9182736)
@@ -161,7 +155,6 @@ def main() -> int:
 
     print(f"\nchecked={checked} mismatches={mismatches}")
     return 1 if mismatches else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

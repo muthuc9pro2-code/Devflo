@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -21,7 +19,6 @@ FIXTURE_PATH = Path(__file__).resolve().parents[1] / "tests/fixtures/bench/gener
 BENCH_USERNAME = "__bench_pipeline__"
 BENCH_EMAIL = "bench-pipeline@example.invalid"
 
-
 def _get_or_create_bench_user(db) -> User:
     user = db.query(User).filter(User.username == BENCH_USERNAME).first()
     if user is not None:
@@ -36,7 +33,6 @@ def _get_or_create_bench_user(db) -> User:
     db.commit()
     db.refresh(user)
     return user
-
 
 def _reset_analysis(db, user_id: int) -> int:
 
@@ -79,7 +75,6 @@ def _reset_analysis(db, user_id: int) -> int:
     db.commit()
     return analysis.id
 
-
 class _StageCapture(logging.Handler):
 
     def __init__(self):
@@ -100,7 +95,6 @@ class _StageCapture(logging.Handler):
             self.stages["total"] = float(args[-1])
         elif "artifact_position=" in msg:
             self.artifact_lines.append(args)
-
 
 def _evidence_signature(db, analysis_id: int) -> tuple[int, str]:
     rows = (
@@ -129,7 +123,6 @@ def _evidence_signature(db, analysis_id: int) -> tuple[int, str]:
     for row in rows:
         digest.update(json.dumps(dict(row), sort_keys=True, default=str).encode())
     return len(rows), digest.hexdigest()
-
 
 def run_full(iterations: int) -> None:
     from app.tasks.analysis import process_analysis
@@ -187,7 +180,6 @@ def run_full(iterations: int) -> None:
     hashes = {it["evidence_hash"] for it in per_iteration}
     print(f"evidence_count consistent: {counts if len(counts) > 1 else counts.pop()}")
     print(f"evidence_hash consistent: {len(hashes) == 1} ({next(iter(hashes))[:16]}...)")
-
 
 def run_cpu_only(iterations: int) -> None:
 
@@ -279,7 +271,6 @@ def run_cpu_only(iterations: int) -> None:
     print(f"normalized: {results[-1]['normalized']}")
     print(f"important: {results[-1]['important']}")
 
-
 def run_profile() -> None:
     import cProfile
     import pstats
@@ -305,7 +296,6 @@ def run_profile() -> None:
     print(f"records: {len(records)}")
     stats = pstats.Stats(profiler).sort_stats("cumulative")
     stats.print_stats(25)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

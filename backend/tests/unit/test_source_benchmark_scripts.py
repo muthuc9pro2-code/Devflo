@@ -1,9 +1,7 @@
 from pathlib import Path
-
 from app.services.log_praser import ParsedEvent, StackFrame
 from app.services.source_index import build_index
 from scripts import ab_build_index, ab_correlate
-
 
 def test_historical_build_index_ab_script_is_decoupled_from_production_source_index(
     tmp_path,
@@ -20,7 +18,6 @@ def test_historical_build_index_ab_script_is_decoupled_from_production_source_in
     assert set(old.by_path) == {"x/a/main.py", "y/b/worker.py"}
     assert old.by_suffix == new.by_suffix
     assert old.by_stem == new.by_stem
-
 
 def test_historical_correlate_ab_script_uses_same_legacy_matcher_on_both_sides(
     tmp_path,

@@ -1,17 +1,14 @@
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.api import analysis as analysis_api
 from app.crud.analysis import ActiveAnalysisLimitReached
 from app.db.database import Base
 from app.models import Analysis, User
-
 
 def test_multiple_files_are_streamed_into_one_analysis(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=17, artifacts=[]))
@@ -37,7 +34,6 @@ def test_multiple_files_are_streamed_into_one_analysis(tmp_path, monkeypatch):
     )
     task.delay.assert_called_once_with(17)
 
-
 def test_direct_single_file_call_remains_compatible(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=18, artifacts=[]))
     task = Mock()
@@ -56,7 +52,6 @@ def test_direct_single_file_call_remains_compatible(tmp_path, monkeypatch):
     assert [row["original_filename"] for row in rows] == ["single.txt"]
     task.delay.assert_called_once_with(18)
 
-
 def test_combined_upload_limit_cleans_partial_files(tmp_path, monkeypatch):
     create_analysis = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -74,7 +69,6 @@ def test_combined_upload_limit_cleans_partial_files(tmp_path, monkeypatch):
     assert error.value.status_code == 413
     assert list(tmp_path.iterdir()) == []
     create_analysis.assert_not_called()
-
 
 def test_optional_github_source_is_canonicalized_separately(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=19, artifacts=[]))
@@ -101,7 +95,6 @@ def test_optional_github_source_is_canonicalized_separately(tmp_path, monkeypatc
         "diagnostic.log"
     ]
 
-
 def test_optional_source_zip_is_staged_but_not_a_diagnostic_artifact(
     tmp_path, monkeypatch
 ):
@@ -125,7 +118,6 @@ def test_optional_source_zip_is_staged_but_not_a_diagnostic_artifact(
     assert kwargs["source_reference"].endswith("_source.zip")
     validate.assert_called_once()
 
-
 def test_github_and_source_zip_are_mutually_exclusive(tmp_path, monkeypatch):
     create_analysis = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -144,16 +136,9 @@ def test_github_and_source_zip_are_mutually_exclusive(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
     create_analysis.assert_not_called()
 
-
 def test_oversized_source_zip_degrades_source_but_still_processes_diagnostics(
     tmp_path, monkeypatch
 ):
-    """Source ZIP is OPTIONAL enrichment - a controlled failure detected
-    synchronously at upload time (oversized here) must not abort otherwise-
-    valid diagnostic artifacts. The request succeeds, source_kind still
-    records what was attempted, source_status is "unavailable" with a safe
-    reason, and the invalid staged ZIP is reclaimed - but the diagnostic
-    artifact remains staged and dispatched normally."""
     create_analysis = Mock(return_value=SimpleNamespace(id=24, artifacts=[]))
     task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -184,16 +169,9 @@ def test_oversized_source_zip_degrades_source_but_still_processes_diagnostics(
     assert not any(name.endswith("_source.zip") for name in remaining)
     assert any(name.endswith("diagnostic.log") for name in remaining)
 
-
 def test_invalid_github_url_degrades_source_but_still_processes_diagnostics(
     tmp_path, monkeypatch
 ):
-    """Same optional-source degradation as the ZIP case, for a malformed
-    GitHub URL rejected synchronously by validate_github_url() - a
-    malformed URL Devflo can reliably detect without ever attempting to
-    reach GitHub gets its own distinct wording, deliberately different
-    from a later genuine access/clone failure (see
-    test_source_correlation_outcome.py for that async-path case)."""
     create_analysis = Mock(return_value=SimpleNamespace(id=25, artifacts=[]))
     task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -216,14 +194,9 @@ def test_invalid_github_url_degrades_source_but_still_processes_diagnostics(
     assert [row["original_filename"] for row in kwargs["artifacts"]] == ["diagnostic.log"]
     task.delay.assert_called_once_with(25)
 
-
 def test_unexpected_source_exception_remains_fatal_and_is_not_degraded(
     tmp_path, monkeypatch
 ):
-    """Only controlled SourceInputError/UploadTooLarge failures degrade to
-    source_status="unavailable" - an unexpected internal exception (a
-    programming bug, an infrastructure failure) raised from source
-    validation must still abort the whole request, exactly like before."""
     create_analysis = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
@@ -241,7 +214,6 @@ def test_unexpected_source_exception_remains_fatal_and_is_not_degraded(
 
     create_analysis.assert_not_called()
     assert list(tmp_path.iterdir()) == []
-
 
 def test_unsupported_binary_artifact_is_rejected_before_celery(tmp_path, monkeypatch):
     create_analysis = Mock()
@@ -265,14 +237,9 @@ def test_unsupported_binary_artifact_is_rejected_before_celery(tmp_path, monkeyp
     task.delay.assert_not_called()
     assert list(tmp_path.iterdir()) == []
 
-
 def test_mixed_batch_persists_unsupported_artifact_and_still_processes_the_rest(
     tmp_path, monkeypatch
 ):
-    """A batch with both a valid and an unsupported file must not lose the
-    valid one - the unsupported file is recorded (status="unsupported",
-    source_format None) so the frontend can report it, not silently
-    dropped and not aborting artifacts that ARE usable."""
     create_analysis = Mock(return_value=SimpleNamespace(id=22, artifacts=[]))
     task = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -295,7 +262,6 @@ def test_mixed_batch_persists_unsupported_artifact_and_still_processes_the_rest(
     assert rows[1]["detected_format"] is None
     assert rows[1]["status"] == "unsupported"
     task.delay.assert_called_once_with(22)
-
 
 def test_all_unsupported_multi_file_batch_still_rejects_the_whole_request(
     tmp_path, monkeypatch
@@ -322,7 +288,6 @@ def test_all_unsupported_multi_file_batch_still_rejects_the_whole_request(
     task.delay.assert_not_called()
     assert list(tmp_path.iterdir()) == []
 
-
 def test_identical_content_different_filenames_share_the_same_content_hash(
     tmp_path, monkeypatch
 ):
@@ -343,15 +308,12 @@ def test_identical_content_different_filenames_share_the_same_content_hash(
     assert rows[0]["content_sha256"] == rows[1]["content_sha256"]
     assert rows[0]["content_sha256"] is not None
 
-
 def test_generic_log_with_no_error_in_first_bytes_is_accepted(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=21, artifacts=[]))
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
     monkeypatch.setattr(analysis_api, "process_analysis", Mock())
 
-    # Plenty of ordinary INFO/startup noise up front; the only failure would
-    # show up far later than a bounded detection sample could ever see.
     content = ("INFO startup ok\n" * 5000).encode() + b"ERROR late failure\n"
 
     result = analysis_api.upload_file(
@@ -362,7 +324,6 @@ def test_generic_log_with_no_error_in_first_bytes_is_accepted(tmp_path, monkeypa
 
     assert result.id == 21
     create_analysis.assert_called_once()
-
 
 def test_active_analysis_quota_preflight_maps_to_429(monkeypatch):
     monkeypatch.setattr(
@@ -377,7 +338,6 @@ def test_active_analysis_quota_preflight_maps_to_429(monkeypatch):
 
     assert error.value.status_code == 429
     assert "3 active investigations" in error.value.detail
-
 
 def test_active_analysis_quota_race_cleans_staged_bytes_and_never_dispatches(
     tmp_path, monkeypatch
@@ -400,17 +360,9 @@ def test_active_analysis_quota_race_cleans_staged_bytes_and_never_dispatches(
     assert list(tmp_path.iterdir()) == []
     task.delay.assert_not_called()
 
-
 def test_post_commit_refresh_failure_preserves_staged_inputs_for_recovery(
     tmp_path, monkeypatch
 ):
-    """A DB outage after create_analysis() commits must not make the upload
-    path delete inputs that the durably-pending Analysis still needs.
-
-    This reproduces the exact boundary: Analysis + Artifact rows commit, the
-    immediately-following refresh fails, the HTTP call fails, but both the
-    durable rows and staged diagnostic bytes remain for Beat recovery.
-    """
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
@@ -443,8 +395,6 @@ def test_post_commit_refresh_failure_preserves_staged_inputs_for_recovery(
     refresh.assert_called_once()
     task.delay.assert_not_called()
 
-    # Use a different DB session to prove this is genuinely durable state,
-    # not merely objects still hanging around in the request Session.
     verify_db = session_factory()
     try:
         created = verify_db.query(Analysis).one()
@@ -456,7 +406,6 @@ def test_post_commit_refresh_failure_preserves_staged_inputs_for_recovery(
     finally:
         verify_db.close()
         db.close()
-
 
 def _upload(filename: str, content: bytes):
     return SimpleNamespace(

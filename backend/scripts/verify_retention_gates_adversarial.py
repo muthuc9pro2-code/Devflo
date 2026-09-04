@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import sys
 from pathlib import Path
 
@@ -84,7 +82,6 @@ CASES: dict[ArtifactFormat, list[str]] = {
     ],
 }
 
-
 def normalize_for(artifact_format: ArtifactFormat, raw_text: str):
     if artifact_format == ArtifactFormat.WEB_SERVER:
         return da._normalize_web_event(raw_text, 1, "f")
@@ -114,7 +111,6 @@ def normalize_for(artifact_format: ArtifactFormat, raw_text: str):
         return da.normalize_text_event(raw_text, 1, source_file="f", source_format="stack_trace", defaults=defaults)
     raise ValueError(artifact_format)
 
-
 def main() -> int:
     total = 0
     violations = 0
@@ -139,7 +135,6 @@ def main() -> int:
 
     print(f"\ntotal={total} violations={violations}")
     return 1 if violations else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

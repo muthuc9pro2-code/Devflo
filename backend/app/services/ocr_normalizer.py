@@ -1,6 +1,5 @@
 import re
 
-
 _UI_NOISE = {
     "PROBLEMS",
     "OUTPUT",
@@ -10,7 +9,6 @@ _UI_NOISE = {
     "TIMELINE",
     "OUTLINE",
 }
-
 
 def normalize_ocr_text(text: str) -> str:
     normalized_lines: list[str] = []

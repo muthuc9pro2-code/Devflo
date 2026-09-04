@@ -1,18 +1,7 @@
-"""RapidOCR confidence propagation: RapidOCR result -> normalized OCR event
--> Evidence -> frontend investigation_result payload -> SIMPLE/CORRELATED
-Gemini context.
-
-Reuses the existing OCR -> normalization -> Evidence architecture end to
-end; no parallel OCR pipeline, no fabricated confidence for anything
-RapidOCR didn't actually score, no fabricated confidence on non-image
-evidence.
-"""
 from datetime import datetime, timezone
 from io import BytesIO
-
 from PIL import Image
 import pytest
-
 from app.models.evidence import Evidence
 from app.services import diagnostic_adapters, evidence_store, image_text_extractor
 from app.services.artifact_detector import ArtifactFormat
@@ -25,18 +14,11 @@ from app.services.investigation_context import (
     build_simple_payload,
 )
 
-
 def _write_tiny_png(path):
-    """A real, tiny, decodable image on disk - item 1's shared
-    validate_ocr_image() now runs inside _run_ocr() itself (defense in
-    depth) before any mocked/real RapidOCR call, so tests exercising
-    _run_ocr()/extract_text_from_image_with_confidence need a genuine
-    file at the given path rather than an arbitrary placeholder string."""
     buffer = BytesIO()
     Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
     path.write_bytes(buffer.getvalue())
     return str(path)
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -56,15 +38,11 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
-# --- image_text_extractor: real RapidOCR confidence, mean-of-lines, no fabrication --
-
-
 def test_extract_with_confidence_reuses_the_same_ocr_call_and_returns_mean_confidence(monkeypatch, tmp_path):
     fake_results = [
         (None, "ERROR something failed", 0.95),
         (None, "  at handler (App.tsx:42)", 0.61),
-        (None, "   ", 0.99),  # blank text after strip -> excluded by the shared OCR extraction path
+        (None, "   ", 0.99),
     ]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
     image_path = _write_tiny_png(tmp_path / "shot.png")
@@ -72,9 +50,7 @@ def test_extract_with_confidence_reuses_the_same_ocr_call_and_returns_mean_confi
     text, confidence = image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
     assert text == "ERROR something failed\nat handler (App.tsx:42)"
-    # mean of the two retained lines' confidences (0.95, 0.61), not min/max/fabricated
     assert confidence == (0.95 + 0.61) / 2
-
 
 def test_extract_with_confidence_preserves_joined_ocr_text(monkeypatch, tmp_path):
     fake_results = [(None, "line one", 0.9), (None, "line two", 0.5)]
@@ -86,9 +62,7 @@ def test_extract_with_confidence_preserves_joined_ocr_text(monkeypatch, tmp_path
     assert text == "line one\nline two"
     assert confidence == pytest.approx(0.7)
 
-
 def test_no_usable_confidence_returns_none_not_fabricated(monkeypatch, tmp_path):
-    # RapidOCR result tuples without a third (confidence) element.
     fake_results = [(None, "some text")]
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: (fake_results, None))
     image_path = _write_tiny_png(tmp_path / "shot.png")
@@ -98,7 +72,6 @@ def test_no_usable_confidence_returns_none_not_fabricated(monkeypatch, tmp_path)
     assert text == "some text"
     assert confidence is None
 
-
 def test_no_ocr_results_at_all_returns_empty_text_and_none_confidence(monkeypatch, tmp_path):
     monkeypatch.setattr(image_text_extractor, "_ocr", lambda path: ([], None))
     image_path = _write_tiny_png(tmp_path / "shot.png")
@@ -107,7 +80,6 @@ def test_no_ocr_results_at_all_returns_empty_text_and_none_confidence(monkeypatc
 
     assert text == ""
     assert confidence is None
-
 
 def test_rapidocr_initialization_failure_is_converted_after_validation(monkeypatch, tmp_path):
     image_path = _write_tiny_png(tmp_path / "shot.png")
@@ -124,7 +96,6 @@ def test_rapidocr_initialization_failure_is_converted_after_validation(monkeypat
     with pytest.raises(image_text_extractor.OcrProcessingError):
         image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
-
 def test_rapidocr_inference_failure_is_converted(monkeypatch, tmp_path):
     image_path = _write_tiny_png(tmp_path / "shot.png")
 
@@ -135,7 +106,6 @@ def test_rapidocr_inference_failure_is_converted(monkeypatch, tmp_path):
 
     with pytest.raises(image_text_extractor.OcrProcessingError):
         image_text_extractor.extract_text_from_image_with_confidence(image_path)
-
 
 @pytest.mark.parametrize(
     "malformed_result",
@@ -159,10 +129,6 @@ def test_malformed_rapidocr_results_are_converted(
     with pytest.raises(image_text_extractor.OcrProcessingError):
         image_text_extractor.extract_text_from_image_with_confidence(image_path)
 
-
-# --- diagnostic_adapters: confidence lands on the ParsedEvent -------------
-
-
 def test_stream_image_events_attaches_real_confidence_to_the_event(monkeypatch, tmp_path):
     monkeypatch.setattr(
         diagnostic_adapters,
@@ -180,7 +146,6 @@ def test_stream_image_events_attaches_real_confidence_to_the_event(monkeypatch, 
     )
 
     assert records[0].event.ocr_confidence == 0.73
-
 
 def test_stream_image_events_preserves_none_confidence(monkeypatch, tmp_path):
     monkeypatch.setattr(
@@ -200,10 +165,7 @@ def test_stream_image_events_preserves_none_confidence(monkeypatch, tmp_path):
 
     assert records[0].event.ocr_confidence is None
 
-
 def test_non_image_text_events_never_carry_a_confidence_value(tmp_path):
-    """Requirement: non-image evidence must remain unchanged / no fake
-    OCR confidence. Runs the real GENERIC text path (not image) end to end."""
     log_path = tmp_path / "app.log"
     log_path.write_text("ERROR something failed\n")
 
@@ -214,10 +176,6 @@ def test_non_image_text_events_never_carry_a_confidence_value(tmp_path):
     )
 
     assert records[0].event.ocr_confidence is None
-
-
-# --- evidence_store: persistence keeps confidence tied to the right row ---
-
 
 def test_persist_evidence_batch_writes_ocr_confidence_only_for_the_image_event():
     captured_rows = {}
@@ -250,10 +208,6 @@ def test_persist_evidence_batch_writes_ocr_confidence_only_for_the_image_event()
     assert rows_by_fingerprint["fp-image"]["ocr_confidence"] == 0.42
     assert rows_by_fingerprint["fp-text"]["ocr_confidence"] is None
 
-
-# --- 5: keep confidence associated with the correct evidence item ---------
-
-
 def test_confidence_stays_attached_to_its_own_evidence_item_not_others():
     rows = [
         _evidence(1, artifact_id=101, source_format="image", source_file="a.png", ocr_confidence=0.9),
@@ -268,17 +222,12 @@ def test_confidence_stays_attached_to_its_own_evidence_item_not_others():
     assert by_id[2]["ocr_confidence"] == 0.2
     assert by_id[3]["ocr_confidence"] is None
 
-
-# --- frontend investigation_result payload ---------------------------------
-
-
 def test_frontend_payload_exposes_ocr_confidence_for_image_evidence():
     rows = [_evidence(1, artifact_id=1, source_format="image", source_file="shot.png", ocr_confidence=0.81)]
 
     payload = build_simple_payload(1, rows)
 
     assert payload["evidence"][0]["ocr_confidence"] == 0.81
-
 
 def test_frontend_payload_leaves_non_image_evidence_confidence_null():
     rows = [_evidence(1, artifact_id=1, source_format="web_server", service="checkout")]
@@ -287,7 +236,6 @@ def test_frontend_payload_leaves_non_image_evidence_confidence_null():
 
     assert "ocr_confidence" in payload["evidence"][0]
     assert payload["evidence"][0]["ocr_confidence"] is None
-
 
 def test_correlated_frontend_payload_exposes_ocr_confidence_on_node_evidence():
     from datetime import timedelta
@@ -308,17 +256,12 @@ def test_correlated_frontend_payload_exposes_ocr_confidence_on_node_evidence():
     other_node = next(n for n in payload["components"][0]["nodes"] if n["artifact_id"] == 101)
     assert other_node["evidence"][0]["ocr_confidence"] is None
 
-
-# --- both Gemini contexts ---------------------------------------------------
-
-
 def test_simple_gemini_context_carries_ocr_confidence():
     rows = [_evidence(1, artifact_id=1, source_format="image", source_file="shot.png", ocr_confidence=0.55)]
 
     context = build_simple_llm_context(1, rows)
 
     assert context["evidence"][0]["ocr_confidence"] == 0.55
-
 
 def test_correlated_gemini_context_carries_ocr_confidence_and_none_for_non_image():
     from datetime import timedelta

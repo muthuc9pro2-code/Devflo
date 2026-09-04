@@ -1,45 +1,23 @@
-"""Upload & OCR resource limits.
-
-MAX_DIAGNOSTIC_ARTIFACTS bounds artifact/task/DB fan-out from a huge batch
-of tiny files; MAX_OCR_IMAGES_PER_INVESTIGATION bounds RapidOCR's own
-CPU-heavy work; MAX_OCR_IMAGE_BYTES/MAX_OCR_IMAGE_PIXELS bound one image's
-compressed size and decoded pixel count. All four are independent of the
-existing, unchanged MAX_INVESTIGATION_UPLOAD_BYTES (1 GiB combined budget).
-
-Proves POST /analysis/upload and the OCR engine use the SAME shared
-validator (image_text_extractor.validate_ocr_image) - no second,
-independently-drifting image validation implementation - and that RapidOCR
-itself is never the first place an oversized/absurd image is discovered.
-"""
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 import pytest
 from fastapi import HTTPException
 from PIL import Image
-
 from app.api import analysis as analysis_api
 from app.core.processing_config import MAX_OCR_IMAGE_PIXELS
 from app.services import image_text_extractor
 
-
 def _upload(filename: str, content: bytes, content_type: str = "text/plain"):
     return SimpleNamespace(filename=filename, content_type=content_type, file=BytesIO(content))
 
-
 def _image_upload(filename: str, content: bytes, content_type: str = "image/png"):
     return _upload(filename, content, content_type=content_type)
-
 
 def _png_bytes(width: int, height: int, mode: str = "RGB") -> bytes:
     buffer = BytesIO()
     Image.new(mode, (width, height), 0).save(buffer, format="PNG")
     return buffer.getvalue()
-
-
-# --- 1-2: MAX_DIAGNOSTIC_ARTIFACTS -----------------------------------------
-
 
 def test_more_than_max_diagnostic_artifacts_is_rejected(tmp_path, monkeypatch):
     create_analysis = Mock()
@@ -56,9 +34,7 @@ def test_more_than_max_diagnostic_artifacts_is_rejected(tmp_path, monkeypatch):
 
     assert error.value.status_code == 413
     create_analysis.assert_not_called()
-    # Rejected before any file was even staged to disk.
     assert list(tmp_path.iterdir()) == []
-
 
 def test_exactly_max_diagnostic_artifacts_is_permitted(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=30, artifacts=[]))
@@ -75,10 +51,6 @@ def test_exactly_max_diagnostic_artifacts_is_permitted(tmp_path, monkeypatch):
 
     assert result.id == 30
     create_analysis.assert_called_once()
-
-
-# --- 3: MAX_OCR_IMAGES_PER_INVESTIGATION -----------------------------------
-
 
 def test_more_than_max_ocr_images_is_rejected(tmp_path, monkeypatch):
     create_analysis = Mock()
@@ -98,7 +70,6 @@ def test_more_than_max_ocr_images_is_rejected(tmp_path, monkeypatch):
     create_analysis.assert_not_called()
     assert list(tmp_path.iterdir()) == []
 
-
 def test_exactly_max_ocr_images_is_permitted(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=33, artifacts=[]))
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -115,15 +86,7 @@ def test_exactly_max_ocr_images_is_permitted(tmp_path, monkeypatch):
 
     assert result.id == 33
 
-
-# --- 4-5: MAX_OCR_IMAGE_BYTES streaming ceiling ----------------------------
-
-
 def test_oversized_image_is_rejected_by_the_streaming_ceiling_before_ocr(tmp_path, monkeypatch):
-    """A large image must not first be fully written to disk before being
-    rejected - the per-file streaming ceiling (copy_upload's own max_bytes)
-    trips mid-stream, well before detect_artifact_sample/validate_ocr_image
-    even run."""
     create_analysis = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
@@ -139,8 +102,7 @@ def test_oversized_image_is_rejected_by_the_streaming_ceiling_before_ocr(tmp_pat
 
     assert error.value.status_code == 413
     create_analysis.assert_not_called()
-    assert list(tmp_path.iterdir()) == []  # cleaned up, never left partially staged
-
+    assert list(tmp_path.iterdir()) == []
 
 def test_image_exactly_at_the_byte_limit_is_accepted(tmp_path, monkeypatch):
     content = _png_bytes(4, 4)
@@ -148,10 +110,6 @@ def test_image_exactly_at_the_byte_limit_is_accepted(tmp_path, monkeypatch):
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
     monkeypatch.setattr(analysis_api, "process_analysis", Mock())
-    # Both the streaming ceiling (analysis.py) and the post-hoc validator
-    # (image_text_extractor.py) read their own imported copy of the
-    # constant - patch both so "exactly at the limit" means the same thing
-    # in each.
     monkeypatch.setattr(analysis_api, "MAX_OCR_IMAGE_BYTES", len(content))
     monkeypatch.setattr(image_text_extractor, "MAX_OCR_IMAGE_BYTES", len(content))
 
@@ -163,21 +121,12 @@ def test_image_exactly_at_the_byte_limit_is_accepted(tmp_path, monkeypatch):
 
     assert result.id == 34
 
-
-# --- 6: MAX_OCR_IMAGE_PIXELS ------------------------------------------------
-
-
 def test_excessive_decoded_pixel_count_is_rejected_before_ocr(tmp_path, monkeypatch):
-    """A small-BYTE-SIZE image with a huge decoded pixel count (well under
-    MAX_OCR_IMAGE_BYTES, so the streaming ceiling alone would never catch
-    it) must still be rejected - proves the real Pillow-based pixel check
-    is a genuine backstop independent of the byte ceiling, and that a
-    disguised/pathological image can never reach RapidOCR."""
     width = 6000
     height = (MAX_OCR_IMAGE_PIXELS // width) + 100
     assert width * height > MAX_OCR_IMAGE_PIXELS
-    content = _png_bytes(width, height, mode="1")  # 1-bit, uniform -> tiny compressed size
-    assert len(content) < analysis_api.MAX_OCR_IMAGE_BYTES  # genuinely a pixel-count test
+    content = _png_bytes(width, height, mode="1")
+    assert len(content) < analysis_api.MAX_OCR_IMAGE_BYTES
 
     create_analysis = Mock()
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
@@ -197,10 +146,6 @@ def test_excessive_decoded_pixel_count_is_rejected_before_ocr(tmp_path, monkeypa
     ocr_spy.assert_not_called()
     assert list(tmp_path.iterdir()) == []
 
-
-# --- 7: a safe image still reaches OCR --------------------------------------
-
-
 def test_safe_small_image_still_reaches_ocr(tmp_path, monkeypatch):
     content = _png_bytes(4, 4)
     path = tmp_path / "safe.png"
@@ -213,10 +158,6 @@ def test_safe_small_image_still_reaches_ocr(tmp_path, monkeypatch):
 
     ocr_spy.assert_called_once_with(str(path))
 
-
-# --- 8: upload path and OCR engine share one validator ---------------------
-
-
 def test_analysis_upload_and_ocr_engine_share_the_same_validator_and_constants():
     assert (
         analysis_api.validate_ocr_image
@@ -226,10 +167,6 @@ def test_analysis_upload_and_ocr_engine_share_the_same_validator_and_constants()
         analysis_api.MAX_OCR_IMAGE_BYTES
         == image_text_extractor.MAX_OCR_IMAGE_BYTES
     )
-
-
-# --- 9: OCR engine call count -----------------------------------------------
-
 
 def test_ocr_engine_called_at_most_once_per_accepted_image(tmp_path, monkeypatch):
     content = _png_bytes(4, 4)
@@ -243,17 +180,11 @@ def test_ocr_engine_called_at_most_once_per_accepted_image(tmp_path, monkeypatch
 
     assert ocr_spy.call_count == 1
 
-
-# --- 10: non-image uploads are not bounded by the image byte cap -----------
-
-
 def test_non_image_upload_is_not_bounded_by_the_ocr_image_byte_cap(tmp_path, monkeypatch):
     create_analysis = Mock(return_value=SimpleNamespace(id=32, artifacts=[]))
     monkeypatch.setattr(analysis_api, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(analysis_api, "create_analysis", create_analysis)
     monkeypatch.setattr(analysis_api, "process_analysis", Mock())
-    # A cap tiny enough that any actual "image" this size would be rejected -
-    # proves a non-image upload is genuinely never subjected to it at all.
     monkeypatch.setattr(analysis_api, "MAX_OCR_IMAGE_BYTES", 4)
 
     content = b"ERROR failure detected in service\n" * 10

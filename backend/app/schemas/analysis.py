@@ -1,7 +1,5 @@
 from datetime import datetime
-
 from pydantic import BaseModel
-
 
 class AnalysisResponse(BaseModel):
     id: int
@@ -10,7 +8,6 @@ class AnalysisResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
-
 
 class AnalysisHistoryItem(BaseModel):
 
@@ -22,7 +19,6 @@ class AnalysisHistoryItem(BaseModel):
     original_filename: str
     title: str | None = None
     summary: str | None = None
-
 
 class AnalysisHistoryPage(BaseModel):
     items: list[AnalysisHistoryItem]

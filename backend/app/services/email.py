@@ -4,7 +4,6 @@ from app.services.email_service import (
     send_verification_email_message,
 )
 
-
 def send_verification_email(email: str, token: str) -> None:
     verification_link = (
         f"{Settings.FRONTEND_URL}/verify-email#token={token}"
@@ -13,7 +12,6 @@ def send_verification_email(email: str, token: str) -> None:
         to_email=email,
         verification_url=verification_link,
     )
-
 
 def send_password_reset_email(email: str, token: str) -> None:
     reset_link = (

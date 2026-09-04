@@ -16,7 +16,6 @@ from app.models.analysis import Analysis
 from app.tasks.analysis import compute_current_analysis_state
 from starlette.concurrency import run_in_threadpool
 
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter()

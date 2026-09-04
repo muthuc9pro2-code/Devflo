@@ -63,7 +63,6 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 router = APIRouter(prefix="/analysis", tags=["Analysis"])
 logger = logging.getLogger(__name__)
 
-
 def _require_analysis_capacity(
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_verified_user)],
@@ -74,7 +73,6 @@ def _require_analysis_capacity(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         detail=str(ActiveAnalysisLimitReached()),
     )
-
 
 @router.post(
     "/upload",
@@ -88,7 +86,6 @@ def upload_file(
     source_zip: Annotated[UploadFile | None, File()] = None,
     _capacity: None = Depends(_require_analysis_capacity),
 ):
-    """Create one investigation from one or more repeated ``file`` parts."""
     uploads = file if isinstance(file, list) else [file]
 
     if not uploads:
@@ -185,12 +182,6 @@ def upload_file(
                 filename=original_filename,
                 mime_type=upload.content_type,
             ):
-                # Unsupported artifacts are recorded (not silently dropped
-                # and not aborting a batch that has other, valid artifacts)
-                # so the frontend can report which file/why via the same
-                # investigation_result.artifacts[] contract as every other
-                # outcome - never dispatched for ingestion, so the bytes
-                # are removed immediately like before.
                 saved_path.unlink(missing_ok=True)
 
                 artifact_rows.append(
@@ -223,13 +214,6 @@ def upload_file(
                         ),
                     )
 
-                # Real size/pixel validation against the file actually
-                # staged on disk - the same shared validator every OCR call
-                # runs (image_text_extractor._run_ocr), so even a disguised
-                # image that escaped the early filename/MIME hint above
-                # cannot reach OCR unvalidated. A resource-invalid image is
-                # an invalid investigation input, not zero-evidence
-                # "unsupported" evidence - the whole request is rejected.
                 try:
                     validate_ocr_image(saved_path)
                 except OcrImageTooLargeError as error:
@@ -315,7 +299,6 @@ def upload_file(
         )
     return analysis
 
-
 @router.get("/history", response_model=AnalysisHistoryPage)
 def get_analysis_history(
     db: Annotated[Session, Depends(get_db)],
@@ -324,19 +307,6 @@ def get_analysis_history(
     limit: int = HISTORY_DEFAULT_LIMIT,
     cursor: str | None = None,
 ) -> AnalysisHistoryPage:
-    """Bounded, keyset-paginated (created_at, id desc) list of only the
-    current user's own analyses. Deliberately cheap and O(page size): no
-    Evidence query, no correlation graph, no result_snapshot
-    deserialization - only the small ai_analysis column (for title/
-    summary) and one grouped artifact-count query, both scoped to exactly
-    the page being returned, never the user's whole history.
-
-    Cancelled analyses are excluded at the query level - not a general
-    History-deletion feature, just the terminal-state equivalent of an
-    upload that never really happened: its generated data was already
-    discarded by cancel_analysis_and_cleanup(). pending/processing/
-    completed/failed are all returned exactly as before.
-    """
     response.headers["Cache-Control"] = "no-store"
     limit = max(1, min(limit, HISTORY_MAX_LIMIT))
 
@@ -407,7 +377,6 @@ def get_analysis_history(
 
     return AnalysisHistoryPage(items=items, next_cursor=next_cursor)
 
-
 @router.get("/{analysis_id}")
 def get_analysis_detail(
     analysis_id: int,
@@ -429,7 +398,6 @@ def get_analysis_detail(
         headers={"Cache-Control": "no-store"},
     )
 
-
 @router.post("/{analysis_id}/cancel")
 def cancel_analysis(
     analysis_id: int,
@@ -445,7 +413,7 @@ def cancel_analysis(
         raise HTTPException(status_code=404, detail="Analysis not found")
 
     if analysis.status == "cancelled":
-        return {"analysis_id": analysis.id, "status": "cancelled"}  # idempotent
+        return {"analysis_id": analysis.id, "status": "cancelled"}
 
     if analysis.status == "completed":
         raise HTTPException(
@@ -463,7 +431,7 @@ def cancel_analysis(
             db.query(Analysis.status).filter(Analysis.id == analysis_id).scalar()
         )
         if current_status == "cancelled":
-            return {"analysis_id": analysis_id, "status": "cancelled"}  # idempotent
+            return {"analysis_id": analysis_id, "status": "cancelled"}
         if current_status == "completed":
             raise HTTPException(
                 status_code=409, detail="Completed analyses cannot be cancelled"
@@ -478,11 +446,9 @@ def cancel_analysis(
 
     return {"analysis_id": analysis_id, "status": "cancelled"}
 
-
 def _encode_history_cursor(created_at: datetime, analysis_id: int) -> str:
     raw = f"{created_at.isoformat()}|{analysis_id}"
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
-
 
 def _decode_history_cursor(cursor: str) -> tuple[datetime, int]:
     try:
@@ -492,18 +458,15 @@ def _decode_history_cursor(cursor: str) -> tuple[datetime, int]:
     except Exception as error:
         raise HTTPException(status_code=400, detail="Invalid history cursor") from error
 
-
 def _safe_original_filename(filename: str | None, position: int) -> str:
     candidate = Path((filename or f"artifact-{position}.txt").replace("\\", "/")).name
     candidate = candidate.replace("\x00", "").strip()
     return (candidate or f"artifact-{position}.txt")[-255:]
 
-
 def _safe_storage_filename(filename: str) -> str:
     return (
         filename.encode("utf-8")[-180:].decode("utf-8", errors="ignore") or "artifact"
     )
-
 
 def _remove_staged_uploads(paths: list[Path]) -> None:
     upload_root = UPLOAD_DIR.resolve()

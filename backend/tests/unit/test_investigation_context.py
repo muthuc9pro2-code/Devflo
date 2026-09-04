@@ -1,17 +1,5 @@
-"""Outward-facing frontend/Gemini contract for investigation_context.py.
-
-These tests run the real, unmodified correlation_engine.py (run_correlation)
-against real Evidence objects, then verify build_correlation_payload() /
-build_llm_context() / build_simple_llm_context() shape that same
-deterministic result into the explicit contract - identity_strength,
-correlation_strength, root_cause_strength kept unambiguous, no generic
-"score"/"strength" leaking into the new contract, and every piece of
-provenance (artifact_id, source_file/format, timestamps, source_matches)
-preserved according to availability, never fabricated.
-"""
 import json
 from datetime import datetime, timedelta, timezone
-
 from app.models.evidence import Evidence
 from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import (
@@ -20,7 +8,6 @@ from app.services.investigation_context import (
     build_llm_context,
     build_simple_llm_context,
 )
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -41,13 +28,7 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
 def _correlated_fixture():
-    """A real, deterministic 3-node causal chain: db (root) -> payment
-    (propagation) -> api (victim), all sharing trace-1, plus a source-code
-    match on the root and a distinct artifact per node - exercises
-    provenance separation, identity, timing, and source_matches together.
-    """
     base = datetime.now(timezone.utc)
     database = _evidence(
         1, artifact_id=101, source_format="database", trace_id="trace-1",
@@ -80,10 +61,6 @@ def _correlated_fixture():
     run = run_correlation(analysis_id=7, evidence_rows=[database, payment, api])
     return run, [database, payment, api]
 
-
-# --- 1/2: explicit strength names, no ambiguous "score" -------------------
-
-
 def test_correlated_frontend_payload_uses_explicit_strength_names():
     run, evidence_rows = _correlated_fixture()
     payload = build_correlation_payload(run, evidence_rows)
@@ -103,15 +80,7 @@ def test_correlated_frontend_payload_uses_explicit_strength_names():
     payload_text = json.dumps(payload)
     assert '"score"' not in payload_text
 
-
 def test_node_carries_its_own_role_and_root_cause_strength():
-    """A node is self-sufficient - the frontend must not have
-    to cross-reference the separate root_causes[] array merely to know
-    whether a node is the root, a propagation step, or a victim.
-    root_causes[] is additionally narrowed to actual role=="root" candidates
-    only, so every node (including propagation/victim ones no longer
-    listed there at all) must still carry its own role/root_cause_strength
-    directly."""
     run, evidence_rows = _correlated_fixture()
     payload = build_correlation_payload(run, evidence_rows)
 
@@ -125,10 +94,8 @@ def test_node_carries_its_own_role_and_root_cause_strength():
     assert "root" in roles.values()
     assert "victim" in roles.values()
 
-    # root_causes[] lists exactly the role=="root" nodes, no more.
     root_node_ids = {node["id"] for node in component["nodes"] if node["role"] == "root"}
     assert root_node_ids == {c["node_id"] for c in component["root_causes"]}
-
 
 def test_correlated_gemini_context_uses_explicit_strength_names():
     run, evidence_rows = _correlated_fixture()
@@ -146,8 +113,7 @@ def test_correlated_gemini_context_uses_explicit_strength_names():
 
     context_text = json.dumps(context)
     assert '"score"' not in context_text
-    assert '"strength":' not in context_text  # bare ambiguous key, not *_strength
-
+    assert '"strength":' not in context_text
 
 def test_identity_strength_survives_where_available():
     run, evidence_rows = _correlated_fixture()
@@ -156,10 +122,6 @@ def test_identity_strength_survives_where_available():
     node_by_id = {node["id"]: node for node in payload["components"][0]["nodes"]}
     payment_node = node_by_id["evidence-2"]
     assert payment_node["identity_strength"] == 1.0
-
-
-# --- 3/4: delta_ms and signals preserved exactly --------------------------
-
 
 def test_delta_ms_and_signals_preserved_from_the_correlation_edge():
     run, evidence_rows = _correlated_fixture()
@@ -174,8 +136,7 @@ def test_delta_ms_and_signals_preserved_from_the_correlation_edge():
         raw = raw_edges[(edge["source_id"], edge["target_id"])]
         assert edge["delta_ms"] == raw.delta_ms
         assert edge["signals"] == [s.value for s in raw.signals]
-        assert edge["signals"]  # a real trace_id-linked chain has real signals
-
+        assert edge["signals"]
 
 def test_delta_ms_preserved_in_gemini_propagation_too():
     run, evidence_rows = _correlated_fixture()
@@ -190,17 +151,13 @@ def test_delta_ms_preserved_in_gemini_propagation_too():
         raw = raw_edges[(edge["source"], edge["target"])]
         assert edge["delta_ms"] == raw.delta_ms
 
-
-# --- 5: provenance survives ------------------------------------------------
-
-
 def test_evidence_provenance_survives_artifact_source_file_and_format():
     run, evidence_rows = _correlated_fixture()
     payload = build_correlation_payload(run, evidence_rows)
 
     nodes = payload["components"][0]["nodes"]
     artifact_ids = {node["artifact_id"] for node in nodes}
-    assert artifact_ids == {101, 102, 103}  # each node keeps its own artifact
+    assert artifact_ids == {101, 102, 103}
 
     db_node = next(n for n in nodes if n["id"] == "evidence-1")
     assert db_node["source_file"] == "db/pool.py"
@@ -209,10 +166,6 @@ def test_evidence_provenance_survives_artifact_source_file_and_format():
     for node in nodes:
         for evidence_item in node["evidence"]:
             assert evidence_item["artifact_id"] == node["artifact_id"]
-
-
-# --- 6: timestamps survive where available --------------------------------
-
 
 def test_timestamps_survive_where_available_and_are_not_fabricated():
     run, evidence_rows = _correlated_fixture()
@@ -227,10 +180,6 @@ def test_timestamps_survive_where_available_and_are_not_fabricated():
     assert simple_context["evidence"][0]["first_seen"] is None
     assert simple_context["evidence"][0]["last_seen"] is None
 
-
-# --- 7: source_matches survive ---------------------------------------------
-
-
 def test_source_matches_survive_with_original_structure():
     run, evidence_rows = _correlated_fixture()
     payload = build_correlation_payload(run, evidence_rows)
@@ -244,15 +193,7 @@ def test_source_matches_survive_with_original_structure():
     assert match["match_method"] == "exact"
     assert match["confidence"] == "high"
 
-
 def test_gemini_context_still_reaches_a_source_match_outside_top_roots():
-    """Reproduces the real gap: a component with more than roots_per_component
-    (3) candidates, where the node with a genuine deterministic source_match
-    ranks 4th. Root-cause ranking itself is untouched (root_causes is
-    supplied pre-ranked here, exactly as run_correlation would produce it) -
-    only build_llm_context()'s selection of what reaches Gemini is under
-    test, and it must not silently drop the 4th-ranked node's source_match.
-    """
     from app.services.correlation_engine import (
         CorrelationComponent,
         CorrelationNode,
@@ -289,8 +230,6 @@ def test_gemini_context_still_reaches_a_source_match_outside_top_roots():
     ]
     component = CorrelationComponent(nodes=nodes, edges=[])
     stats = NodeGraphStats()
-    # Pre-ranked exactly as rank_root_causes() would produce: node-4 (the
-    # real source-matched candidate) is 4th, outside roots_per_component=3.
     root_causes = {
         0: [
             RootCauseCandidate(node_id="evidence-1", score=0.9, graph_stats=stats, role="root"),
@@ -312,18 +251,11 @@ def test_gemini_context_still_reaches_a_source_match_outside_top_roots():
     assert source_matched["source_matches"][0]["relative_path"] == "srv/worker.py"
     assert source_matched["source_matches"][0]["line_number"] == 42
 
-    # Root-cause ranking/roles themselves are untouched by this widening.
-    # Displayed root_candidates is narrowed to actual
-    # role=="root" candidates only (evidence-2/3 are propagation/victim).
     assert [c["node_id"] for c in context["components"][0]["root_candidates"]] == [
         "evidence-1",
     ]
 
-
 def test_gemini_context_additional_source_matched_evidence_stays_bounded():
-    """The widening above is capped, not unbounded - even with many
-    source-matched nodes outside the top roots, only a small fixed number
-    are added (bounded context, never the whole component)."""
     from app.services.correlation_engine import (
         CorrelationComponent,
         CorrelationNode,
@@ -350,12 +282,7 @@ def test_gemini_context_additional_source_matched_evidence_stays_bounded():
 
     context = build_llm_context(run, evidence_rows)
 
-    # 1 root + at most 3 additional source-matched entries, not all 6.
     assert len(context["components"][0]["root_evidence"]) <= 4
-
-
-# --- 8: Gemini correlated context has what it needs -----------------------
-
 
 def test_gemini_correlated_context_contains_required_fields():
     run, evidence_rows = _correlated_fixture()
@@ -380,10 +307,6 @@ def test_gemini_correlated_context_contains_required_fields():
         assert "source_format" in item
         assert "artifact_id" in item
 
-
-# --- 9: simple Gemini context never fabricates correlation concepts -------
-
-
 def test_simple_gemini_context_does_not_fabricate_correlation_concepts():
     evidence_rows = [_evidence(1, artifact_id=1, service="worker")]
     context = build_simple_llm_context(analysis_id=1, evidence_rows=evidence_rows)
@@ -394,7 +317,6 @@ def test_simple_gemini_context_does_not_fabricate_correlation_concepts():
     assert "root_cause_strength" not in context_text
     assert "propagation" not in context_text
     assert "components" not in context
-
 
 def test_simple_gemini_context_still_carries_available_evidence_fields():
     evidence_rows = [
@@ -411,21 +333,7 @@ def test_simple_gemini_context_still_carries_available_evidence_fields():
     assert item["trace_id"] == "trace-x"
     assert item["source_file"] == "worker.py"
 
-
-# --- 10: missing optional fields do not break serialization --------------
-
-
 def test_missing_optional_fields_do_not_break_serialization():
-    # A genuinely isolated singleton (a lone sparse row with no correlating
-    # signal at all) is now excluded from build_correlation_payload's
-    # components[] entirely (components[] is the
-    # PRIMARY incident only) before its node-level serialization could
-    # even be exercised here - so `sparse` gets one same-artifact,
-    # same-service companion (a real structural signal, unrelated to any
-    # of the fields under test below) purely so it lands in a genuine
-    # >1-node primary component. first_seen must be real (not None) for
-    # that correlation to be possible at all; every other field this test
-    # cares about stays None/missing on `sparse` itself.
     base = datetime.now(timezone.utc)
     sparse = _evidence(
         1,
@@ -453,8 +361,6 @@ def test_missing_optional_fields_do_not_break_serialization():
     llm_context = build_llm_context(run, [sparse, companion])
     simple_context = build_simple_llm_context(analysis_id=1, evidence_rows=[sparse, companion])
 
-    # Must not raise, and must be genuinely JSON-serializable (datetimes,
-    # enums etc. all resolved to plain values already).
     json.dumps(payload)
     json.dumps(llm_context)
     json.dumps(simple_context)
@@ -462,29 +368,14 @@ def test_missing_optional_fields_do_not_break_serialization():
     assert len(payload["components"]) == 1
     sparse_node = next(n for n in payload["components"][0]["nodes"] if n["id"] == "evidence-1")
 
-    # CorrelationNode (frozen correlation_engine.py) already normalizes a
-    # missing source_matches to [] at node-construction time
-    # (list(evidence.source_matches or [])) - preserved as-is, not
-    # something this task changes.
     assert sparse_node["source_matches"] == []
     assert sparse_node["trace_id"] is None
 
-    # _evidence_payload() reads Evidence.source_matches directly with no
-    # such coalescing, so None survives as None at the evidence level.
     sparse_evidence_context = next(e for e in simple_context["evidence"] if e["id"] == 1)
     assert sparse_evidence_context["source_matches"] is None
     assert sparse_evidence_context["trace_id"] is None
 
-
 def test_select_primary_component_ties_are_broken_by_earliest_line_not_list_order():
-    """Two components tying exactly on (distinct-artifact-count,
-    node-count) - a real possibility, e.g. two same-shaped 2-node
-    same-artifact bursts - must resolve to the SAME primary component
-    regardless of which order they appear in `components`, proving the
-    tie-break is an explicit, first_line_number-based rule rather than
-    max()'s implicit first-occurrence-wins behavior over component-list
-    order (itself downstream of correlation-engine construction order,
-    not anything about the underlying data)."""
     from types import SimpleNamespace
 
     def _node(artifact_id, first_line_number):
@@ -504,8 +395,6 @@ def test_select_primary_component_ties_are_broken_by_earliest_line_not_list_orde
     assert reversed_order is component_early
 
 def test_select_primary_component_exact_line_ties_use_complete_stable_node_key():
-    """A tie on artifact count, node count, and earliest line must still
-    be independent of component-list order."""
     from types import SimpleNamespace
 
     def _node(

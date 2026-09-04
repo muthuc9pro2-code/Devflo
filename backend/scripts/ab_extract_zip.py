@@ -14,7 +14,6 @@ from app.services.source_archive import SourceInputError, _safe_members
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 ZIP_PATH = SCRATCH / "synthetic_source.zip"
 
-
 def old_extract_zip(path: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     root = dest.resolve()
@@ -29,7 +28,6 @@ def old_extract_zip(path: Path, dest: Path) -> None:
             with zf.open(member) as source, open(target, "wb") as destination:
                 shutil.copyfileobj(source, destination)
 
-
 def new_extract_zip(path: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     root = dest.resolve()
@@ -43,7 +41,6 @@ def new_extract_zip(path: Path, dest: Path) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as source, open(target, "wb") as destination:
                 shutil.copyfileobj(source, destination)
-
 
 results = {"old": [], "new": []}
 order = ["old", "new"] * 6

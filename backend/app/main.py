@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 _SERVICE_UNAVAILABLE_DETAIL = "Devflo is temporarily unavailable. Please try again."
 _SERVICE_UNAVAILABLE_CODE = "service_unavailable"
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("starting Devflo API")
@@ -32,7 +31,6 @@ app.add_middleware(
     max_body_size=MAX_ANALYSIS_REQUEST_BODY_BYTES,
 )
 
-
 @app.exception_handler(OperationalError)
 async def handle_database_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
     logger.error("Database unavailable for %s %s", request.method, request.url.path, exc_info=exc)
@@ -44,7 +42,6 @@ async def handle_database_unavailable(request: Request, exc: OperationalError) -
         },
     )
 
-
 app.include_router(health_router)
 app.include_router(auth.router)
 app.include_router(analysis.router)
@@ -54,4 +51,3 @@ app.include_router(analysis_stream.router)
 def root():
     logger.info("Root endpoint called")
     return {"app": Settings.APP_NAME, "version": Settings.APP_VERSION}
-

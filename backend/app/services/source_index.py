@@ -1,4 +1,3 @@
-"""Deterministic stack-frame -> source-file correlation via one prebuilt index."""
 from bisect import bisect_left
 import json
 import logging
@@ -8,7 +7,6 @@ import uuid
 from collections import namedtuple
 from dataclasses import dataclass, field
 from pathlib import Path
-
 from app.core.processing_config import (
     MAX_SOURCE_CONTEXT_FILE_BYTES,
     MAX_SOURCE_FILES,
@@ -30,17 +28,12 @@ BINARY_EXTENSIONS = {
 
 SourceFile = namedtuple("SourceFile", "relative_path basename extension size")
 
-# v1 persisted generated suffix/stem maps. v2 persists only canonical by_path
-# metadata. Derived lookup structures are reconstructed in memory so old or
-# corrupt derived maps can never change source-correlation semantics.
 _SOURCE_INDEX_MANIFEST_VERSION = 2
 _LEGACY_SOURCE_INDEX_MANIFEST_VERSIONS = {None, 1}
 _SUFFIX_COMPONENT_SEPARATOR = "\x00"
 
-
 class SourceIndexLimitError(ValueError):
-    """A source tree would amplify into an unreasonably large derived index."""
-
+    pass
 
 def _validate_relative_path_for_index(relative_path: str) -> list[str]:
     if not isinstance(relative_path, str) or "\x00" in relative_path:
@@ -68,20 +61,12 @@ def _validate_relative_path_for_index(relative_path: str) -> list[str]:
         )
     return parts
 
-
 def _reversed_path_key(parts: list[str]) -> str:
     return _SUFFIX_COMPONENT_SEPARATOR.join(reversed(parts)) + _SUFFIX_COMPONENT_SEPARATOR
-
 
 def _derived_maps_from_paths(
     by_path: dict[str, SourceFile],
 ) -> tuple[list[str], list[str], dict[str, list[str]]]:
-    """Build bounded lookup structures from canonical source paths.
-
-    Exactly one reversed lookup key is retained per source file. Prefix
-    searches over those keys reproduce the old exhaustive proper-suffix index
-    without storing every materialized suffix.
-    """
     suffix_entries: list[tuple[str, str]] = []
     by_stem: dict[str, list[str]] = {}
     for relative_path, source_file in by_path.items():
@@ -131,7 +116,6 @@ class SourceIndex:
                 )
         return lines
 
-
 _MISSING = object()
 
 def build_index(root: Path) -> SourceIndex:
@@ -166,27 +150,10 @@ def build_index(root: Path) -> SourceIndex:
         by_stem=by_stem,
     )
 
-
 def index_manifest_path(root: Path) -> Path:
     return root.parent / f"{root.name}.index.json"
 
-
 def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
-    """Persist only canonical bounded source-file metadata as safe JSON.
-
-    Derived lookup structures are reconstructed from by_path. Each writer gets
-    its own source-tree-owned temporary file before atomically replacing the
-    sibling manifest.
-
-    Keeping the writer temp inside index.root is important for terminal
-    cleanup: if cancellation/failure removes the source tree while a stale
-    manifest refresh is in flight, that stale writer cannot recreate the
-    sibling manifest after cleanup has already won.
-
-    The .pyc suffix also keeps implementation-owned writer temps invisible to
-    concurrent build_index() walks because .pyc is already excluded from the
-    source index.
-    """
     payload = {
         "version": _SOURCE_INDEX_MANIFEST_VERSION,
         "by_path": {
@@ -205,7 +172,6 @@ def save_index_manifest(index: SourceIndex, manifest_path: Path) -> None:
         os.replace(temp_path, manifest_path)
     finally:
         temp_path.unlink(missing_ok=True)
-
 
 def _source_file_from_manifest(relative_path: str, raw_source_file) -> SourceFile:
     if not isinstance(relative_path, str):
@@ -228,14 +194,7 @@ def _source_file_from_manifest(relative_path: str, raw_source_file) -> SourceFil
         raise TypeError("Source index file metadata has an invalid shape")
     return SourceFile(relative_path, basename, extension, size)
 
-
 def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None":
-    """Load canonical metadata and rebuild bounded lookup structures.
-
-    Unversioned/v1 manifests remain safe to adopt because only their validated
-    by_path metadata is trusted; their old suffix/stem maps are ignored.
-    Missing, corrupt, oversized, or unsupported manifests remain cache misses.
-    """
     try:
         if manifest_path.stat().st_size > MAX_SOURCE_INDEX_MANIFEST_BYTES:
             logger.warning(
@@ -294,18 +253,9 @@ def load_index_manifest(manifest_path: Path, root: Path) -> "SourceIndex | None"
         )
         return None
 
-
 def _lookup_proper_suffix(
     index: SourceIndex, suffix_parts: list[str]
 ) -> tuple[str | None, bool]:
-    """Return (unique_path, ambiguous) for one requested proper suffix.
-
-    The reversed-key prefix represents all repository paths ending in the
-    requested component sequence. A key exactly equal to the prefix represents
-    a source file whose COMPLETE relative path equals that suffix; the original
-    exhaustive index deliberately did not register a path as its own suffix,
-    so that entry is skipped.
-    """
     prefix = _reversed_path_key(suffix_parts)
     position = bisect_left(index._suffix_keys, prefix)
     candidate: str | None = None
@@ -321,19 +271,15 @@ def _lookup_proper_suffix(
         position += 1
     return candidate, False
 
-
 def _match_frame(frame, index: SourceIndex, module: str | None) -> dict | None:
     normalized = posixpath.normpath(frame.file.replace("\\", "/")).lstrip("./") if frame.file else None
     if normalized:
         if normalized in index.by_path:
             return _build_match(index, normalized, normalized, frame, "exact")
         parts = normalized.split("/")
-        # Preserve the original exhaustive-suffix algorithm exactly:
-        # requested proper suffixes are examined longest -> shortest.
         for start in range(1, len(parts)):
             candidate, ambiguous = _lookup_proper_suffix(index, parts[start:])
             if ambiguous:
-                # Never fabricate a source location.
                 return None
             if candidate is not None:
                 method = "basename" if start == len(parts) - 1 else "suffix"

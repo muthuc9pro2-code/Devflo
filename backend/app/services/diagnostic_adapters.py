@@ -15,17 +15,11 @@ from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent
 from app.services.image_text_extractor import extract_text_from_image_with_confidence
 from app.services.ocr_normalizer import normalize_ocr_text
+
 logger = logging.getLogger(__name__)
 
-
 class ArtifactInputError(ValueError):
-    """One diagnostic artifact cannot be parsed safely.
-
-    This exception is reserved for input/format failures discovered inside a
-    parser boundary.  The artifact task converts it to an artifact-local
-    processing error; persistence, database, and deterministic-engine failures
-    must not be wrapped in it.
-    """
+    pass
 
 if ijson.backend != "yajl2_c":
     logger.warning(
@@ -146,15 +140,8 @@ def _diagnostic_attribute_priority(key: str) -> int:
     lowered = key.lower()
     return 2 if any(hint in lowered for hint in _DIAGNOSTIC_ATTRIBUTE_KEYWORDS) else 1
 
-
 @dataclass(slots=True)
 class _BoundedAttributeBudget:
-    """Bounded (by byte size, not entry count) set of scalar key/value
-    pairs, keeping the most diagnostically useful ones (see
-    _diagnostic_attribute_priority) when more candidates arrive than fit -
-    the same "capacity + priority-based eviction" shape
-    _BoundedStructuredCapture already uses for canonical fields, applied
-    here to the non-canonical ones instead of discarding them."""
 
     max_bytes: int
     values: dict[str, Any] = field(default_factory=dict)
@@ -194,14 +181,9 @@ class _BoundedAttributeBudget:
     def result(self) -> dict[str, Any] | None:
         return dict(self.values) if self.values else None
 
-
 def _iter_scalar_leaves(
     data: Mapping[str, Any], prefix: str = "", depth: int = 0, max_depth: int = 4
 ) -> Iterator[tuple[str, Any]]:
-    """Yields (dotted_path, value) for every scalar leaf in a small,
-    already-in-memory mapping - never descends into lists/arrays (could be
-    unbounded) and stops at max_depth (a handful of nested objects is
-    normal for a real log record; anything deeper is not worth chasing)."""
     if depth > max_depth:
         return
     for key, value in data.items():
@@ -210,22 +192,14 @@ def _iter_scalar_leaves(
             yield from _iter_scalar_leaves(value, path, depth + 1, max_depth)
         elif value is None or isinstance(value, (str, int, float, bool)):
             yield path, value
-        # lists/other types: skipped - never recursively copied
-
 
 def _extract_diagnostic_attributes(data: Mapping[str, Any]) -> dict[str, Any] | None:
-    """For an already-fully-parsed structured record (one JSON-lines line,
-    or one container CRI JSON body): every scalar leaf that is NOT one of
-    normalize_structured_event's own canonical fields, bounded to
-    DIAGNOSTIC_ATTRIBUTES_MAX_BYTES and biased toward diagnostically useful
-    names when the budget fills."""
     budget = _BoundedAttributeBudget(DIAGNOSTIC_ATTRIBUTES_MAX_BYTES)
     for relative, value in _iter_scalar_leaves(data):
         if _structured_canonical_key(relative) is not None:
             continue  
         budget.offer(relative, value)
     return budget.result()
-
 
 def stream_artifact_events(*, file_path: str, artifact_format: ArtifactFormat, source_file: str, start_offset: int=0, start_artifact_line: int=0, global_line_number: int=0) -> Iterator[ArtifactEvent]:
     if artifact_format == ArtifactFormat.IMAGE:
@@ -263,7 +237,6 @@ def _stream_image_events(
         global_line_number=global_line_number,
     )
 
-
 def stream_image_events_from_text(
     *,
     extracted_text: str,
@@ -271,12 +244,6 @@ def stream_image_events_from_text(
     source_file: str,
     global_line_number: int,
 ) -> Iterator[ArtifactEvent]:
-    """Record reconstruction only, from ALREADY-extracted OCR text - split
-    out of _stream_image_events so a caller that also needs the raw OCR
-    result for something else (the zero-evidence fallback context, see
-    app.tasks.analysis._process_artifact) can call
-    extract_text_from_image_with_confidence() itself exactly once and reuse
-    the same result here, instead of this function extracting it again."""
     normalized_text = normalize_ocr_text(extracted_text)
 
     if not normalized_text.strip():
@@ -321,7 +288,6 @@ def stream_image_events_from_text(
         yield _build_image_text_event(
             pending, source_file=source_file, ocr_confidence=ocr_confidence
         )
-
 
 def _build_image_text_event(
     record: _PendingTextRecord,
@@ -478,22 +444,9 @@ _LOOSE_FRAME_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _default_level_for_bare_stack_frame(event: ParsedEvent | None, raw_text: str) -> None:
-    """Lowest-priority level fallback, applied only after normalize_text_event
-    has already had every normal chance to find a real level (defaults,
-    LOG_LEVEL_PATTERN, exception match, the _FATAL/_SLOW markers) and still
-    came back with none. A bare stack-frame line/block with no accompanying
-    level keyword - e.g. a cropped screenshot that captured "File ..., line
-    N, in func" but not the "Traceback"/"Error" line above it - is still
-    real diagnostic content and must not be silently downgraded to
-    unretained just because the keyword-based signal never fires. Mutates
-    in place (same established pattern as ocr_confidence below), never
-    overrides a level that was actually found.
-    """
     if event is not None and event.level is None and _contains_stack_frame(raw_text):
         event.level = 'ERROR'
-
 
 def _contains_stack_frame(raw_text: str) -> bool:
     return bool(
@@ -506,7 +459,6 @@ def _contains_stack_frame(raw_text: str) -> bool:
         )
         or _LOOSE_FRAME_MARKER_RE.search(raw_text)
     )
-
 
 def _generic_text_may_be_important(raw_text: str) -> bool:
     lowered = raw_text.lower()

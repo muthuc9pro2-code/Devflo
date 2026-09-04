@@ -23,7 +23,6 @@ LINES_PER_FILE = 120
 
 _MISSING = object()
 
-
 def _legacy_suffix_map(index: SourceIndex) -> dict[str, list[str]]:
     by_suffix: dict[str, list[str]] = {}
     for relative_path in index.by_path:
@@ -31,7 +30,6 @@ def _legacy_suffix_map(index: SourceIndex) -> dict[str, list[str]]:
         for start in range(len(parts) - 1):
             by_suffix.setdefault("/".join(parts[start + 1:]), []).append(relative_path)
     return by_suffix
-
 
 def old_context_lines(index: SourceIndex, path: Path):
     cached = index._context_cache.get(path, _MISSING)
@@ -49,7 +47,6 @@ def old_context_lines(index: SourceIndex, path: Path):
     index._context_cache[path] = lines
     return lines
 
-
 def old_read_context(index: SourceIndex, relative_path: str, line_number):
     if not line_number or line_number < 1:
         return None, None, None
@@ -62,7 +59,6 @@ def old_read_context(index: SourceIndex, relative_path: str, line_number):
         return None, None, None
     return "\n".join(lines[start - 1: end]), start, end
 
-
 def new_read_context(index: SourceIndex, relative_path: str, line_number):
     if not line_number or line_number < 1:
         return None, None, None
@@ -74,7 +70,6 @@ def new_read_context(index: SourceIndex, relative_path: str, line_number):
     if start > end:
         return None, None, None
     return "\n".join(lines[start - 1: end]), start, end
-
 
 def _build_match(index, relative_path, requested_path, frame, method, read_context):
     line_number = getattr(frame, "line", None)
@@ -90,7 +85,6 @@ def _build_match(index, relative_path, requested_path, frame, method, read_conte
         "match_method": method,
         "confidence": "high" if method == "exact" else "medium",
     }
-
 
 def _match_frame(frame, index: SourceIndex, module, by_suffix: dict[str, list[str]], read_context):
     normalized = posixpath.normpath(frame.file.replace("\\", "/")).lstrip("./") if frame.file else None
@@ -111,7 +105,6 @@ def _match_frame(frame, index: SourceIndex, module, by_suffix: dict[str, list[st
         return _build_match(index, candidates[0], normalized or stem, frame, "module", read_context)
     return None
 
-
 def _correlate_event(event, index, by_suffix, read_context):
     if index is None:
         return []
@@ -119,14 +112,11 @@ def _correlate_event(event, index, by_suffix, read_context):
     frames = getattr(event, "stack_frames", None) or []
     return [match for frame in frames if (match := _match_frame(frame, index, module, by_suffix, read_context))]
 
-
 def old_correlate_event(event, index, by_suffix):
     return _correlate_event(event, index, by_suffix, old_read_context)
 
-
 def new_correlate_event(event, index, by_suffix):
     return _correlate_event(event, index, by_suffix, new_read_context)
-
 
 unique_events = [
     ParsedEvent(
@@ -153,29 +143,23 @@ hot_events = [
     for index in range(20000)
 ]
 
-
 def _run(events, correlate):
     index = build_index(ROOT)
     by_suffix = _legacy_suffix_map(index)
     for event in events:
         correlate(event, index, by_suffix)
 
-
 def run_old_unique():
     _run(unique_events, old_correlate_event)
-
 
 def run_new_unique():
     _run(unique_events, new_correlate_event)
 
-
 def run_old_hot():
     _run(hot_events, old_correlate_event)
 
-
 def run_new_hot():
     _run(hot_events, new_correlate_event)
-
 
 def main() -> None:
     for scenario, old_fn, new_fn in (
@@ -199,7 +183,6 @@ def main() -> None:
             f"{scenario}: old_median={old_median:.4f}s new_median={new_median:.4f}s "
             f"delta={delta:+.4f}s ({percent:+.1f}%)\n"
         )
-
 
 if __name__ == "__main__":
     main()

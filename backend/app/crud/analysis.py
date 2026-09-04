@@ -14,7 +14,6 @@ _UPLOAD_ROOT = Path("uploads").resolve()
 
 _ACTIVE_ANALYSIS_STATUSES = ("pending", "processing")
 
-
 class ActiveAnalysisLimitReached(Exception):
     def __init__(self, limit: int = MAX_ACTIVE_ANALYSES_PER_USER) -> None:
         self.limit = limit
@@ -22,7 +21,6 @@ class ActiveAnalysisLimitReached(Exception):
             f"You already have {limit} active investigations. "
             "Wait for one to finish or cancel one before starting another."
         )
-
 
 def _active_analysis_query(db: Session, user_id: int):
     return (
@@ -34,10 +32,7 @@ def _active_analysis_query(db: Session, user_id: int):
         .order_by(Analysis.id)
     )
 
-
 def user_has_analysis_capacity(db: Session, user_id: int) -> bool:
-    """Cheap upload preflight only. The authoritative race-safe check
-    happens inside create_analysis()."""
     active_rows = (
         _active_analysis_query(db, user_id)
         .limit(MAX_ACTIVE_ANALYSES_PER_USER)
@@ -45,26 +40,13 @@ def user_has_analysis_capacity(db: Session, user_id: int) -> bool:
     )
     return len(active_rows) < MAX_ACTIVE_ANALYSES_PER_USER
 
-
 def _ensure_user_analysis_capacity(db: Session, user_id: int) -> None:
-    # User is the per-account serialization row. No Analysis lifecycle path
-    # takes User after taking Analysis, so this does not introduce the lock
-    # inversion we spent half our natural lifespan removing earlier.
     locked_user_id = (
         db.query(User.id).filter(User.id == user_id).with_for_update().scalar()
     )
     if locked_user_id is None:
         raise ValueError("User does not exist")
 
-    # This MUST be a locking/current read, not COUNT(*) from an earlier
-    # request snapshot.
-    #
-    # Authentication has already read User through this Session. Under
-    # MySQL's default transaction isolation a normal later SELECT may
-    # therefore use that older consistent-read snapshot.
-    #
-    # FOR UPDATE is a current read. Combined with the User-row lock above,
-    # concurrent Analysis creations for this SAME account serialize here.
     active_rows = (
         _active_analysis_query(db, user_id)
         .with_for_update()
@@ -73,7 +55,6 @@ def _ensure_user_analysis_capacity(db: Session, user_id: int) -> None:
     )
     if len(active_rows) >= MAX_ACTIVE_ANALYSES_PER_USER:
         raise ActiveAnalysisLimitReached()
-
 
 def create_analysis(
     db: Session,
@@ -154,19 +135,10 @@ def create_analysis(
             if model.status == "unsupported":
                 model.processed_bytes = model.size_bytes
 
-        # Capture filesystem cleanup paths before commit. SQLAlchemy expires
-        # ORM state on commit by default, so reading duplicate.saved_file_path
-        # afterward could otherwise trigger an implicit database refresh in
-        # the post-commit durability window.
         duplicate_staged_paths = [
             duplicate.saved_file_path for duplicate, _canonical in duplicates
         ]
 
-        # Durability boundary: do not perform any database read after this
-        # commit inside create_analysis(). If the commit succeeds but the DB
-        # connection disappears immediately afterward, callers must treat the
-        # Analysis/Artifact rows as durable and preserve staged inputs for
-        # recovery instead of cleaning them up as though creation rolled back.
         db.commit()
     except Exception:
         db.rollback()
@@ -176,7 +148,6 @@ def create_analysis(
         _delete_staged_upload(duplicate_staged_path)
 
     return analysis
-
 
 def _delete_staged_upload(saved_file_path: str) -> None:
     path = Path(saved_file_path)

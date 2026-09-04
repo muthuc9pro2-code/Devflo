@@ -1,14 +1,8 @@
-"""A real per-component timeline built from correlation's
-already-loaded nodes/roles - never a second DB scan, never fabricated
-ordering for missing/equal timestamps.
-"""
 from datetime import datetime, timedelta, timezone
-
 from app.models.evidence import Evidence
 from app.services.correlation_engine import run_correlation
 from app.services.investigation_context import build_correlation_payload
 from app.services.timeline_processor import build_component_timeline
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -25,7 +19,6 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     }
     defaults.update(kwargs)
     return Evidence(**defaults)
-
 
 def test_scenario_s_millisecond_propagation_timeline_has_exact_relative_ms():
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -52,7 +45,6 @@ def test_scenario_s_millisecond_propagation_timeline_has_exact_relative_ms():
     for entry in timeline:
         assert entry["timestamp"] is not None
 
-
 def test_equal_timestamp_events_share_the_same_relative_ms():
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     a = _evidence(1, trace_id="trace-eq", service="svc-a", first_seen=base)
@@ -64,7 +56,6 @@ def test_equal_timestamp_events_share_the_same_relative_ms():
     timeline = payload["components"][0]["timeline"]
     assert len(timeline) == 2
     assert timeline[0]["relative_ms"] == timeline[1]["relative_ms"] == 0.0
-
 
 def test_events_with_no_timestamp_are_never_assigned_fake_ordering():
     component_nodes_source = [
@@ -86,10 +77,7 @@ def test_events_with_no_timestamp_are_never_assigned_fake_ordering():
     assert untimed[0]["relative_ms"] is None
     assert untimed[0]["node_id"] == "evidence-1"
 
-
 def test_build_component_timeline_is_pure_in_memory_no_db_access():
-    """Direct unit-level proof this never touches the database - it only
-    reads attributes already present on the in-memory objects."""
     from types import SimpleNamespace
 
     node_a = SimpleNamespace(
@@ -102,7 +90,7 @@ def test_build_component_timeline_is_pure_in_memory_no_db_access():
         service="b",
         first_line_number=2, fingerprint=None, source_file=None,
     )
-    component = SimpleNamespace(nodes=[node_b, node_a])  # deliberately out of order
+    component = SimpleNamespace(nodes=[node_b, node_a])
     root_candidates = [
         SimpleNamespace(node_id="evidence-1", role="root"),
         SimpleNamespace(node_id="evidence-2", role="victim"),

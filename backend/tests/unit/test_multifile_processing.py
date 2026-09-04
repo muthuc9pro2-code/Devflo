@@ -1,7 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import stream_artifact_events
 from app.services.log_praser import ParsedEvent
@@ -10,19 +9,7 @@ from app.tasks.analysis import _process_artifact
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
 
-
 def _fenced_mock_db(generation: int = 0) -> Mock:
-    """A Mock db whose generation-fence query (status, processing_generation)
-    - used by _persist_artifact_batch's per-batch fence,
-    _process_artifact's terminal-commit fence, and
-    _artifact_mutation_authorized's setup/fallback-context fences -
-    reports "processing" at the given generation, so direct calls to these
-    functions in this file (which never touch a real Analysis row) still
-    pass the fence. Also configures the artifact-ownership half of
-    _artifact_mutation_authorized's two-query check (Analysis via
-    with_for_update().first(), then AnalysisArtifact via
-    with_for_update().scalar()) to report "processing" too - both queries
-    share this same Mock chain regardless of which model they're against."""
     db = Mock()
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = (
         "processing",
@@ -33,12 +20,7 @@ def _fenced_mock_db(generation: int = 0) -> Mock:
     )
     return db
 
-
 def test_two_artifacts_process_independently_with_position_based_line_bands():
-    """Each artifact computes its own starting global_line_number
-    from its own position band (exactly like _process_artifact_task does),
-    independent of any other artifact - no shared, accumulating checkpoint
-    on the Analysis row anymore."""
     db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     first = _artifact(101, 0, "generic.txt")
@@ -61,12 +43,7 @@ def test_two_artifacts_process_independently_with_position_based_line_bands():
     assert second.processed_bytes == second.size_bytes
     assert db.execute.call_count == 2
 
-
 def test_processing_never_mutates_the_shared_analysis_row():
-    """Batch/artifact processing must not repeatedly dirty the
-    shared Analysis.processed_bytes/last_processed_line row - only this
-    artifact's own row is ever written. (Recomputing the legacy aggregate
-    columns once, at finalize time, is covered separately.)"""
     db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
     artifact = _artifact(101, 0, "generic.txt")
@@ -77,7 +54,6 @@ def test_processing_never_mutates_the_shared_analysis_row():
 
     assert analysis.processed_bytes == 0
     assert analysis.last_processed_line == 0
-
 
 def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
     db = _fenced_mock_db()
@@ -120,7 +96,6 @@ def test_artifact_batch_fingerprints_only_retained_events(monkeypatch):
     )
     db.commit.assert_called_once()
 
-
 def test_artifact_batch_correlates_only_retained_events(monkeypatch):
     db = _fenced_mock_db()
     analysis = SimpleNamespace(id=9, processed_bytes=0, last_processed_line=0)
@@ -155,14 +130,9 @@ def test_artifact_batch_correlates_only_retained_events(monkeypatch):
     assert retained.source_matches == [{"relative_path": "app/main.py"}]
     assert discarded.source_matches == []
 
-
 def test_source_index_is_prepared_once_and_zip_is_not_removed_before_ready_commit(
     monkeypatch,
 ):
-    # The process-local cache is module-level and keyed by
-    # (analysis.id, generation) - reset it so an entry left behind by
-    # another test (this fixture id is reused throughout the suite) can
-    # never make this test silently skip calling prepare_source.
     monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
 
     analysis = SimpleNamespace(
@@ -195,11 +165,7 @@ def test_source_index_is_prepared_once_and_zip_is_not_removed_before_ready_commi
         0,
     )
 
-    # Item 7: filesystem preparation alone is NOT enough to delete the
-    # original staged ZIP. _prepare_source_task removes it only after the
-    # generation-authorized source_status="ready" DB commit succeeds.
     remove.assert_not_called()
-
 
 def test_log_only_analysis_does_not_prepare_source(monkeypatch):
     prepare = Mock()
@@ -212,7 +178,6 @@ def test_log_only_analysis_does_not_prepare_source(monkeypatch):
         is None
     )
     prepare.assert_not_called()
-
 
 def test_line_stream_resume_starts_after_the_committed_record():
     path = FIXTURES / "syslog.txt"
@@ -240,7 +205,6 @@ def test_line_stream_resume_starts_after_the_committed_record():
     assert resumed[0].event.host == "worker-1"
     assert resumed[0].event.line_number == first_record.global_end_line_number + 1
 
-
 def test_otlp_resume_skips_committed_structured_records():
     path = FIXTURES / "otlp.json"
     artifact_format = detect_artifact(path, filename=path.name)
@@ -266,7 +230,6 @@ def test_otlp_resume_skips_committed_structured_records():
     assert resumed[0].event.span_id == "span-child"
     assert resumed[0].event.line_number == first_record.global_end_line_number + 1
 
-
 def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path):
     first_line = b"ERROR first failure\n"
     path = tmp_path / "looks-structured.json"
@@ -283,8 +246,6 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
         original_filename=path.name,
         saved_file_path=str(path),
         content_type="application/json",
-        # The migration uses zero as a one-time unknown-size sentinel for
-        # unfinished legacy analyses.
         size_bytes=0,
         detected_format=ArtifactFormat.GENERIC.value,
         status="pending",
@@ -298,12 +259,9 @@ def test_migrated_partial_checkpoint_resumes_with_generic_byte_offsets(tmp_path)
     assert artifact.detected_format == ArtifactFormat.GENERIC.value
     assert artifact.size_bytes == path.stat().st_size
     assert artifact.processed_bytes == path.stat().st_size
-    # The shared Analysis row is no longer written by
-    # _process_artifact - only this artifact's own row (asserted above).
     assert analysis.last_processed_line == 1
     assert analysis.processed_bytes == len(first_line)
     assert db.execute.call_count == 1
-
 
 def test_legacy_single_file_artifact_resolves_unknown_size_and_detects_format():
     path = FIXTURES / "json_in_txt.txt"
@@ -329,7 +287,6 @@ def test_legacy_single_file_artifact_resolves_unknown_size_and_detects_format():
     assert artifact.size_bytes == path.stat().st_size
     assert artifact.processed_bytes == path.stat().st_size
 
-
 def test_worker_session_keeps_checkpoint_rows_loaded_across_commits(monkeypatch):
     db = Mock()
     db.query.return_value.filter.return_value.first.return_value = SimpleNamespace(
@@ -342,7 +299,6 @@ def test_worker_session_keeps_checkpoint_rows_loaded_across_commits(monkeypatch)
 
     session_factory.assert_called_once_with(expire_on_commit=False)
     db.close.assert_called_once()
-
 
 def _artifact(identifier: int, position: int, fixture_name: str):
     path = FIXTURES / fixture_name

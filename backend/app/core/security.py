@@ -11,7 +11,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = Settings.ACCESS_TOKEN_EXPIRE_MINUTES
 REFRESH_TOKEN_EXPIRE_DAYS = Settings.REFRESH_TOKEN_EXPIRE_DAYS
 VERIFICATION_HANDOFF_EXPIRE_MINUTES = 30
 
-
 def create_verification_handoff_token(email: str, token_version: int) -> str:
     payload = {
         "sub": email,
@@ -26,7 +25,6 @@ def create_verification_handoff_token(email: str, token_version: int) -> str:
         SECRET_KEY,
         algorithm=ALGORITHM,
     )
-
 
 def decode_verification_handoff_token(token: str) -> dict:
     payload = jwt.decode(
@@ -130,7 +128,6 @@ def decode_password_reset_token(token: str) -> dict:
         raise ValueError("Invalid token type")
 
     return payload
-
 
 def hash_password(plain_password: str) -> str:
     return password_hash.hash(plain_password)

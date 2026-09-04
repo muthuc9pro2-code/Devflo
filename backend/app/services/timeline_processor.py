@@ -1,33 +1,16 @@
-"""A real per-component timeline, built from the correlation
-nodes/roles that are already loaded in memory by the time correlation
-finishes - never a second DB scan, never a persisted timeline subsystem.
-"""
 from typing import Any
-
 from app.services.correlation_engine import (
     CorrelationComponent,
     RootCauseCandidate,
     _stable_node_key,
 )
 
-
 def build_component_timeline(
     component: CorrelationComponent,
     root_candidates: list[RootCauseCandidate],
 ) -> list[dict[str, Any]]:
-    """Chronological view of one correlated component's nodes. Only real
-    timestamps are ever used for ordering/relative_ms - nodes with no
-    first_seen at all are appended afterward with timestamp/relative_ms
-    both explicitly None, never assigned a fabricated position. Nodes that
-    share the exact same first_seen legitimately share the same
-    relative_ms (0.0 or otherwise) - that is the honest ordering, not an
-    artifact of this function.
-    """
     role_by_node_id = {candidate.node_id: candidate.role for candidate in root_candidates}
 
-    # Tie-broken by the stable node key, not node.id: node.id embeds
-    # Evidence.id, which reflects commit-race order across concurrently-
-    # processing artifact workers, not anything about the underlying data.
     timed_nodes = sorted(
         (node for node in component.nodes if node.first_seen is not None),
         key=lambda node: (node.first_seen, _stable_node_key(node)),

@@ -1,30 +1,9 @@
-"""Reclaiming the original staged optional source ZIP.
-
-Successful ZIP preparation already removes the original staged archive
-(app.tasks.analysis._acquire_source_index, via _remove_staged_source_archive)
-once prepare_source() has copied its bytes into investigation-scoped
-storage. Two paths previously left that original archive behind on disk:
-
-  1. cancellation before _acquire_source_index() ever reaches the
-     successful-preparation archive removal;
-  2. optional source preparation failure (_record_optional_source_failure),
-     which cleaned the *prepared* source but never the *original staged*
-     archive.
-
-Both call sites reuse the existing _remove_staged_source_archive() helper -
-this file proves that reuse happens, in the right order (durable DB state
-committed first, filesystem cleanup best-effort afterward), idempotently,
-and without ever turning a cancellation/failure into an analysis-wide
-failure when the filesystem cleanup itself raises OSError.
-"""
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.services.source_archive import SourceInputError
@@ -36,19 +15,16 @@ from app.tasks.analysis import (
 
 UPLOADS_DIR = Path("uploads")
 
-
 def _session():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)()
-
 
 def _user(db, name="alice") -> User:
     user = User(username=name, email=f"{name}@example.com", hashed_password="x", is_verified=True)
     db.add(user)
     db.commit()
     return user
-
 
 def _analysis(db, user, *, status="pending", **kwargs) -> Analysis:
     defaults = dict(
@@ -61,13 +37,8 @@ def _analysis(db, user, *, status="pending", **kwargs) -> Analysis:
     db.commit()
     return analysis
 
-
 @pytest.fixture
 def staged_zip():
-    """A real file under uploads/ - _remove_staged_source_archive() only
-    ever acts on a reference whose parent resolves to this exact
-    directory, so a real path (not tmp_path) is required to exercise it
-    honestly. Cleaned up unconditionally afterward."""
     UPLOADS_DIR.mkdir(exist_ok=True)
     path = UPLOADS_DIR / f"test_source_zip_cleanup_{uuid.uuid4().hex}_source.zip"
     path.write_bytes(b"PK\x03\x04fake-zip-bytes")
@@ -75,10 +46,6 @@ def staged_zip():
         yield path
     finally:
         path.unlink(missing_ok=True)
-
-
-# --- Cancellation reclaims the original staged ZIP -------------------------
-
 
 def test_cancel_zip_source_analysis_removes_staged_archive_and_keeps_rows(staged_zip):
     db = _session()
@@ -108,11 +75,10 @@ def test_cancel_zip_source_analysis_removes_staged_archive_and_keeps_rows(staged
     reloaded = db.query(Analysis).filter(Analysis.id == analysis.id).first()
     assert reloaded is not None
     assert reloaded.status == "cancelled"
-    assert reloaded.source_reference == str(staged_zip)  # metadata preserved
+    assert reloaded.source_reference == str(staged_zip)
     assert db.query(AnalysisArtifact).filter(AnalysisArtifact.id == artifact.id).first() is not None
     assert db.query(Evidence).filter(Evidence.analysis_id == analysis.id).count() == 0
     assert not staged_zip.exists()
-
 
 def test_cancel_zip_source_when_archive_already_deleted_is_idempotent(staged_zip):
     db = _session()
@@ -121,7 +87,7 @@ def test_cancel_zip_source_when_archive_already_deleted_is_idempotent(staged_zip
         db, alice, status="pending",
         source_kind="zip", source_reference=str(staged_zip), source_status=None,
     )
-    staged_zip.unlink()  # simulate another path having already removed it
+    staged_zip.unlink()
 
     result = cancel_analysis_and_cleanup(db, analysis.id)
 
@@ -129,7 +95,6 @@ def test_cancel_zip_source_when_archive_already_deleted_is_idempotent(staged_zip
     reloaded = db.query(Analysis).filter(Analysis.id == analysis.id).first()
     assert reloaded.status == "cancelled"
     assert not staged_zip.exists()
-
 
 def test_cancel_github_source_does_not_attempt_staged_archive_removal(monkeypatch):
     db = _session()
@@ -149,7 +114,6 @@ def test_cancel_github_source_does_not_attempt_staged_archive_removal(monkeypatc
     assert result == "processing"
     assert db.query(Analysis).filter(Analysis.id == analysis.id).first().status == "cancelled"
 
-
 def test_cancel_no_source_analysis_attempts_no_staged_cleanup(monkeypatch):
     db = _session()
     alice = _user(db)
@@ -168,7 +132,6 @@ def test_cancel_no_source_analysis_attempts_no_staged_cleanup(monkeypatch):
     assert result == "pending"
     assert db.query(Analysis).filter(Analysis.id == analysis.id).first().status == "cancelled"
 
-
 def test_cancel_zip_source_archive_unlink_oserror_does_not_break_the_tombstone(monkeypatch):
     db = _session()
     alice = _user(db)
@@ -186,11 +149,7 @@ def test_cancel_zip_source_archive_unlink_oserror_does_not_break_the_tombstone(m
 
     assert result == "processing"
     reloaded = db.query(Analysis).filter(Analysis.id == analysis.id).first()
-    assert reloaded.status == "cancelled"  # the durable tombstone still wins
-
-
-# --- Optional source preparation failure reclaims the staged ZIP -----------
-
+    assert reloaded.status == "cancelled"
 
 def test_zip_source_preparation_failure_marks_unavailable_and_removes_staged_archive(staged_zip):
     db = _session()
@@ -208,10 +167,9 @@ def test_zip_source_preparation_failure_marks_unavailable_and_removes_staged_arc
     assert analysis.source_status == "unavailable"
     assert "corrupt archive" in analysis.source_failure_reason
     reloaded = db.query(Analysis).filter(Analysis.id == analysis.id).first()
-    assert reloaded.status == "processing"  # diagnostic analysis remains viable
+    assert reloaded.status == "processing"
     assert reloaded.source_reference == str(staged_zip)
     assert not staged_zip.exists()
-
 
 def test_github_source_preparation_failure_does_not_attempt_staged_archive_removal(monkeypatch):
     db = _session()
@@ -233,7 +191,6 @@ def test_github_source_preparation_failure_does_not_attempt_staged_archive_remov
     assert handled is True
     assert analysis.source_status == "unavailable"
 
-
 def test_source_failure_archive_unlink_oserror_does_not_break_unavailable_state(monkeypatch):
     db = _session()
     alice = _user(db)
@@ -253,13 +210,10 @@ def test_source_failure_archive_unlink_oserror_does_not_break_unavailable_state(
 
     assert handled is True
     reloaded = db.query(Analysis).filter(Analysis.id == analysis.id).first()
-    assert reloaded.source_status == "unavailable"  # durable state still wins
-    assert reloaded.status == "processing"  # never turned into an analysis-wide failure
-
+    assert reloaded.source_status == "unavailable"
+    assert reloaded.status == "processing"
 
 def test_source_failure_ignored_when_analysis_already_cancelled(monkeypatch):
-    """The pre-existing cancellation fence: no new-archive-removal
-    behavior should run at all once cancellation already won."""
     db = _session()
     alice = _user(db)
     analysis = _analysis(
@@ -278,10 +232,6 @@ def test_source_failure_ignored_when_analysis_already_cancelled(monkeypatch):
 
     assert handled is False
     assert analysis.source_status is None
-
-
-# --- Successful preparation's existing archive-removal is unchanged --------
-
 
 def test_successful_zip_preparation_removes_staged_archive_only_after_ready_commit(
     staged_zip,
@@ -328,7 +278,6 @@ def test_successful_zip_preparation_removes_staged_archive_only_after_ready_comm
         generation_arg,
         publish_callback=None,
     ):
-        # The original ZIP MUST still exist before the durable ready commit.
         assert staged_zip.exists()
         assert publish_callback is not None
 
@@ -396,7 +345,6 @@ def test_successful_zip_preparation_removes_staged_archive_only_after_ready_comm
     assert observed_source_status == ["ready"]
     assert not staged_zip.exists()
 
-
 def test_staged_zip_unlink_oserror_after_ready_is_housekeeping_only(
     staged_zip,
     monkeypatch,
@@ -424,7 +372,6 @@ def test_staged_zip_unlink_oserror_after_ready_is_housekeeping_only(
         ),
     )
 
-    # Must not raise and must not alter durable source/analysis state.
     analysis_task._remove_staged_zip_after_ready(
         analysis
     )
@@ -435,14 +382,7 @@ def test_staged_zip_unlink_oserror_after_ready_is_housekeeping_only(
     assert analysis.source_status == "ready"
     assert staged_zip.exists()
 
-
 def test_source_index_cache_does_not_leak_across_generations(monkeypatch):
-    """A worker that built/cached a SourceIndex for processing_generation 1
-    of some analysis_id must not hand that SAME cached object back for
-    processing_generation 2 of the SAME analysis_id - recovery can demote a
-    stale "processing" analysis back to "pending" and a later
-    process_analysis call establishes a brand-new generation for it, and a
-    long-lived worker process must never confuse the two."""
     monkeypatch.setattr(analysis_task, "_source_index_process_cache", {})
     analysis = SimpleNamespace(
         id=77, source_kind="github", source_reference="https://github.com/acme/project",
@@ -461,24 +401,13 @@ def test_source_index_cache_does_not_leak_across_generations(monkeypatch):
     generation_1_index_again = analysis_task._acquire_source_index(analysis, 1)
     generation_2_index = analysis_task._acquire_source_index(analysis, 2)
 
-    assert generation_1_index_again is generation_1_index  # same generation: cached
-    assert generation_2_index is not generation_1_index  # new generation: rebuilt
+    assert generation_1_index_again is generation_1_index
+    assert generation_2_index is not generation_1_index
     assert len(build_calls) == 2
-
-
-# --- Cross-worker "source became unavailable" observation (item 4E) --------
-
 
 def test_batch_persistence_stops_correlating_once_source_becomes_unavailable_elsewhere(
     monkeypatch,
 ):
-    """A worker holding a process-local SourceIndex object has no way to
-    know another worker/session just committed source_status="unavailable"
-    for the same analysis (its own matcher failure, or a source-prep
-    failure discovered later). The very next batch this worker persists
-    must observe that durable flag and stop attempting NEW correlation -
-    while diagnostic Evidence persistence for that batch still proceeds
-    exactly as normal, never blocked by this check."""
     from types import SimpleNamespace as NS
     from app.services.log_praser import ParsedEvent
 
@@ -502,7 +431,7 @@ def test_batch_persistence_stops_correlating_once_source_becomes_unavailable_els
         lambda event, index: correlate_calls.append(event) or [],
     )
 
-    stale_source_index = object()  # this worker's own still-live cached reference
+    stale_source_index = object()
     event = ParsedEvent(line_number=1, raw_line="ERROR failure", level="ERROR")
     batch = [NS(event=event, end_offset=10, artifact_line_number=1, global_end_line_number=1)]
 
@@ -511,23 +440,13 @@ def test_batch_persistence_stops_correlating_once_source_becomes_unavailable_els
         batch=batch, source_index=stale_source_index,
     )
 
-    assert result == 1  # Evidence persistence still proceeded
-    assert correlate_calls == []  # but no NEW correlation was attempted
+    assert result == 1
+    assert correlate_calls == []
     assert event.source_matches == []
-
 
 def test_artifact_level_source_failure_never_deletes_the_canonical_tree_a_sibling_may_be_reading(
     tmp_path, monkeypatch,
 ):
-    """Interleaving D (item 19), with a REAL prepared source tree on disk:
-    Worker A discovers a source problem at the artifact level (e.g. its
-    own matcher crashed, or - as here - a "ready" source whose canonical
-    tree turns out unreadable) while Worker B, an independent artifact
-    task for a DIFFERENT artifact in the SAME analysis, may still be
-    concurrently reading that same canonical tree. Worker A's failure
-    handling must mark source_status "unavailable" WITHOUT ever removing
-    the canonical tree itself - only a genuine terminal cleanup
-    (completed/cancelled/failed) may do that."""
     from app.services import source_archive
 
     monkeypatch.setattr(source_archive, "SOURCE_STORAGE_ROOT", str(tmp_path / "sources"))
@@ -550,8 +469,6 @@ def test_artifact_level_source_failure_never_deletes_the_canonical_tree_a_siblin
 
     assert handled is True
     assert analysis.source_status == "unavailable"
-    # The canonical tree Worker B might still be reading survives -
-    # Worker A's artifact-level failure never touched it.
     assert canonical_dir.exists()
     assert (canonical_dir / "app.py").exists()
     assert source_archive._ready_marker(canonical_dir).exists()

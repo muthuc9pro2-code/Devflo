@@ -1,22 +1,9 @@
-"""Targeted tests for the two final surgical fixes:
-
-1. Browser HAR request.headers (name/value pairs) promoting a recognized
-   request-id-shaped header into the canonical Evidence.request_id field,
-   so a HAR entry can correlate normally instead of defaulting to
-   relationship_status="not_linked".
-2. build_correlation_payload()'s components[] representing the PRIMARY
-   correlated incident only (via the existing _select_primary_component),
-   matching the definition already used for relationship-status labeling
-   and Gemini isolation - never a second definition of "primary".
-"""
 import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.schemas.gemini import GeminiInvestigationResponse
@@ -30,7 +17,6 @@ _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     title="t", summary="s", probable_root_causes=[], what_happened=[],
     source_code_findings=[], recommended_actions=[], uncertainties=[],
 )
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -48,10 +34,6 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
-# --- Fix 1: HAR x-request-id -> canonical request_id -----------------------
-
-
 def _har_events(entries: list[dict]):
     har = {"log": {"entries": entries}}
     with tempfile.NamedTemporaryFile(mode="w", suffix=".har", delete=False) as f:
@@ -68,7 +50,6 @@ def _har_events(entries: list[dict]):
     finally:
         os.unlink(path)
 
-
 def _har_entry(*, headers, status=500):
     return {
         "startedDateTime": "2026-08-14T10:00:00.000Z",
@@ -80,7 +61,6 @@ def _har_entry(*, headers, status=500):
         "response": {"status": status},
     }
 
-
 def test_har_x_request_id_header_becomes_canonical_request_id():
     events = _har_events([
         _har_entry(headers=[
@@ -90,10 +70,7 @@ def test_har_x_request_id_header_becomes_canonical_request_id():
     ])
     assert len(events) == 1
     assert events[0].event.request_id == "req-prod-500"
-    # diagnostic_attributes are not stripped merely because the canonical
-    # field got populated - the header pair still survives there too.
     assert events[0].event.diagnostic_attributes is not None
-
 
 def test_har_request_header_matching_is_case_insensitive_and_covers_aliases():
     for header_name, expected in [
@@ -107,14 +84,12 @@ def test_har_request_header_matching_is_case_insensitive_and_covers_aliases():
         assert len(events) == 1, header_name
         assert events[0].event.request_id == expected, header_name
 
-
 def test_arbitrary_har_header_does_not_become_request_id():
     events = _har_events([
         _har_entry(headers=[{"name": "X-Custom-Trace", "value": "should-not-be-promoted"}])
     ])
     assert len(events) == 1
     assert events[0].event.request_id is None
-
 
 def test_har_shared_request_id_correlates_normally_with_another_artifact():
     har_events = _har_events([
@@ -146,10 +121,6 @@ def test_har_shared_request_id_correlates_normally_with_another_artifact():
     assert len(run.result.components) == 1
     assert len(run.result.components[0].nodes) == 2
 
-
-# --- Fix 2: components[] is the primary graph only --------------------------
-
-
 def _db_with_schema(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -157,10 +128,7 @@ def _db_with_schema(monkeypatch):
     monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
     return session_factory
 
-
 def test_isolated_not_linked_component_excluded_from_returned_graph():
-    """One primary multi-artifact component + one truly isolated
-    not_linked artifact: components[] must contain only the primary."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
@@ -179,11 +147,7 @@ def test_isolated_not_linked_component_excluded_from_returned_graph():
     assert node_ids == {"evidence-1", "evidence-2"}
     assert "evidence-3" not in node_ids
 
-
 def test_not_linked_artifact_still_reported_in_artifacts_with_full_outcome(monkeypatch):
-    """Isolated artifact's node never appears in components[], but its
-    outcome (filename/status/relationship_status/message) still reaches
-    artifacts[]."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
@@ -210,15 +174,10 @@ def test_not_linked_artifact_still_reported_in_artifacts_with_full_outcome(monke
     assert isolated["relationship_status"] == "not_linked"
     assert "Not linked" in isolated["message"]
 
-    # The primary pair are linked, never conflated with not_linked.
     assert outcome_by_id[101]["relationship_status"] == "linked"
     assert outcome_by_id[102]["relationship_status"] == "linked"
 
-
 def test_not_linked_evidence_remains_persisted_in_mysql_backed_finalize(monkeypatch):
-    """End-to-end via _finalize_analysis_task: the isolated artifact's
-    Evidence row must still exist in the database after finalize, even
-    though it never appears in the returned components[] graph."""
     session_factory = _db_with_schema(monkeypatch)
     db = session_factory()
     user = User(username="t", email="t@example.com", hashed_password="x", is_verified=True)
@@ -278,7 +237,7 @@ def test_not_linked_evidence_remains_persisted_in_mysql_backed_finalize(monkeypa
 
     payload = published[0]
     node_ids = {n["id"] for c in payload["components"] for n in c["nodes"]}
-    assert f"evidence-{isolated_artifact_id}" not in [nid for nid in node_ids]  # never in the returned graph by construction
+    assert f"evidence-{isolated_artifact_id}" not in [nid for nid in node_ids]
     assert len(payload["components"]) == 1
 
     db = session_factory()
@@ -289,17 +248,11 @@ def test_not_linked_evidence_remains_persisted_in_mysql_backed_finalize(monkeypa
     assert isolated_evidence[0].fingerprint == "fp-3"
     db.close()
 
-
 def test_partially_linked_artifact_keeps_only_its_primary_component_nodes():
-    """An artifact with SOME evidence in the primary component and SOME
-    in a separate, non-primary component must show partially_linked, and
-    only its primary-component node may appear in components[]."""
     base = datetime.now(timezone.utc)
     rows = [
-        # Primary component: 3 nodes, 2 distinct artifacts (101, 102).
         _evidence(1, artifact_id=101, trace_id="trace-1", service="db", first_seen=base),
         _evidence(2, artifact_id=102, trace_id="trace-1", service="api", first_seen=base + timedelta(milliseconds=5)),
-        # Artifact 101 ALSO has an isolated evidence row elsewhere, unrelated.
         _evidence(3, artifact_id=101, service="unrelated-batch-job", first_seen=base + timedelta(hours=2)),
     ]
     run = run_correlation(analysis_id=1, evidence_rows=rows)
@@ -311,10 +264,6 @@ def test_partially_linked_artifact_keeps_only_its_primary_component_nodes():
     returned_node_ids = {n["id"] for c in payload["components"] for n in c["nodes"]}
     assert returned_node_ids == {"evidence-1", "evidence-2"}
     assert "evidence-3" not in returned_node_ids
-
-
-# --- Gemini behavior unchanged -----------------------------------------
-
 
 def test_gemini_context_still_excludes_not_linked_diagnostic_content():
     base = datetime.now(timezone.utc)

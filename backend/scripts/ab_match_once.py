@@ -12,8 +12,6 @@ from app.services.artifact_detector import ArtifactFormat
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests/fixtures/bench"
 
-
-
 def old_web_server_may_be_important(raw_text: str) -> bool:
     access_match = da.WEB_ACCESS_RE.search(raw_text)
     if access_match:
@@ -22,7 +20,6 @@ def old_web_server_may_be_important(raw_text: str) -> bool:
     if error_match:
         return normalize_level(error_match.group('level')) in da.IMPORTANT_LEVELS
     return da._generic_text_may_be_important(raw_text)
-
 
 def old_normalize_web_event(raw_text, line_number, source_file):
     access_match = da.WEB_ACCESS_RE.search(raw_text)
@@ -37,13 +34,11 @@ def old_normalize_web_event(raw_text, line_number, source_file):
             defaults['level'] = normalize_level(error_match.group('level'))
     return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.WEB_SERVER.value, defaults=defaults)
 
-
 def old_syslog_may_be_important(raw_text: str) -> bool:
     match = da.SYSLOG_5424_RE.search(raw_text) or da.SYSLOG_3164_RE.search(raw_text)
     if match:
         return da._syslog_level(int(match.group('pri')) % 8) in da.IMPORTANT_LEVELS
     return da._generic_text_may_be_important(raw_text)
-
 
 def old_normalize_syslog_event(raw_text, line_number, source_file):
     match = da.SYSLOG_5424_RE.search(raw_text) or da.SYSLOG_3164_RE.search(raw_text)
@@ -52,7 +47,6 @@ def old_normalize_syslog_event(raw_text, line_number, source_file):
         defaults.update(timestamp=match.group('time'), level=da._syslog_level(int(match.group('pri')) % 8), host=match.group('host'), service=match.group('app'))
     return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.SYSLOG.value, defaults=defaults)
 
-
 def old_serverless_may_be_important(raw_text: str) -> bool:
     if da.LAMBDA_LIFECYCLE_RE.search(raw_text):
         return False
@@ -60,7 +54,6 @@ def old_serverless_may_be_important(raw_text: str) -> bool:
     if application:
         return normalize_level(application.group('level')) in da.IMPORTANT_LEVELS
     return da._generic_text_may_be_important(raw_text)
-
 
 def old_normalize_serverless_event(raw_text, line_number, source_file):
     defaults = {}
@@ -73,7 +66,6 @@ def old_normalize_serverless_event(raw_text, line_number, source_file):
     if da.EXPLICIT_SERVICE_RE.search(raw_text) is None:
         defaults['service'] = 'aws-lambda'
     return normalize_text_event(raw_text, line_number, source_file=source_file, source_format=ArtifactFormat.SERVERLESS.value, defaults=defaults)
-
 
 def run_old(fmt_name, records_text):
     if fmt_name == 'web_server':
@@ -89,7 +81,6 @@ def run_old(fmt_name, records_text):
             count += 1
     return count
 
-
 def run_new(fmt_name, records_text):
     if fmt_name == 'web_server':
         match_fn, gate, norm = da._match_web_server_line, da._web_server_may_be_important, da._normalize_web_event
@@ -104,7 +95,6 @@ def run_new(fmt_name, records_text):
             norm(text, 1, 'f', match=match)
             count += 1
     return count
-
 
 FIXTURES = {
     'web_server': 'web_server_10mib.log',

@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import dataclasses
 import sys
 from pathlib import Path
@@ -28,10 +26,8 @@ FORMAT_FIXTURES = {
 
 _real_may_be_important = da._may_be_important
 
-
 def _always_important(_artifact_format, _raw_text, **_kwargs) -> bool:
     return True
-
 
 def _as_dict(event) -> dict:
     if event is None:
@@ -40,7 +36,6 @@ def _as_dict(event) -> dict:
     data.pop("fingerprint", None)
     return data
 
-
 def _is_genuinely_unimportant(event) -> bool:
     if event is None:
         return True
@@ -48,7 +43,6 @@ def _is_genuinely_unimportant(event) -> bool:
         event.trace_id is not None or event.span_id is not None
     )
     return event.level not in IMPORTANT_LEVELS and not has_otel_identity
-
 
 def check_format(name: str, fixture_path: Path) -> tuple[int, int]:
     artifact_format = detect_artifact(fixture_path, filename=fixture_path.name)
@@ -95,7 +89,6 @@ def check_format(name: str, fixture_path: Path) -> tuple[int, int]:
 
     return mismatches, skipped_but_would_be_important
 
-
 def main() -> int:
     total_mismatches = 0
     total_evidence_loss = 0
@@ -111,7 +104,6 @@ def main() -> int:
 
     print(f"\nTOTAL content_mismatches={total_mismatches} evidence_loss_risk={total_evidence_loss}")
     return 1 if (total_mismatches or total_evidence_loss) else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

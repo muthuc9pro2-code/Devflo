@@ -1,9 +1,7 @@
 import resend
-
 from app.core.config import Settings
 
 resend.api_key = Settings.RESEND_API_KEY
-
 
 def send_verification_email_message(to_email: str, verification_url: str) -> None:
     resend.Emails.send(
@@ -19,7 +17,6 @@ def send_verification_email_message(to_email: str, verification_url: str) -> Non
             ),
         }
     )
-
 
 def send_password_reset_email_message(to_email: str, reset_url: str) -> None:
     resend.Emails.send(

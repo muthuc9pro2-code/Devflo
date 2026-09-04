@@ -1,14 +1,10 @@
-"""Per-user token-version invalidation and single-use password resets."""
-
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 import jwt
 import pytest
 from fastapi import HTTPException, Response
-
 from app.api import auth as auth_api
 from app.api import dependencies as auth_dependencies
 from app.core.security import (
@@ -25,10 +21,8 @@ from app.crud.user import authenticate_user
 from app.models.user import User
 from app.schemas.user import ResetPasswordRequest, UserLogin
 
-
 def _decode(token: str) -> dict:
     return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-
 
 def _token_without_version(email: str, token_type: str) -> str:
     return jwt.encode(
@@ -40,7 +34,6 @@ def _token_without_version(email: str, token_type: str) -> str:
         SECRET_KEY,
         algorithm=ALGORITHM,
     )
-
 
 def _token_with_invalid_version(email: str, token_type: str) -> str:
     return jwt.encode(
@@ -54,7 +47,6 @@ def _token_with_invalid_version(email: str, token_type: str) -> str:
         algorithm=ALGORITHM,
     )
 
-
 def _cookie_value(response: Response, name: str) -> str:
     header = next(
         value.decode()
@@ -63,14 +55,12 @@ def _cookie_value(response: Response, name: str) -> str:
     )
     return header.split(";", 1)[0].split("=", 1)[1]
 
-
 def _cookie_names(response: Response) -> set[str]:
     return {
         value.decode().split("=", 1)[0]
         for key, value in response.raw_headers
         if key == b"set-cookie"
     }
-
 
 @pytest.mark.parametrize(
     ("creator", "token_type"),
@@ -85,7 +75,6 @@ def test_session_and_reset_token_creators_include_version(creator, token_type):
 
     assert payload["type"] == token_type
     assert payload["ver"] == 9
-
 
 def test_access_token_with_current_version_authenticates(monkeypatch):
     user = SimpleNamespace(email="user@example.com", token_version=4)
@@ -103,7 +92,6 @@ def test_access_token_with_current_version_authenticates(monkeypatch):
     )
 
     assert current_user is user
-
 
 @pytest.mark.parametrize(
     "access_token",
@@ -132,7 +120,6 @@ def test_access_token_with_old_or_missing_version_is_rejected(
 
     assert error.value.status_code == 401
     assert error.value.detail == "Invalid access token"
-
 
 @pytest.mark.parametrize(
     "access_token",
@@ -167,7 +154,6 @@ def test_malformed_or_expired_access_token_is_rejected_before_user_lookup(
     assert error.value.status_code == 401
     get_user_mock.assert_not_called()
 
-
 def test_refresh_token_with_current_version_rotates_versioned_tokens(monkeypatch):
     user = SimpleNamespace(email="user@example.com", token_version=6)
     user.is_verified = True
@@ -185,7 +171,6 @@ def test_refresh_token_with_current_version_rotates_versioned_tokens(monkeypatch
     assert result == {"message": "Tokens refreshed successfully"}
     assert _decode(_cookie_value(response, "access_token"))["ver"] == 6
     assert _decode(_cookie_value(response, "refresh_token"))["ver"] == 6
-
 
 @pytest.mark.parametrize(
     "refresh_token",
@@ -213,7 +198,6 @@ def test_refresh_token_with_old_or_missing_version_is_rejected_without_rotation(
     assert rejection.status_code == 401
     assert json.loads(rejection.body) == {"detail": "Invalid refresh token"}
     assert _cookie_names(rejection) == {"access_token", "refresh_token"}
-
 
 @pytest.mark.parametrize(
     "refresh_token",
@@ -250,7 +234,6 @@ def test_malformed_or_expired_refresh_token_is_rejected_and_cookies_expire(
     assert _cookie_names(rejection) == {"access_token", "refresh_token"}
     get_user_mock.assert_not_called()
 
-
 def test_login_uses_authenticated_users_current_token_version(monkeypatch):
     user = SimpleNamespace(email="user@example.com", token_version=12)
     monkeypatch.setattr(auth_api, "authenticate_user", Mock(return_value=user))
@@ -264,7 +247,6 @@ def test_login_uses_authenticated_users_current_token_version(monkeypatch):
 
     assert _decode(_cookie_value(response, "access_token"))["ver"] == 12
     assert _decode(_cookie_value(response, "refresh_token"))["ver"] == 12
-
 
 def test_reset_token_is_single_use_and_only_new_password_authenticates(monkeypatch):
     old_password = "old-password"
@@ -315,7 +297,6 @@ def test_reset_token_is_single_use_and_only_new_password_authenticates(monkeypat
     assert old_password_error.value.status_code == 401
     assert authenticate_user(db=Mock(), email=user.email, password=new_password) is user
 
-
 def test_reset_to_current_password_is_rejected_without_consuming_the_token():
     current_password = "current-password"
     original_hash = hash_password(current_password)
@@ -354,7 +335,6 @@ def test_reset_to_current_password_is_rejected_without_consuming_the_token():
     assert not verify_password(current_password, user.hashed_password)
     db.commit.assert_called_once()
 
-
 def test_stale_reset_token_is_rejected_without_password_change_or_commit():
     original_hash = hash_password("current-password")
     user = SimpleNamespace(
@@ -379,7 +359,6 @@ def test_stale_reset_token_is_rejected_without_password_change_or_commit():
     assert user.hashed_password == original_hash
     assert user.token_version == 5
     db.commit.assert_not_called()
-
 
 @pytest.mark.parametrize(
     "reset_token",
@@ -414,7 +393,6 @@ def test_malformed_or_expired_reset_token_returns_controlled_400(reset_token):
     assert error.value.detail == "Invalid or expired password reset token"
     db.query.assert_not_called()
     db.commit.assert_not_called()
-
 
 def test_reset_invalidates_old_sessions_and_new_login_uses_incremented_version(
     monkeypatch,
@@ -468,7 +446,6 @@ def test_reset_invalidates_old_sessions_and_new_login_uses_incremented_version(
     assert _decode(_cookie_value(login_response, "access_token"))["ver"] == 3
     assert _decode(_cookie_value(login_response, "refresh_token"))["ver"] == 3
 
-
 def test_password_reset_invalidates_previously_issued_verification_handoff(
     monkeypatch,
 ):
@@ -504,7 +481,6 @@ def test_password_reset_invalidates_previously_issued_verification_handoff(
     assert error.value.status_code == 401
     assert _cookie_names(response) == set()
 
-
 def test_unverified_user_cannot_refresh_even_with_current_version(monkeypatch):
     user = SimpleNamespace(
         email="user@example.com",
@@ -524,7 +500,6 @@ def test_unverified_user_cannot_refresh_even_with_current_version(monkeypatch):
 
     assert rejection.status_code == 401
     assert _cookie_names(rejection) == {"access_token", "refresh_token"}
-
 
 def test_user_token_version_column_has_safe_zero_defaults():
     column = User.__table__.c.token_version

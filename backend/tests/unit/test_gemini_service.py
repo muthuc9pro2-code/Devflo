@@ -17,7 +17,6 @@ _MINIMAL_GEMINI_JSON = (
     '"recommended_actions": [], "uncertainties": []}'
 )
 
-
 def _server_error(status_code=503):
     return genai_errors.ServerError(
         status_code,
@@ -25,18 +24,15 @@ def _server_error(status_code=503):
         None,
     )
 
-
 def _client_error(status_code):
     return genai_errors.ClientError(
         status_code, {"message": "client error", "status": "ERROR"}, None
     )
 
-
 def _mock_response(text=_MINIMAL_GEMINI_JSON):
     mock_response = MagicMock()
     mock_response.text = text
     return mock_response
-
 
 def test_generate_investigation_explanation_returns_structured_response():
     gemini_json = """
@@ -105,7 +101,6 @@ def test_generate_investigation_explanation_returns_structured_response():
 
     generate_content.assert_called_once()
 
-
 def test_gemini_request_preserves_ready_zero_match_source_context():
     context = {
         "analysis_id": 1,
@@ -134,13 +129,7 @@ def test_gemini_request_preserves_ready_zero_match_source_context():
     assert 'status="ready", match_count=0' in instruction
     assert 'Do not describe this state as "no source' in instruction
 
-
 def test_generate_investigation_explanation_disables_automatic_function_calling():
-    """Devflo never registers tools/functions on this request, so there is
-    nothing for Automatic Function Calling to dispatch - it must be
-    explicitly disabled rather than left at the SDK's default-enabled
-    behavior (which otherwise logs an AFC warning and recommends
-    Chat.send_message for no reason here)."""
     with patch(
         "app.services.gemini_service._client.models.generate_content",
         return_value=_mock_response(),
@@ -150,10 +139,7 @@ def test_generate_investigation_explanation_disables_automatic_function_calling(
     _, kwargs = generate_content.call_args
     assert kwargs["config"].automatic_function_calling.disable is True
 
-
 def test_generate_investigation_explanation_sets_a_finite_request_timeout():
-    """Without a per-request timeout, a stalled connection can block a
-    Celery worker indefinitely and never reach the retry logic below."""
     with patch(
         "app.services.gemini_service._client.models.generate_content",
         return_value=_mock_response(),
@@ -162,7 +148,6 @@ def test_generate_investigation_explanation_sets_a_finite_request_timeout():
 
     _, kwargs = generate_content.call_args
     assert kwargs["config"].http_options.timeout == _REQUEST_TIMEOUT_SECONDS * 1000
-
 
 def test_request_timeout_still_set_after_a_retry(monkeypatch):
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
@@ -176,14 +161,7 @@ def test_request_timeout_still_set_after_a_retry(monkeypatch):
     _, kwargs = generate_content.call_args
     assert kwargs["config"].http_options.timeout == _REQUEST_TIMEOUT_SECONDS * 1000
 
-
-# --- 1/2: 5xx (ServerError) retry policy --------------------------------
-
-
 def test_generate_investigation_explanation_retries_transient_server_error(monkeypatch):
-    """A 503 ("high demand") is transient - a subsequent attempt within the
-    bounded retry budget that succeeds must return the real result, not
-    fail the caller."""
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
 
     with patch(
@@ -195,12 +173,7 @@ def test_generate_investigation_explanation_retries_transient_server_error(monke
     assert isinstance(result, GeminiInvestigationResponse)
     assert generate_content.call_count == 2
 
-
 def test_generate_investigation_explanation_raises_unavailable_after_exhausting_retries(monkeypatch):
-    """If Gemini stays unavailable for the whole bounded retry budget, the
-    caller (finalize) must get a distinguishable GeminiUnavailableError, not
-    a raw SDK exception nor a hang - that is what lets finalize complete
-    the deterministic result instead of failing the whole analysis."""
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
 
     with patch(
@@ -212,14 +185,7 @@ def test_generate_investigation_explanation_raises_unavailable_after_exhausting_
 
     assert generate_content.call_count == 3
 
-
-# --- 3/4: 429 (ClientError) is now retried, unlike other 4xx ------------
-
-
 def test_generate_investigation_explanation_retries_429_client_error(monkeypatch):
-    """429 (rate limiting) is a ClientError in google.genai, but it IS
-    transient - it must be retried like a 5xx, not treated as an ordinary
-    non-retryable 4xx."""
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
 
     with patch(
@@ -230,7 +196,6 @@ def test_generate_investigation_explanation_retries_429_client_error(monkeypatch
 
     assert isinstance(result, GeminiInvestigationResponse)
     assert generate_content.call_count == 2
-
 
 def test_generate_investigation_explanation_raises_unavailable_after_exhausting_429_retries(monkeypatch):
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
@@ -244,16 +209,7 @@ def test_generate_investigation_explanation_raises_unavailable_after_exhausting_
 
     assert generate_content.call_count == 3
 
-
-# --- 5/6: ordinary non-429 4xx is NOT retried, but IS converted ---------
-
-
 def test_generate_investigation_explanation_does_not_retry_400_but_raises_unavailable():
-    """A 400 (bad request) is not transient - retrying it cannot succeed,
-    so it must NOT burn the retry budget. But it must also never escape as
-    a raw SDK exception - the finalizer only catches GeminiUnavailableError,
-    so anything else would incorrectly fail an otherwise-complete
-    deterministic investigation."""
     with patch(
         "app.services.gemini_service._client.models.generate_content",
         side_effect=_client_error(400),
@@ -262,7 +218,6 @@ def test_generate_investigation_explanation_does_not_retry_400_but_raises_unavai
             generate_investigation_explanation({"analysis_id": 1})
 
     generate_content.assert_called_once()
-
 
 @pytest.mark.parametrize("status_code", [401, 403])
 def test_generate_investigation_explanation_does_not_retry_auth_errors(status_code):
@@ -275,14 +230,7 @@ def test_generate_investigation_explanation_does_not_retry_auth_errors(status_co
 
     generate_content.assert_called_once()
 
-
-# --- 7/8: unexpected transport/SDK exceptions from generate_content ----
-
-
 def test_generate_investigation_explanation_retries_unexpected_transport_error(monkeypatch):
-    """A generic network/timeout/SDK exception (not a genai_errors type at
-    all) raised by the external generate_content(...) call must still be
-    bounded-retried, then converted - never left to propagate raw."""
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
 
     with patch(
@@ -294,10 +242,7 @@ def test_generate_investigation_explanation_retries_unexpected_transport_error(m
 
     assert generate_content.call_count == 3
 
-
 def test_generate_investigation_explanation_transport_error_then_success(monkeypatch):
-    """A transport exception followed by a successful call within the
-    retry budget must return the real, valid result."""
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
 
     with patch(
@@ -309,13 +254,7 @@ def test_generate_investigation_explanation_transport_error_then_success(monkeyp
     assert isinstance(result, GeminiInvestigationResponse)
     assert generate_content.call_count == 2
 
-
-# --- 9/10: response validation ------------------------------------------
-
-
 def test_malformed_json_response_raises_unavailable_not_retried(monkeypatch):
-    """A response body that isn't even valid JSON must not be retried in
-    this V1 - it converts straight to GeminiUnavailableError."""
     sleep_calls = []
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: sleep_calls.append(seconds))
 
@@ -329,12 +268,7 @@ def test_malformed_json_response_raises_unavailable_not_retried(monkeypatch):
     generate_content.assert_called_once()
     assert sleep_calls == []
 
-
 def test_schema_invalid_json_response_raises_unavailable_not_retried(monkeypatch):
-    """Valid JSON that does not satisfy GeminiInvestigationResponse's
-    schema (e.g. missing required fields) must also convert to
-    GeminiUnavailableError without being retried, and without loosening
-    the schema or accepting a partial result."""
     sleep_calls = []
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: sleep_calls.append(seconds))
 
@@ -348,7 +282,6 @@ def test_schema_invalid_json_response_raises_unavailable_not_retried(monkeypatch
     generate_content.assert_called_once()
     assert sleep_calls == []
 
-
 def test_lazy_client_initialization_failure_raises_unavailable(monkeypatch):
     monkeypatch.setattr(gemini_service._client, "_resolved_client", None)
 
@@ -359,7 +292,6 @@ def test_lazy_client_initialization_failure_raises_unavailable(monkeypatch):
 
     with pytest.raises(GeminiUnavailableError, match="SDK initialization failed"):
         generate_investigation_explanation({"analysis_id": 1})
-
 
 def test_throwing_response_text_property_raises_unavailable_without_retry(monkeypatch):
     sleep_calls = []
@@ -382,10 +314,6 @@ def test_throwing_response_text_property_raises_unavailable_without_retry(monkey
     generate_content.assert_called_once()
     assert sleep_calls == []
 
-
-# --- 11: successful valid response remains unchanged --------------------
-
-
 def test_successful_valid_response_returns_parsed_result_unchanged():
     with patch(
         "app.services.gemini_service._client.models.generate_content",
@@ -397,10 +325,6 @@ def test_successful_valid_response_returns_parsed_result_unchanged():
     assert result.title == "t"
     assert result.summary == "s"
     generate_content.assert_called_once()
-
-
-# --- 12: automatic function calling remains disabled (also covered above) -
-
 
 def test_automatic_function_calling_disabled_even_after_a_retry(monkeypatch):
     monkeypatch.setattr("app.services.gemini_service.sleep", lambda seconds: None)
@@ -414,7 +338,6 @@ def test_automatic_function_calling_disabled_even_after_a_retry(monkeypatch):
     _, kwargs = generate_content.call_args
     assert kwargs["config"].automatic_function_calling.disable is True
 
-
 def test_unconfigured_gemini_is_optional_and_never_constructs_sdk_client(monkeypatch):
     monkeypatch.setattr(gemini_service.Settings, "GEMINI_API_KEY", None)
     monkeypatch.setattr(gemini_service._client, "_resolved_client", None)
@@ -425,7 +348,6 @@ def test_unconfigured_gemini_is_optional_and_never_constructs_sdk_client(monkeyp
         generate_investigation_explanation({"analysis_id": 1})
 
     client_constructor.assert_not_called()
-
 
 def test_gemini_request_redacts_obvious_secrets_without_mutating_context():
     context = {
@@ -456,7 +378,6 @@ def test_gemini_request_redacts_obvious_secrets_without_mutating_context():
                 ],
             }
         ],
-        # Deliberately NOT PII redaction.
         "contact": "alice@example.com",
     }
     original = deepcopy(context)
@@ -489,11 +410,8 @@ def test_gemini_request_redacts_obvious_secrets_without_mutating_context():
     source_snippet = parsed["evidence"][0]["source_matches"][0]["snippet"]
     assert "mode=rw" in source_snippet
     assert "raise RuntimeError('boom')" in source_snippet
-    # We explicitly are NOT building a general PII scrubber in this project.
     assert parsed["contact"] == "alice@example.com"
-    # Gemini gets a redacted COPY. Deterministic context remains intact.
     assert context == original
-
 
 def test_gemini_redaction_is_narrow_and_does_not_scrub_benign_security_words():
     context = {
@@ -523,7 +441,6 @@ def test_gemini_redaction_is_narrow_and_does_not_scrub_benign_security_words():
         "secret rotation job completed"
     )
 
-
 def test_gemini_redacts_sensitive_values_embedded_in_json_log_strings():
     context = {
         "evidence": [
@@ -552,7 +469,6 @@ def test_gemini_redacts_sensitive_values_embedded_in_json_log_strings():
     assert representative["Cookie"] == "[REDACTED]"
     assert representative["Authorization"] == "[REDACTED]"
     assert representative["message"] == "database timeout"
-
 
 def test_gemini_source_redaction_preserves_references_but_removes_hardcoded_literals():
     context = {
@@ -610,7 +526,6 @@ def test_gemini_source_redaction_preserves_references_but_removes_hardcoded_lite
     assert 'SECRET_KEY = "[REDACTED]"' in snippet
     assert "dbPassword = '[REDACTED]'" in snippet
     assert "stripeSecretKey = `[REDACTED]`" in snippet
-
 
 def test_gemini_redaction_covers_devflo_env_credentials_without_scrubbing_metadata():
     context = {
@@ -680,7 +595,6 @@ def test_gemini_redaction_covers_devflo_env_credentials_without_scrubbing_metada
     assert sent["COOKIE_SECURE"] is False
     assert sent["api_key_name"] == "provider-key-name"
 
-
 def test_gemini_source_redaction_handles_env_files_and_preserves_substitutions():
     context = {
         "evidence": [
@@ -722,7 +636,6 @@ def test_gemini_source_redaction_handles_env_files_and_preserves_substitutions()
     assert "DATABASE_URL=mysql://user:[REDACTED]@db/devflo" in snippet
     assert "REDIS_EVENTS_URL=redis://:[REDACTED]@redis:6379/0" in snippet
 
-
 def test_gemini_redaction_covers_private_keys_jwts_and_signed_urls_without_breaking_username_only_urls():
     context = {
         "evidence": [
@@ -759,7 +672,6 @@ def test_gemini_redaction_covers_private_keys_jwts_and_signed_urls_without_break
     assert "super-secret-private-key-material" not in line
     assert "-----BEGIN PRIVATE KEY-----" in line
     assert "-----END PRIVATE KEY-----" in line
-
 
 @pytest.mark.parametrize(
     ("relative_path", "snippet", "secret_fragments", "safe_fragment"),
@@ -847,7 +759,6 @@ def test_gemini_source_redaction_removes_complete_multiline_config_values(
     assert safe_fragment in sent
     assert "[REDACTED]" in sent
 
-
 def test_gemini_env_redaction_does_not_treat_hash_inside_secret_as_a_comment():
     context = {
         "evidence": [
@@ -875,7 +786,6 @@ def test_gemini_env_redaction_does_not_treat_hash_inside_secret_as_a_comment():
     assert "after" not in sent
     assert "SECRET_KEY=[REDACTED]" in sent
     assert "SAFE=value" in sent
-
 
 def test_gemini_source_redaction_handles_triple_quoted_secret_literals_without_hiding_references():
     context = {

@@ -1,8 +1,6 @@
 from io import BytesIO
 from pathlib import Path
-
 import pytest
-
 from app.services.artifact_detector import (
     ArtifactFormat,
     detect_artifact,
@@ -12,7 +10,6 @@ from app.services.artifact_detector import (
 )
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "diagnostics"
-
 
 @pytest.mark.parametrize(
     ("fixture_name", "expected"),
@@ -39,7 +36,6 @@ def test_content_first_format_detection(fixture_name, expected):
     path = FIXTURES / fixture_name
     assert detect_artifact(path, filename="misleading.txt") == expected
 
-
 def test_misleading_json_hint_falls_back_to_generic():
     assert (
         detect_artifact_sample(
@@ -49,7 +45,6 @@ def test_misleading_json_hint_falls_back_to_generic():
         )
         == ArtifactFormat.GENERIC
     )
-
 
 @pytest.mark.parametrize(
     ("sample", "expected"),
@@ -75,17 +70,7 @@ def test_misleading_json_hint_falls_back_to_generic():
 def test_remaining_v1_families_are_recognized(sample, expected):
     assert detect_artifact_sample(sample) == expected
 
-
-# --- upload-acceptance gate: content-first, not extension-fragile --------
-
-
 def test_cloudfront_tsv_is_accepted_through_the_real_upload_gate():
-    """Regression: cloudfront.tsv was correctly DETECTED as cloud_gateway
-    (see test_content_first_format_detection above) but could still be
-    REJECTED before detection ever ran, because .tsv was never in
-    SUPPORTED_TEXT_SUFFIXES/MIME_TYPES - a format Devflo knows how to parse
-    was rejected before it got the chance. This goes through the actual
-    upload-support gate, not detect_artifact_sample() directly."""
     sample = (FIXTURES / "cloudfront.tsv").read_bytes()
 
     assert is_supported_diagnostic_sample(
@@ -93,43 +78,29 @@ def test_cloudfront_tsv_is_accepted_through_the_real_upload_gate():
     )
     assert is_supported_diagnostic_sample(sample, filename="cloudfront.tsv", mime_type=None)
 
-
 @pytest.mark.parametrize(
     "filename",
     ("access.log.1", "error.log.2", "access.log.42"),
 )
 def test_rotated_log_filenames_are_not_rejected_by_the_numeric_suffix(filename):
-    """Path.suffix on "access.log.1" is ".1", not ".log" - the rotation
-    counter must not shadow the real, supported extension underneath it."""
     sample = (FIXTURES / "nginx.txt").read_bytes()
 
     assert is_supported_diagnostic_sample(sample, filename=filename)
-
 
 @pytest.mark.parametrize("filename", ("service.out", "stderr.err", "notes.txt"))
 def test_common_plain_diagnostic_suffixes_remain_accepted(filename):
     sample = b"2026-08-12 10:00:00 ERROR service=worker connection refused"
     assert is_supported_diagnostic_sample(sample, filename=filename)
 
-
 def test_unfamiliar_extension_with_confidently_detected_family_is_accepted():
-    """A syslog-shaped sample under a totally unfamiliar extension/MIME must
-    still be accepted - content proves it is a real, supported family."""
     sample = (FIXTURES / "syslog.txt").read_bytes()
     assert is_supported_diagnostic_sample(sample, filename="whatever.syslogdump", mime_type=None)
 
-
 def test_unfamiliar_extension_with_only_generic_content_is_still_rejected():
-    """The content-first exception is deliberately narrow: an unfamiliar
-    extension only rescues a CONFIDENTLY-detected specific family
-    (e.g. cloud_gateway). Ordinary unstructured text under an unfamiliar
-    extension must not be waved through as if it were a recognized
-    diagnostic family - that would make GENERIC swallow arbitrary files."""
     assert not is_supported_diagnostic_sample(
         b"just some random unstructured text, not diagnostic in shape",
         filename="notes.xyz",
     )
-
 
 def test_binary_content_is_rejected_regardless_of_extension():
     assert not is_supported_diagnostic_sample(
@@ -138,12 +109,10 @@ def test_binary_content_is_rejected_regardless_of_extension():
     )
     assert not is_supported_diagnostic_sample(b"", filename="empty.log")
 
-
 def test_known_image_suffix_is_still_accepted_through_the_gate():
     assert is_supported_diagnostic_sample(
         b"\x89PNG\r\n\x1a\n", filename="screenshot.png"
     )
-
 
 def test_detector_uses_a_bounded_read_and_restores_position():
     class GuardedStream(BytesIO):

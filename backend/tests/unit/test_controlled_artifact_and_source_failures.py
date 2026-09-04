@@ -1,30 +1,10 @@
-"""Controlled artifact/source failure isolation.
-
-Expected USER-INPUT / RESOURCE / OPTIONAL-ENRICHMENT failures must degrade
-gracefully; internal/infrastructure failures must remain fatal. Covers:
-
-- a JSON artifact whose individual scalar exceeds the supported bound
-  (resource_limited), with partial Evidence from that one failed artifact
-  cleaned up and every other artifact's Evidence untouched;
-- an image that fails RapidOCR after passing validation (processing_error);
-- optional source ZIP/GitHub acquisition failing in a controlled way
-  (source_status="unavailable") without failing the diagnostic investigation;
-- source-contained acquisition/index/matching failures degrading while core
-  artifact, database, and deterministic-correlation failures remain fatal;
-- resource_limited/processing_error artifact outcomes surviving the live
-  event, a mid-processing reconnect snapshot, and the final result payload;
-- Devflo AI (Gemini) unavailability across CORRELATED/SIMPLE/fallback paths
-  without ever leaking the provider name into user-facing payloads.
-"""
 import json
 from datetime import datetime, timezone
 from io import BytesIO
-
 import pytest
 from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.services.artifact_detector import ArtifactFormat
@@ -37,10 +17,6 @@ from app.services import gemini_service, image_text_extractor
 from app.tasks import analysis as analysis_task
 from app.services import source_archive
 
-
-# --- shared fixtures -------------------------------------------------------
-
-
 def _db_with_schema(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -48,11 +24,7 @@ def _db_with_schema(monkeypatch):
     monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
     return session_factory
 
-
 def _force_single_item_batches(monkeypatch):
-    """Every ArtifactEvent becomes its own batch/commit - so a fixture only
-    needs a couple of valid records (not thousands) to prove that earlier,
-    already-committed batches of a since-failed artifact get cleaned up."""
     from app.services.batch_processor import create_batches as real_create_batches
 
     monkeypatch.setattr(
@@ -61,15 +33,7 @@ def _force_single_item_batches(monkeypatch):
         lambda items: real_create_batches(items, max_batch_bytes=64, max_batch_items=1),
     )
 
-
 def _use_sqlite_compatible_evidence_persistence(monkeypatch):
-    """persist_evidence_batch's real implementation uses a MySQL-only
-    insert(...).on_duplicate_key_update(...) statement that cannot compile
-    against sqlite (the same limitation test_multifile_processing.py/
-    test_artifact_outcome_live_events.py document and route around). This
-    swaps in a plain per-event insert equivalent enough for these tests:
-    real Evidence rows actually land in the sqlite DB, so a controlled
-    artifact failure's cleanup query has real rows to delete."""
     counter = {"n": 0}
 
     def fake_persist(*, db, analysis_id, events, artifact_id=None):
@@ -124,16 +88,13 @@ def _use_sqlite_compatible_evidence_persistence(monkeypatch):
 
     monkeypatch.setattr(analysis_task, "persist_evidence_batch", fake_persist)
 
-
 def _quiet_sse(monkeypatch):
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_artifact_outcome", lambda *a, **k: None)
 
-
 def _raise_gemini_unavailable(_context):
     raise GeminiUnavailableError("temporarily unavailable")
-
 
 def _seed_user_and_analysis(session_factory, **analysis_kwargs) -> int:
     db = session_factory()
@@ -151,7 +112,6 @@ def _seed_user_and_analysis(session_factory, **analysis_kwargs) -> int:
     analysis_id = analysis.id
     db.close()
     return analysis_id
-
 
 def _add_artifact(
     session_factory,
@@ -180,12 +140,7 @@ def _add_artifact(
     db.close()
     return artifact_id
 
-
 def _oversized_json_array(tmp_path, good_count: int = 2):
-    """A single top-level JSON array (never JSON-lines) so it routes through
-    _stream_json_document's BoundedJsonStream-protected ijson parse. The
-    first `good_count` records are real, evidence-worthy ERROR records; the
-    final record's message exceeds the supported 1 MiB scalar limit."""
     records = [
         {
             "level": "ERROR",
@@ -207,22 +162,16 @@ def _oversized_json_array(tmp_path, good_count: int = 2):
     path.write_text(json.dumps(records))
     return path
 
-
 def _valid_generic_log(tmp_path, name: str, marker: str):
     path = tmp_path / name
     path.write_text(f"2026-08-12 10:00:00 ERROR service=api ConnectionError: {marker}\n")
     return path
-
 
 def _valid_png(path):
     buffer = BytesIO()
     Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
     path.write_bytes(buffer.getvalue())
     return path
-
-
-# --- TEST 1: mixed artifact resource failure --------------------------------
-
 
 def test_oversized_json_scalar_is_resource_limited_without_poisoning_the_chord(
     tmp_path, monkeypatch
@@ -252,10 +201,6 @@ def test_oversized_json_scalar_is_resource_limited_without_poisoning_the_chord(
         path=valid2_path, detected_format=ArtifactFormat.GENERIC.value,
     )
 
-    # None of these raise - a controlled artifact failure must never poison
-    # the chord (Celery only invokes the finalizer once every task in the
-    # group has "completed successfully", which .run() returning normally
-    # here proves).
     analysis_task._process_artifact_task.run(analysis_id, valid1_id, 0)
     result = analysis_task._process_artifact_task.run(analysis_id, bad_id, 0)
     analysis_task._process_artifact_task.run(analysis_id, valid2_id, 0)
@@ -270,21 +215,15 @@ def test_oversized_json_scalar_is_resource_limited_without_poisoning_the_chord(
     assert bad_artifact.last_processed_line == 0
     assert bad_artifact.fallback_context is None
 
-    # The two good records from the failed artifact's own earlier-committed
-    # batches must be gone - partial evidence from an incomplete ingestion
-    # must never survive or participate in correlation.
     bad_evidence = db.query(Evidence).filter(Evidence.artifact_id == bad_id).all()
     assert bad_evidence == []
 
-    # The other two artifacts' Evidence is completely untouched.
     valid1_evidence = db.query(Evidence).filter(Evidence.artifact_id == valid1_id).all()
     valid2_evidence = db.query(Evidence).filter(Evidence.artifact_id == valid2_id).all()
     assert len(valid1_evidence) == 1
     assert len(valid2_evidence) == 1
     db.close()
 
-    # The finalizer runs (chord callback) and completes using only the
-    # valid evidence.
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
@@ -296,10 +235,6 @@ def test_oversized_json_scalar_is_resource_limited_without_poisoning_the_chord(
     assert statuses["valid1.log"] == "processed"
     assert statuses["valid2.log"] == "processed"
     db.close()
-
-
-# --- TEST 2: OCR engine failure ---------------------------------------------
-
 
 def test_ocr_engine_failure_is_processing_error_without_poisoning_the_chord(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
@@ -317,7 +252,7 @@ def test_ocr_engine_failure_is_processing_error_without_poisoning_the_chord(tmp_
     analysis_id = _seed_user_and_analysis(session_factory)
     valid_path = _valid_generic_log(tmp_path, "valid.log", "db refused")
     image_path = tmp_path / "broken.jpg"
-    image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)  # content is irrelevant; OCR is mocked
+    image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
 
     valid_id = _add_artifact(
         session_factory, analysis_id=analysis_id, position=0, filename="valid.log",
@@ -338,17 +273,12 @@ def test_ocr_engine_failure_is_processing_error_without_poisoning_the_chord(tmp_
     assert image_artifact.failure_reason == "Image OCR could not be completed."
     db.close()
 
-    # Finalizer still runs.
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert analysis.status == "completed"
     db.close()
-
-
-# --- TEST 3/4: controlled optional-source failure (ZIP and GitHub) ---------
-
 
 def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
     tmp_path,
@@ -370,16 +300,12 @@ def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
     archive_bytes[payload_offset] ^= 0xFF
     archive.write_bytes(archive_bytes)
 
-    # Central-directory-only upload validation deliberately succeeds. The
-    # corruption is discovered only when the worker reads the file body.
     source_archive.validate_source_zip(archive)
 
     analysis_id = _seed_user_and_analysis(
         session_factory, source_kind="zip", source_reference=str(archive)
     )
 
-    # Controlled source failure must not raise - process_analysis's chain
-    # (_prepare_source_task -> chord) must be able to continue.
     analysis_task._prepare_source_task.run(analysis_id, 0)
 
     db = session_factory()
@@ -399,7 +325,7 @@ def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
     db = session_factory()
     evidence = db.query(Evidence).filter(Evidence.artifact_id == valid_id).first()
     assert evidence is not None
-    assert evidence.source_matches in (None, [])  # no source index was ever built
+    assert evidence.source_matches in (None, [])
     db.close()
 
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
@@ -410,7 +336,6 @@ def test_corrupt_source_zip_degrades_gracefully_and_diagnostics_continue(
     assert analysis.result_snapshot["source"]["status"] == "unavailable"
     assert "ZIP" in analysis.result_snapshot["source"]["failure_reason"]
     db.close()
-
 
 def test_source_github_controlled_failure_degrades_gracefully(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
@@ -453,10 +378,6 @@ def test_source_github_controlled_failure_degrades_gracefully(tmp_path, monkeypa
     assert "repository" in analysis.result_snapshot["source"]["failure_reason"]
     db.close()
 
-
-# --- TEST 5: unexpected/internal artifact failure remains fatal ------------
-
-
 def test_unexpected_internal_artifact_failure_remains_fatal(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
@@ -483,10 +404,6 @@ def test_unexpected_internal_artifact_failure_remains_fatal(tmp_path, monkeypatc
     assert artifact.status not in ("resource_limited", "processing_error")
     db.close()
 
-
-# --- TEST 6: source-contained unexpected acquisition failure degrades -------
-
-
 def test_unexpected_source_acquisition_failure_degrades(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
@@ -509,7 +426,6 @@ def test_unexpected_source_acquisition_failure_degrades(tmp_path, monkeypatch):
     assert analysis.source_status == "unavailable"
     assert "Optional source processing failed" in analysis.source_failure_reason
     db.close()
-
 
 def test_source_index_construction_failure_degrades_and_diagnostics_continue(
     tmp_path, monkeypatch
@@ -556,7 +472,6 @@ def test_source_index_construction_failure_degrades_and_diagnostics_continue(
     assert db.query(Evidence).filter(Evidence.artifact_id == valid_id).count() == 1
     db.close()
 
-
 def test_source_matching_failure_retains_evidence_without_source_matches(
     tmp_path, monkeypatch
 ):
@@ -599,7 +514,6 @@ def test_source_matching_failure_retains_evidence_without_source_matches(
     assert analysis.source_status == "unavailable"
     assert "retained without source enrichment" in analysis.source_failure_reason
     db.close()
-
 
 def test_malformed_otlp_before_first_record_fails_only_that_artifact(
     tmp_path, monkeypatch
@@ -656,7 +570,6 @@ def test_malformed_otlp_before_first_record_fails_only_that_artifact(
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "completed"
     db.close()
 
-
 def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
     tmp_path, monkeypatch
 ):
@@ -695,10 +608,6 @@ def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
 
     db = session_factory()
     bad = db.query(AnalysisArtifact).filter_by(id=bad_id).one()
-    # "pending" with a preserved partial checkpoint: recovery already reset
-    # a stuck-"processing" artifact back to "pending" (see
-    # _claim_and_demote_stale_processing), which is what this redispatch's
-    # own atomic artifact claim expects to find.
     bad.status = "pending"
     bad.last_processed_line = 1
     bad.processed_bytes = 0
@@ -738,7 +647,6 @@ def test_unsafe_structured_resume_cleans_checkpoint_evidence_but_keeps_sibling(
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "completed"
     db.close()
 
-
 def test_evidence_persistence_failure_remains_analysis_fatal(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
@@ -766,7 +674,6 @@ def test_evidence_persistence_failure_remains_analysis_fatal(tmp_path, monkeypat
     artifact = db.query(AnalysisArtifact).filter_by(id=artifact_id).one()
     assert artifact.status not in ("resource_limited", "processing_error")
     db.close()
-
 
 def test_deterministic_correlation_failure_remains_analysis_fatal(
     tmp_path, monkeypatch
@@ -822,11 +729,9 @@ def test_deterministic_correlation_failure_remains_analysis_fatal(
     assert db.query(Analysis).filter_by(id=analysis_id).one().status == "failed"
     db.close()
 
-
 def test_mixed_investigation_isolates_artifact_source_ocr_and_gemini_failures(
     tmp_path, monkeypatch
 ):
-    """Integration-style task regression for the complete isolation rule."""
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
     _use_sqlite_compatible_evidence_persistence(monkeypatch)
@@ -946,7 +851,6 @@ def test_mixed_investigation_isolates_artifact_source_ocr_and_gemini_failures(
     assert correlation_calls == [analysis_id]
     db.close()
 
-
 def test_gemini_response_object_failure_preserves_deterministic_result(
     tmp_path, monkeypatch
 ):
@@ -988,10 +892,6 @@ def test_gemini_response_object_failure_preserves_deterministic_result(
     assert analysis.result_snapshot.get("ai_analysis") is None
     db.close()
 
-
-# --- TEST 7: artifact outcome reconstruction --------------------------------
-
-
 def test_resource_limited_outcome_survives_live_reconnect_and_final_result(tmp_path, monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _force_single_item_batches(monkeypatch)
@@ -1020,17 +920,12 @@ def test_resource_limited_outcome_survives_live_reconnect_and_final_result(tmp_p
 
     analysis_task._process_artifact_task.run(analysis_id, bad_id, 0)
 
-    # 1) live artifact_outcome payload
     assert len(live_events) == 1
     live_payload = live_events[0]
     assert live_payload["source_file"] == "bad.json"
     assert live_payload["status"] == "resource_limited"
     assert live_payload["message"] == "JSON value exceeded the supported 1 MiB per-value limit."
 
-    # 2) DB reconstruction/reconnect - the OTHER artifact ("valid.log") is
-    # still "pending" (not yet processed), so analysis.status is still
-    # "processing" here - exactly the mid-processing reconnect window a
-    # client's SSE state snapshot must reconstruct correctly.
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     assert analysis.status == "processing"
@@ -1044,7 +939,6 @@ def test_resource_limited_outcome_survives_live_reconnect_and_final_result(tmp_p
         "JSON value exceeded the supported 1 MiB per-value limit."
     )
 
-    # 3) final result payload
     analysis_task._process_artifact_task.run(analysis_id, valid_id, 0)
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
@@ -1057,10 +951,6 @@ def test_resource_limited_outcome_survives_live_reconnect_and_final_result(tmp_p
     assert final_outcomes["bad.json"]["message"] == (
         "JSON value exceeded the supported 1 MiB per-value limit."
     )
-
-
-# --- TEST 8: Devflo AI (Gemini) unavailable, across all three paths --------
-
 
 def _seed_evidence_analysis(session_factory, *, evidence_rows_kwargs: list[dict]) -> int:
     db = session_factory()
@@ -1097,7 +987,6 @@ def _seed_evidence_analysis(session_factory, *, evidence_rows_kwargs: list[dict]
     db.close()
     return analysis_id
 
-
 @pytest.mark.parametrize(
     "evidence_kwargs",
     [
@@ -1124,7 +1013,6 @@ def test_devflo_ai_unavailable_preserves_deterministic_result_without_naming_pro
     assert analysis.status == "completed"
     assert analysis.ai_analysis is None
     assert "ai_analysis" not in analysis.result_snapshot
-    # Deterministic content survives regardless of AI availability.
     if analysis.result_snapshot["investigation_path"] == "correlated":
         assert len(analysis.result_snapshot["components"]) == 1
     db.close()
@@ -1133,10 +1021,7 @@ def test_devflo_ai_unavailable_preserves_deterministic_result_without_naming_pro
     assert "gemini" not in serialized.lower()
     assert "Gemini" not in serialized
 
-
 def test_devflo_ai_unavailable_fallback_path_preserves_deterministic_result(monkeypatch):
-    """The third Gemini call site: zero-structured-evidence with a usable
-    unstructured fallback context (captured OCR/text)."""
     session_factory = _db_with_schema(monkeypatch)
     db = session_factory()
     user = User(username="t", email="t@example.com", hashed_password="x", is_verified=True)
@@ -1176,10 +1061,6 @@ def test_devflo_ai_unavailable_fallback_path_preserves_deterministic_result(monk
     serialized = json.dumps(analysis.result_snapshot)
     assert "gemini" not in serialized.lower()
 
-
-# --- Final proof pass: explicit optional-source failure matrix -------------
-
-
 @pytest.mark.parametrize(
     "source_kind",
     [
@@ -1202,11 +1083,6 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
     source_kind,
     failure_stage,
 ):
-    """Both supported optional-source kinds must degrade identically when
-    acquisition, indexing, or manifest persistence fails: source becomes
-    unavailable, the Analysis stays processing, diagnostic Evidence still
-    persists, and finalization completes with an honest unavailable-source
-    outcome."""
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
     _use_sqlite_compatible_evidence_persistence(monkeypatch)
@@ -1292,8 +1168,6 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
         source_reference=source_reference,
     )
 
-    # Optional source failure must be contained here.
-    # It must never poison the diagnostic workflow.
     analysis_task._prepare_source_task.run(analysis_id, 0)
 
     db = session_factory()
@@ -1334,7 +1208,6 @@ def test_optional_source_preparation_failure_matrix_never_poison_diagnostics(
     assert completed.result_snapshot["source"]["failure_reason"]
     db.close()
 
-
 @pytest.mark.parametrize(
     "source_kind",
     [
@@ -1356,11 +1229,6 @@ def test_optional_source_post_publication_failure_matrix_retains_evidence_and_co
     source_kind,
     failure_stage,
 ):
-    """Failures discovered by artifact workers after source was considered
-    ready are still optional. A missing published tree, a ready-index
-    load/rebuild exception, or a source matcher exception must disable only
-    source enrichment, never diagnostic parsing, Evidence persistence, or
-    deterministic finalization."""
     session_factory = _db_with_schema(monkeypatch)
     _quiet_sse(monkeypatch)
     _use_sqlite_compatible_evidence_persistence(monkeypatch)

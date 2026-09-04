@@ -1,9 +1,7 @@
 import json
 from dataclasses import fields
 from pathlib import Path
-
 import pytest
-
 from app.services import diagnostic_parser
 from app.services.artifact_detector import ArtifactFormat, detect_artifact
 from app.services.diagnostic_adapters import stream_artifact_events
@@ -41,11 +39,9 @@ CANONICAL_FIELDS = {
     "artifact_id",
 }
 
-
 def normalized(fixture_name):
     path = FIXTURES / fixture_name
     return normalized_path(path)
-
 
 def normalized_path(path: Path):
     artifact_format = detect_artifact(path, filename=path.name)
@@ -57,16 +53,10 @@ def normalized_path(path: Path):
         )
     )
     for record in records:
-        # A retention gate may have already proven a record can't be
-        # important (e.g. a serverless START/END/REPORT lifecycle line,
-        # which is always level='INFO') and skipped constructing a
-        # ParsedEvent for it entirely - same mechanism GENERIC already used.
-        # Anything it DID construct must still be a real, fully-shaped event.
         assert record.event is None or isinstance(record.event, ParsedEvent)
         if record.event is not None:
             assert CANONICAL_FIELDS <= {item.name for item in fields(record.event)}
     return [record.event for record in records]
-
 
 def test_generic_plain_application_log():
     event = normalized("generic.txt")[0]
@@ -76,7 +66,6 @@ def test_generic_plain_application_log():
     assert event.service == "checkout"
     assert event.module == "payments"
     assert event.exception_type == "ValueError"
-
 
 def test_text_normalization_reuses_one_feature_classification(monkeypatch):
     classify = diagnostic_parser._classify_text
@@ -100,7 +89,6 @@ def test_text_normalization_reuses_one_feature_classification(monkeypatch):
         503,
     )
 
-
 def test_generic_parser_preserves_space_separated_identity_fields():
     event = parse_log_line(
         "2026-08-12 10:11:12 ERROR trace_id trace-space "
@@ -111,13 +99,11 @@ def test_generic_parser_preserves_space_separated_identity_fields():
     assert event.request_id == "request-space"
     assert event.service == "checkout"
 
-
 def test_generic_parser_preserves_legacy_timestamp_string():
     event = parse_log_line("2026-08-12 10:11:12 ERROR failed", 1)
 
     assert event.timestamp == "2026-08-12 10:11:12"
     assert isinstance(event.timestamp, str)
-
 
 def test_jsonl_structured_application_log_in_txt():
     event = normalized("json_in_txt.txt")[0]
@@ -127,7 +113,6 @@ def test_jsonl_structured_application_log_in_txt():
     assert event.service == "inventory"
     assert event.exception_type == "LookupError"
 
-
 def test_multiline_stack_trace_is_one_event_with_frames():
     events = normalized("stack_trace.txt")
     assert len(events) == 1
@@ -135,7 +120,6 @@ def test_multiline_stack_trace_is_one_event_with_frames():
     assert events[0].exception_type == "RuntimeError"
     assert events[0].stack_frames[0].file == "/srv/worker.py"
     assert events[0].stack_frames[0].line == 42
-
 
 def test_node_stack_trace_is_grouped_without_merging_independent_error_logs(tmp_path):
     node_path = tmp_path / "node-stack.txt"
@@ -168,7 +152,6 @@ def test_node_stack_trace_is_grouped_without_merging_independent_error_logs(tmp_
         "second",
     ]
 
-
 def test_nginx_access_log_normalization():
     access_event, apache_error = normalized("nginx.txt")
     assert access_event.level == "ERROR"
@@ -178,7 +161,6 @@ def test_nginx_access_log_normalization():
     assert apache_error.level == "ERROR"
     assert apache_error.exception_type == "RuntimeError"
 
-
 @pytest.mark.parametrize("fixture_name", ("docker.jsonl", "kubernetes.txt"))
 def test_container_log_normalization(fixture_name):
     event = normalized(fixture_name)[0]
@@ -186,13 +168,11 @@ def test_container_log_normalization(fixture_name):
     assert event.service == "orders"
     assert event.exception_type in {"ConnectionError", "TimeoutError"}
 
-
 def test_ci_cd_log_normalization():
     event = normalized("ci.txt")[0]
     assert event.level == "ERROR"
     assert event.service == "web"
     assert event.request_id == "deploy-1"
-
 
 def test_syslog_normalization_for_rfc5424_and_rfc3164():
     events = normalized("syslog.txt")
@@ -202,7 +182,6 @@ def test_syslog_normalization_for_rfc5424_and_rfc3164():
     assert events[0].service == "gateway"
     assert events[1].level == "WARNING"
     assert events[1].host == "worker-1"
-
 
 def test_otlp_logs_and_spans_preserve_explicit_relationships():
     events = normalized("otlp.json")
@@ -241,7 +220,6 @@ def test_otlp_logs_and_spans_preserve_explicit_relationships():
         informational_span
     ]
 
-
 def test_browser_har_normalization():
     event = normalized("browser.har")[0]
     assert event.timestamp is not None
@@ -249,13 +227,11 @@ def test_browser_har_normalization():
     assert event.http_status == 503
     assert event.endpoint == "https://example.test/api/cart"
 
-
 def test_cloud_load_balancer_normalization():
     event = normalized("cloud_gateway.txt")[0]
     assert event.level == "ERROR"
     assert event.http_status == 502
     assert event.endpoint == "https://api.example.test/orders"
-
 
 def test_cloudfront_fields_tsv_normalization_and_safe_resume():
     path = FIXTURES / "cloudfront.tsv"
@@ -277,9 +253,6 @@ def test_cloudfront_fields_tsv_normalization_and_safe_resume():
     assert first.event.host == "d111111abcdef8.cloudfront.net"
     assert first.event.endpoint == "/api/orders?order=123"
     assert first.event.timestamp is not None
-    # sc-status=200 -> level_from_http_status() gives INFO, which is never
-    # important, so the retention gate recognizes that from the sc-status
-    # column alone and skips constructing a ParsedEvent for it entirely.
     assert second.event is None
 
     resumed = list(
@@ -297,7 +270,6 @@ def test_cloudfront_fields_tsv_normalization_and_safe_resume():
     assert resumed[0].global_end_line_number == second.global_end_line_number
     assert resumed[0].end_offset == second.end_offset
 
-
 def test_message_broker_text_uses_source_defaults_without_losing_fields():
     kafka_event, rabbitmq_event = normalized("message_broker.txt")
 
@@ -308,19 +280,13 @@ def test_message_broker_text_uses_source_defaults_without_losing_fields():
     assert rabbitmq_event.level == "WARNING"
     assert rabbitmq_event.service == "rabbitmq"
 
-
 def test_serverless_plain_text_preserves_lambda_request_relationships():
     events = normalized("serverless.txt")
 
     assert len(events) == 4
-    # START/END/REPORT lifecycle lines are always level='INFO'
-    # (_normalize_serverless_text_event forces it), so the retention gate
-    # recognizes them as definitely unimportant up front and skips
-    # constructing a ParsedEvent for them entirely - the same class of
-    # optimization GENERIC already had for its own unimportant lines.
-    assert events[0] is None  # START RequestId: ...
-    assert events[2] is None  # END RequestId: ...
-    assert events[3] is None  # REPORT RequestId: ...
+    assert events[0] is None
+    assert events[2] is None
+    assert events[3] is None
 
     failure = events[1]
     assert failure is not None
@@ -331,7 +297,6 @@ def test_serverless_plain_text_preserves_lambda_request_relationships():
     assert failure.exception_type == "RuntimeError"
     assert filter_important_events([failure]) == [failure]
 
-
 def test_cloudwatch_document_streams_individual_log_events():
     events = normalized("cloudwatch.json")
     assert len(events) == 2
@@ -340,13 +305,11 @@ def test_cloudwatch_document_streams_individual_log_events():
     assert events[0].request_id == "lambda-1"
     assert events[1].level == "WARNING"
 
-
 def test_database_slow_query_block_is_one_bounded_event():
     events = normalized("database.txt")
     assert len(events) == 1
     assert events[0].level == "WARNING"
     assert "SELECT * FROM orders" in events[0].raw_line
-
 
 def test_compact_structured_wrapper_is_not_mistaken_for_jsonl(tmp_path):
     path = tmp_path / "compact-cloudwatch.json"
@@ -366,7 +329,6 @@ def test_compact_structured_wrapper_is_not_mistaken_for_jsonl(tmp_path):
         )
     )
     assert [record.event.level for record in records] == ["ERROR", "WARNING"]
-
 
 def test_cri_partial_fragments_are_reassembled_before_normalization(tmp_path):
     path = tmp_path / "cri-partial.log"
@@ -397,7 +359,6 @@ def test_cri_partial_fragments_are_reassembled_before_normalization(tmp_path):
     assert records[0].event.exception_type == "ConnectionError"
     assert records[0].event.service == "orders"
 
-
 def test_rfc5424_nil_timestamp_is_detected_and_normalized(tmp_path):
     path = tmp_path / "syslog-nil.log"
     path.write_text(
@@ -411,7 +372,6 @@ def test_rfc5424_nil_timestamp_is_detected_and_normalized(tmp_path):
     assert events[0].level == "WARNING"
     assert events[0].host == "edge-2"
     assert events[0].service == "scheduler"
-
 
 @pytest.mark.parametrize(
     "line",
@@ -432,7 +392,6 @@ def test_web_server_warn_lines_are_content_detected(tmp_path, line):
     assert events[0].source_format == "web_server"
     assert events[0].level == "WARNING"
 
-
 def test_log_praser_keeps_legacy_regex_constant_imports():
     from app.services import log_praser
 
@@ -449,15 +408,13 @@ def test_log_praser_keeps_legacy_regex_constant_imports():
 
     assert all(hasattr(getattr(log_praser, name), "search") for name in pattern_names)
 
-
 def test_log_praser_keeps_legacy_wildcard_exports():
     namespace: dict[str, object] = {}
 
-    exec("from app.services.log_praser import *", namespace)  # noqa: S102
+    exec("from app.services.log_praser import *", namespace)
 
     assert callable(namespace["parse_log_line"])
     assert hasattr(namespace["TIMESTAMP_PATTERN"], "search")
-
 
 def test_numeric_levels_are_source_specific_and_conversion_is_defensive():
     assert normalize_level(10) == "DEBUG"
@@ -476,7 +433,6 @@ def test_numeric_levels_are_source_specific_and_conversion_is_defensive():
     assert parse_timestamp(oversized_number) is None
     assert normalize_level(float("inf")) is None
     assert parse_timestamp(float("inf")) is None
-
 
 def test_streamed_document_aliases_match_jsonl_priority(tmp_path):
     payload = {
@@ -501,7 +457,6 @@ def test_streamed_document_aliases_match_jsonl_priority(tmp_path):
         document_event.exception_message == jsonl_event.exception_message == "details"
     )
 
-
 @pytest.mark.parametrize("as_document", (False, True))
 def test_structured_exception_without_level_is_promoted(as_document, tmp_path):
     payload = {"error": {"type": "LookupError", "message": "sku missing"}}
@@ -515,7 +470,6 @@ def test_structured_exception_without_level_is_promoted(as_document, tmp_path):
     assert event.level == "ERROR"
     assert event.exception_type == "LookupError"
     assert event.exception_message == "sku missing"
-
 
 def test_api_gateway_direct_access_log_aliases(tmp_path):
     path = tmp_path / "api-gateway.json"
@@ -542,7 +496,6 @@ def test_api_gateway_direct_access_log_aliases(tmp_path):
     assert event.endpoint == "/orders/{id}"
     assert event.http_status == 502
 
-
 def test_crash_report_without_textual_log_level_is_error(tmp_path):
     path = tmp_path / "runtime-crash.txt"
     path.write_text(
@@ -558,7 +511,6 @@ def test_crash_report_without_textual_log_level_is_error(tmp_path):
     assert len(events) == 1
     assert events[0].source_format == "stack_trace"
     assert events[0].level == "ERROR"
-
 
 def test_otlp_scope_name_does_not_leak_to_a_scope_without_metadata(tmp_path):
     path = tmp_path / "multiple-otel-scopes.json"

@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import shutil
 import sys
 import tempfile
@@ -13,7 +12,6 @@ from app.services.source_index import build_index
 
 SCRATCH = Path(tempfile.gettempdir()) / "devflo-bench-scratch"
 DEST = SCRATCH / "github_bench_clone"
-
 
 def main() -> None:
     url = sys.argv[1] if len(sys.argv) > 1 else "https://github.com/pallets/flask.git"
@@ -40,7 +38,6 @@ def main() -> None:
     print(f"local-CPU share of total prep time: {index_s / (clone_s + index_s) * 100:.2f}%")
 
     shutil.rmtree(DEST)
-
 
 if __name__ == "__main__":
     main()

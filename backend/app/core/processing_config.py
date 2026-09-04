@@ -14,9 +14,6 @@ MAX_REPRESENTATIVE_LINE_BYTES = 64 * 1024 - 1
 
 MAX_DIAGNOSTIC_ARTIFACTS = 200
 
-# Small admission bound for the interview deployment's two Celery worker
-# slots: two investigations may be doing useful work while one remains
-# queued. completed/failed/cancelled analyses never consume this capacity.
 MAX_ACTIVE_ANALYSES_PER_USER = 3
 MAX_OCR_IMAGES_PER_INVESTIGATION = 20
 MAX_OCR_IMAGE_BYTES = 20 * MEBIBYTE
@@ -45,15 +42,6 @@ SIMPLE_FRONTEND_MAX_CONTEXT_BYTES = 20 * MEBIBYTE
 SOURCE_STORAGE_ROOT = "uploads/sources"
 MAX_SOURCE_ARCHIVE_BYTES = 200 * MEBIBYTE
 
-# Coarse RAW HTTP request-body ceiling for POST /analysis/upload.
-#
-# The existing semantic limits remain authoritative:
-#   diagnostics <= 1 GiB
-#   optional source ZIP <= 200 MiB
-#
-# Multipart boundaries/headers need a little extra room. This limit exists
-# one layer earlier so an arbitrarily large multipart request cannot be
-# fully accepted/spooled before Devflo's normal upload copier sees it.
 ANALYSIS_UPLOAD_MULTIPART_OVERHEAD_BYTES = 8 * MEBIBYTE
 MAX_ANALYSIS_REQUEST_BODY_BYTES = (
     MAX_INVESTIGATION_UPLOAD_BYTES
@@ -65,9 +53,6 @@ ANALYSIS_REQUEST_BODY_LIMIT_DETAIL = (
 )
 MAX_SOURCE_TOTAL_BYTES = 500 * MEBIBYTE
 MAX_SOURCE_FILES = 20_000
-# Bound derived source-index amplification independently from the raw source
-# byte/file limits. Source matching stores one reversed lookup key per source
-# file rather than materializing one full suffix string per path component.
 MAX_SOURCE_RELATIVE_PATH_BYTES = 1024
 MAX_SOURCE_PATH_DEPTH = 32
 MAX_SOURCE_INDEX_LOOKUP_KEYS_PER_FILE = 1

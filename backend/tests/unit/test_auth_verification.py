@@ -1,12 +1,9 @@
-"""Email verification and original-browser session handoff."""
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 import jwt
 import pytest
 from fastapi import BackgroundTasks, HTTPException, Response
-
 from app.api import auth as auth_api
 from app.api import dependencies as auth_dependencies
 from app.core.config import Settings
@@ -28,11 +25,9 @@ from app.schemas.user import (
 )
 from app.services.email import send_verification_email
 
-
 def _token(email, token_type="email_verification", expires_in=timedelta(hours=24)):
     payload = {"sub": email, "type": token_type, "exp": datetime.now(UTC) + expires_in}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
 
 def _cookie_names(response: Response) -> set[str]:
     return {
@@ -41,7 +36,6 @@ def _cookie_names(response: Response) -> set[str]:
         if header[0] == b"set-cookie"
     }
 
-
 def _cookie_headers(response: Response) -> list[str]:
     return [
         header[1].decode()
@@ -49,12 +43,10 @@ def _cookie_headers(response: Response) -> list[str]:
         if header[0] == b"set-cookie"
     ]
 
-
 def _cookie_header(response: Response, name: str) -> str:
     return next(
         header for header in _cookie_headers(response) if header.startswith(f"{name}=")
     )
-
 
 @pytest.mark.parametrize("cookie_secure", [False, True])
 def test_registration_sets_secure_scoped_http_only_handoff_cookie(
@@ -91,7 +83,6 @@ def test_registration_sets_secure_scoped_http_only_handoff_cookie(
     assert payload["ver"] == created_user.token_version
     remaining_lifetime = payload["exp"] - datetime.now(UTC).timestamp()
     assert 29 * 60 <= remaining_lifetime <= 30 * 60
-
 
 def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeypatch):
     existing_password = "existing-password"
@@ -130,7 +121,6 @@ def test_existing_unverified_registration_resend_replaces_handoff_cookie(monkeyp
     )
     assert payload["sub"] == existing_user.email
     assert payload["ver"] == existing_user.token_version
-
 
 def test_existing_unverified_registration_wrong_password_cannot_get_handoff(
     monkeypatch,
@@ -171,7 +161,6 @@ def test_existing_unverified_registration_wrong_password_cannot_get_handoff(
     assert vars(existing_user) == original_account
     db.commit.assert_not_called()
 
-
 def test_existing_verified_registration_behavior_remains_unchanged(monkeypatch):
     existing_user = SimpleNamespace(
         email="verified@example.com",
@@ -205,14 +194,10 @@ def test_existing_verified_registration_behavior_remains_unchanged(monkeypatch):
     send_mock.assert_not_called()
     assert _cookie_names(response) == set()
 
-
 def _locked_db(user) -> Mock:
-    """A Mock db whose SELECT ... FOR UPDATE lookup (the same narrow
-    row-lock pattern reset_password() uses) resolves to `user`."""
     db = Mock()
     db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = user
     return db
-
 
 def test_successful_verification_marks_user_verified_without_authenticating():
     user = SimpleNamespace(email="new@example.com", is_verified=False)
@@ -230,14 +215,7 @@ def test_successful_verification_marks_user_verified_without_authenticating():
     db.query.return_value.filter.return_value.with_for_update.assert_called_once_with()
     assert _cookie_names(response) == set()
 
-
 def test_replayed_verification_of_already_verified_user_is_rejected_without_mutation():
-    """First use of a verification link must durably consume it: is_verified
-    is the fence (never token_version - see
-    test_first_verification_does_not_change_token_version), so any
-    replay - the same link again, or a second link issued before the first
-    succeeded - must be rejected once the account is already verified,
-    with no mutation and no authentication cookies."""
     user = SimpleNamespace(email="already@example.com", is_verified=True)
     db = _locked_db(user)
     response = Response()
@@ -253,7 +231,6 @@ def test_replayed_verification_of_already_verified_user_is_rejected_without_muta
     db.commit.assert_not_called()
     assert _cookie_names(response) == set()
 
-
 def test_first_verification_does_not_change_token_version():
     user = SimpleNamespace(email="new@example.com", is_verified=False, token_version=4)
     db = _locked_db(user)
@@ -266,15 +243,9 @@ def test_first_verification_does_not_change_token_version():
     assert user.is_verified is True
     assert user.token_version == 4
 
-
 def test_original_browser_handoff_survives_verification_from_a_different_device(
     monkeypatch,
 ):
-    """The cross-device signup flow: Computer A holds a verification_handoff
-    cookie minted at token_version N; Phone B verifies the email through
-    the real verify_email() endpoint. Because verification only ever sets
-    is_verified (never token_version), Computer A's still-N handoff must
-    then successfully authenticate."""
     user = SimpleNamespace(
         email="cross-device@example.com", is_verified=False, token_version=0
     )
@@ -304,7 +275,6 @@ def test_original_browser_handoff_survives_verification_from_a_different_device(
         "verification_handoff",
     }
 
-
 def test_verification_session_pending_does_not_set_authentication_cookies(monkeypatch):
     user = SimpleNamespace(
         email="pending@example.com",
@@ -329,7 +299,6 @@ def test_verification_session_pending_does_not_set_authentication_cookies(monkey
 
     assert result == {"status": "pending"}
     assert _cookie_names(response) == set()
-
 
 def test_verified_handoff_authenticates_original_browser_and_deletes_cookie(
     monkeypatch,
@@ -374,7 +343,6 @@ def test_verified_handoff_authenticates_original_browser_and_deletes_cookie(
     assert "max-age=0" in deleted_handoff
     assert "path=/auth/verification-session" in deleted_handoff
 
-
 def test_stale_verification_handoff_cannot_create_a_session(monkeypatch):
     user = SimpleNamespace(
         email="verified@example.com",
@@ -402,7 +370,6 @@ def test_stale_verification_handoff_cannot_create_a_session(monkeypatch):
     assert error.value.detail == "Verification handoff unavailable or expired"
     assert _cookie_names(response) == set()
 
-
 @pytest.mark.parametrize("handoff_version", [None, "0"], ids=["missing", "malformed"])
 def test_missing_or_malformed_handoff_version_is_rejected(
     handoff_version,
@@ -428,7 +395,6 @@ def test_missing_or_malformed_handoff_version_is_rejected(
 
     assert error.value.status_code == 401
     get_user_mock.assert_not_called()
-
 
 @pytest.mark.parametrize(
     "handoff_token",
@@ -481,7 +447,6 @@ def test_missing_invalid_expired_or_wrong_type_handoff_cannot_authenticate(
     assert _cookie_names(response) == set()
     get_user_mock.assert_not_called()
 
-
 def test_handoff_token_cannot_be_used_as_an_access_token(monkeypatch):
     get_user_mock = Mock()
     monkeypatch.setattr(auth_dependencies, "get_user_by_email", get_user_mock)
@@ -502,7 +467,6 @@ def test_handoff_token_cannot_be_used_as_an_access_token(monkeypatch):
     assert error.value.status_code == 401
     assert error.value.detail == "Invalid token type"
     get_user_mock.assert_not_called()
-
 
 def test_handoff_for_unknown_user_cannot_authenticate(monkeypatch):
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
@@ -525,7 +489,6 @@ def test_handoff_for_unknown_user_cannot_authenticate(monkeypatch):
     assert error.value.status_code == 401
     assert _cookie_names(response) == set()
 
-
 def test_expired_token_is_rejected_safely_with_no_cookies_set(monkeypatch):
     user = SimpleNamespace(email="x@example.com", is_verified=False)
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
@@ -541,7 +504,6 @@ def test_expired_token_is_rejected_safely_with_no_cookies_set(monkeypatch):
     assert error.value.status_code == 400
     assert _cookie_names(response) == set()
 
-
 def test_malformed_token_is_rejected_safely():
     with pytest.raises(HTTPException) as error:
         auth_api.verify_email(
@@ -551,10 +513,7 @@ def test_malformed_token_is_rejected_safely():
 
     assert error.value.status_code == 400
 
-
 def test_wrong_token_type_is_rejected_safely():
-    """A password-reset or access token must not double as a verification
-    token even though it is a validly-signed JWT."""
     wrong_type_token = _token("x@example.com", token_type="access")
 
     with pytest.raises(HTTPException) as error:
@@ -565,7 +524,6 @@ def test_wrong_token_type_is_rejected_safely():
 
     assert error.value.status_code == 400
 
-
 def test_unknown_user_returns_404_not_500():
     with pytest.raises(HTTPException) as error:
         auth_api.verify_email(
@@ -575,11 +533,7 @@ def test_unknown_user_returns_404_not_500():
 
     assert error.value.status_code == 404
 
-
 def test_verification_email_links_to_the_frontend_verify_page(monkeypatch):
-    """The link must be environment-specific (existing FRONTEND_URL setting)
-    and point at the frontend's own /verify-email page - not a hardcoded
-    host, and not directly at the backend API."""
     sent = {}
     monkeypatch.setattr(
         "app.services.email.send_verification_email_message",
@@ -591,28 +545,11 @@ def test_verification_email_links_to_the_frontend_verify_page(monkeypatch):
     assert sent["url"] == f"{Settings.FRONTEND_URL}/verify-email#token=abc123"
     assert "localhost:8000" not in sent["url"]
 
-
-# --- forgot-password: undefined send_password_reset_email regression ------
-
-
 def _run_background_tasks(background_tasks: BackgroundTasks) -> None:
-    """forgot_password() only QUEUES the reset email via BackgroundTasks
-    (its own provider round-trip must never be observable in the
-    response's timing) rather than sending it inline - a direct-call test
-    has to run the queued task itself to see what the real ASGI
-    background-task runner would do after the response is already sent."""
     for task in background_tasks.tasks:
         task.func(*task.args, **task.kwargs)
 
-
 def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch):
-    """Regression for the previous bug: forgot_password() called
-    send_password_reset_email(...) without it being imported/defined
-    anywhere, so a real request would fail at runtime with a NameError.
-    This exercises the REAL call chain (auth.py -> app.services.email ->
-    app.services.email_service) down to the Resend boundary - only
-    resend.Emails.send itself is mocked, proving every name in between
-    actually resolves."""
     user = SimpleNamespace(
         email="verified@example.com",
         is_verified=True,
@@ -646,7 +583,6 @@ def test_forgot_password_does_not_raise_nameerror_for_verified_user(monkeypatch)
     assert f"{Settings.FRONTEND_URL}/reset-password#token=" in reset_body
     assert "localhost:3000" not in reset_body
 
-
 def test_forgot_password_reset_token_is_a_real_password_reset_token(monkeypatch):
     user = SimpleNamespace(
         email="verified@example.com",
@@ -674,10 +610,7 @@ def test_forgot_password_reset_token_is_a_real_password_reset_token(monkeypatch)
     assert payload["type"] == "password_reset"
     assert payload["ver"] == user.token_version
 
-
 def test_forgot_password_unknown_email_sends_nothing_but_same_message(monkeypatch):
-    """Anti-user-enumeration: an unknown email must get the identical
-    response and must not trigger any outbound email."""
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=None))
     send_mock = Mock()
     monkeypatch.setattr(auth_api, "send_password_reset_email", send_mock)
@@ -696,10 +629,7 @@ def test_forgot_password_unknown_email_sends_nothing_but_same_message(monkeypatc
     }
     send_mock.assert_not_called()
 
-
 def test_forgot_password_unverified_user_sends_nothing_but_same_message(monkeypatch):
-    """An existing-but-unverified account must not leak its existence
-    either, and must not receive a reset link before it is even verified."""
     user = SimpleNamespace(email="unverified@example.com", is_verified=False)
     monkeypatch.setattr(auth_api, "get_user_by_email", Mock(return_value=user))
     send_mock = Mock()
@@ -718,7 +648,6 @@ def test_forgot_password_unverified_user_sends_nothing_but_same_message(monkeypa
         )
     }
     send_mock.assert_not_called()
-
 
 def test_password_reset_replaces_hash_and_increments_version_atomically(monkeypatch):
     user = SimpleNamespace(
@@ -750,7 +679,6 @@ def test_password_reset_replaces_hash_and_increments_version_atomically(monkeypa
     assert user.token_version == 5
     db.query.return_value.filter.return_value.with_for_update.assert_called_once_with()
     db.commit.assert_called_once()
-
 
 @pytest.mark.parametrize(
     "token_factory",
@@ -790,11 +718,7 @@ def test_wrong_jwt_type_cannot_reset_password(token_factory, monkeypatch):
     hash_mock.assert_not_called()
     db.commit.assert_not_called()
 
-
 def test_password_reset_email_links_to_frontend_reset_page_not_localhost(monkeypatch):
-    """Mirrors test_verification_email_links_to_the_frontend_verify_page:
-    the reset link must use Settings.FRONTEND_URL, never the previous
-    hardcoded http://localhost:3000."""
     from app.services.email import send_password_reset_email
 
     sent = {}

@@ -1,15 +1,12 @@
 from ipaddress import ip_address
 from urllib.parse import urlsplit
-
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 _UNSAFE_SECRET_KEYS = {
     "replace-me",
     "replace-with-at-least-32-random-bytes",
 }
-
 
 class AppSettings(BaseSettings):
     APP_NAME: str 
@@ -67,14 +64,10 @@ class AppSettings(BaseSettings):
                 is_loopback = ip_address(hostname).is_loopback
             except ValueError:
                 pass
-        # Local development is intentionally allowed to run over plain HTTP.
         if is_loopback:
             if frontend.scheme not in {"http", "https"}:
                 raise ValueError("FRONTEND_URL must use http or https")
             return self
-        # Anything non-local is treated as production-like configuration.
-        # Failing closed here prevents accidentally issuing non-Secure auth
-        # cookies on a real deployed host.
         if frontend.scheme != "https" or not hostname:
             raise ValueError("Non-local FRONTEND_URL must use https")
         if not self.COOKIE_SECURE:

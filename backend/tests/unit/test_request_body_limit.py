@@ -1,16 +1,13 @@
 import json
 from pathlib import Path
-
 import pytest
 from fastapi import FastAPI, File, UploadFile
 from fastapi.testclient import TestClient
-
 from app.core.processing_config import (
     ANALYSIS_REQUEST_BODY_LIMIT_DETAIL,
     MAX_ANALYSIS_REQUEST_BODY_BYTES,
 )
 from app.core.request_body_limit import RequestBodyLimitMiddleware
-
 
 def _scope(*, path="/analysis/upload", method="POST", content_length=None):
     headers = []
@@ -29,7 +26,6 @@ def _scope(*, path="/analysis/upload", method="POST", content_length=None):
         "client": ("127.0.0.1", 12345),
         "server": ("testserver", 80),
     }
-
 
 async def _run(
     *,
@@ -88,12 +84,10 @@ async def _run(
 
     return downstream_completed, receive_calls, sent
 
-
 def _response_status(sent):
     return next(
         message["status"] for message in sent if message["type"] == "http.response.start"
     )
-
 
 def _response_json(sent):
     body = b"".join(
@@ -102,7 +96,6 @@ def _response_json(sent):
         if message["type"] == "http.response.body"
     )
     return json.loads(body)
-
 
 @pytest.mark.asyncio
 async def test_oversized_content_length_is_rejected_before_body_is_read():
@@ -117,20 +110,17 @@ async def test_oversized_content_length_is_rejected_before_body_is_read():
     assert _response_status(sent) == 413
     assert _response_json(sent)["detail"] == ANALYSIS_REQUEST_BODY_LIMIT_DETAIL
 
-
 @pytest.mark.asyncio
 async def test_actual_streamed_bytes_are_capped_without_trusting_content_length():
     completed, receive_calls, sent = await _run(
         max_body_size=10,
         chunks=[b"123456", b"78901"],
-        # Deliberately dishonest.
         content_length=5,
     )
 
     assert completed is False
     assert receive_calls == 2
     assert _response_status(sent) == 413
-
 
 @pytest.mark.asyncio
 async def test_exactly_at_limit_is_allowed():
@@ -141,7 +131,6 @@ async def test_exactly_at_limit_is_allowed():
 
     assert completed is True
     assert _response_status(sent) == 204
-
 
 @pytest.mark.asyncio
 async def test_unrelated_routes_bypass_upload_body_limit():
@@ -154,7 +143,6 @@ async def test_unrelated_routes_bypass_upload_body_limit():
 
     assert completed is True
     assert _response_status(sent) == 204
-
 
 def test_stream_over_limit_returns_413_through_real_fastapi_multipart_parser():
     test_app = FastAPI()
@@ -173,22 +161,17 @@ def test_stream_over_limit_returns_413_through_real_fastapi_multipart_parser():
     response = client.post(
         "/analysis/upload",
         files={"file": ("diagnostic.log", b"x" * 256, "text/plain")},
-        # Deliberately lie so the Content-Length fast path cannot reject
-        # first. This forces the receive-stream counter through FastAPI's
-        # real multipart parser.
         headers={"Content-Length": "1"},
     )
 
     assert response.status_code == 413
     assert response.json() == {"detail": ANALYSIS_REQUEST_BODY_LIMIT_DETAIL}
 
-
 def test_caddy_upload_ceiling_matches_backend_raw_body_limit():
     repo_root = Path(__file__).resolve().parents[3]
     caddyfile = (repo_root / "frontend" / "Caddyfile").read_text(encoding="utf-8")
 
     assert f"max_size {MAX_ANALYSIS_REQUEST_BODY_BYTES}" in caddyfile
-
 
 def test_caddy_analysis_413_contract_matches_backend_detail():
     repo_root = Path(__file__).resolve().parents[3]

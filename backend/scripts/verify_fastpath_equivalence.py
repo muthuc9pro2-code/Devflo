@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import dataclasses
 import random
 import sys
@@ -119,7 +117,6 @@ EDGE_CASES = [
     "2026-01-01T00:00:00Z WARN slow query detected query_time: 500ms",
 ]
 
-
 def _generate_fuzz_cases(rng: random.Random, count: int) -> list[str]:
     timestamps = [
         "2026-03-14T09:22:07Z",
@@ -178,14 +175,12 @@ def _generate_fuzz_cases(rng: random.Random, count: int) -> list[str]:
         cases.append(" ".join(parts))
     return cases
 
-
 def _as_dict(event) -> dict:
     if event is None:
         return {"__none__": True}
     data = dataclasses.asdict(event)
     data.pop("fingerprint", None)
     return data
-
 
 def main() -> int:
     mismatches = 0
@@ -230,7 +225,6 @@ def main() -> int:
         f"mismatches={mismatches}"
     )
     return 1 if mismatches else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

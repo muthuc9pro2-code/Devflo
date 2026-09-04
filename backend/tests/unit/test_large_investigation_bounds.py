@@ -1,14 +1,6 @@
-"""Sections 20-21: hard safety-net bounds on how much evidence a single
-CORRELATED graph or SIMPLE frontend result is allowed to carry/serialize.
-Evidence itself always stays fully persisted in MySQL - these bounds only
-cap what one request/response cycle has to build and transmit, and always
-expose the real total honestly rather than silently understating it.
-"""
 from datetime import datetime, timedelta, timezone
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.schemas.gemini import GeminiInvestigationResponse
@@ -20,7 +12,6 @@ _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     title="t", summary="s", probable_root_causes=[], what_happened=[],
     source_code_findings=[], recommended_actions=[], uncertainties=[],
 )
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -38,10 +29,6 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
-# --- build_correlation_payload(): truncation-field exposure ---------------
-
-
 def test_correlation_payload_exposes_truncation_fields_when_bounded():
     base = datetime.now(timezone.utc)
     rows = [
@@ -55,7 +42,6 @@ def test_correlation_payload_exposes_truncation_fields_when_bounded():
     assert payload["evidence_count"] == 10_000
     assert payload["evidence_count_returned"] == 2
     assert payload["evidence_truncated"] is True
-
 
 def test_correlation_payload_omits_truncation_fields_when_not_bounded():
     base = datetime.now(timezone.utc)
@@ -71,10 +57,6 @@ def test_correlation_payload_omits_truncation_fields_when_not_bounded():
     assert "evidence_count_returned" not in payload
     assert "evidence_truncated" not in payload
 
-
-# --- build_simple_payload(): bounded evidence array ------------------------
-
-
 def test_simple_payload_bounds_a_large_evidence_array():
     from app.core.processing_config import SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS
 
@@ -86,11 +68,10 @@ def test_simple_payload_bounds_a_large_evidence_array():
 
     payload = build_simple_payload(analysis_id=1, evidence_rows=rows)
 
-    assert payload["evidence_count"] == len(rows)  # real total, never understated
+    assert payload["evidence_count"] == len(rows)
     assert len(payload["evidence"]) <= SIMPLE_FRONTEND_MAX_EVIDENCE_RECORDS
     assert payload["evidence_count_returned"] == len(payload["evidence"])
     assert payload["evidence_truncated"] is True
-
 
 def test_simple_payload_small_list_is_never_truncated():
     rows = [_evidence(1), _evidence(2)]
@@ -101,10 +82,6 @@ def test_simple_payload_small_list_is_never_truncated():
     assert len(payload["evidence"]) == 2
     assert "evidence_truncated" not in payload
 
-
-# --- end-to-end: _finalize_analysis_task actually applies the bound -------
-
-
 def _db_with_schema(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -112,10 +89,7 @@ def _db_with_schema(monkeypatch):
     monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
     return session_factory
 
-
 def test_finalize_applies_the_correlated_bound_end_to_end(monkeypatch):
-    """A tiny CORRELATED_MAX_EVIDENCE_RECORDS makes the bound trivial to
-    trigger without needing thousands of real rows in the test."""
     monkeypatch.setattr(analysis_task, "CORRELATED_MAX_EVIDENCE_RECORDS", 2)
 
     session_factory = _db_with_schema(monkeypatch)
@@ -144,7 +118,7 @@ def test_finalize_applies_the_correlated_bound_end_to_end(monkeypatch):
                 source_format="generic", first_line_number=1, last_line_number=1,
                 first_seen=base + timedelta(milliseconds=i), severity="ERROR",
             )
-            for i in range(1, 4)  # 3 rows, exceeds the monkeypatched bound of 2
+            for i in range(1, 4)
         ]
     )
     db.commit()

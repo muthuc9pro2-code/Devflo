@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import resource
 import subprocess
 import sys
@@ -19,7 +18,6 @@ CASES = [
     ("container", "container_10mib.log"),
     ("container", "container_50mib.log"),
 ]
-
 
 def _child(fixture_path: str, fmt_name: str) -> None:
     from app.services.artifact_detector import ArtifactFormat
@@ -65,7 +63,6 @@ def _child(fixture_path: str, fmt_name: str) -> None:
     peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(f"RESULT important={important_total} peak_rss_kib={peak_kib}")
 
-
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--child":
         _child(sys.argv[2], sys.argv[3])
@@ -91,7 +88,6 @@ def main() -> None:
         peak_mib = int(parts["peak_rss_kib"]) / 1024
         size_bytes = path.stat().st_size
         print(f"{fmt_name:<10} {filename:<22} {size_bytes:>12,}   {peak_mib:>10.1f} MiB   important={parts['important']}")
-
 
 if __name__ == "__main__":
     main()

@@ -2,9 +2,6 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 from app.core.processing_config import MAX_OCR_IMAGE_BYTES, MAX_OCR_IMAGE_PIXELS, MEBIBYTE
 
-# RapidOCR loads native ONNX libraries and model data.  Keep that optional
-# dependency outside application/task-module import so a broken OCR runtime can
-# affect only an image that actually needs it.
 _ocr = None
 
 _ALLOWED_IMAGE_EXTENSIONS = {
@@ -20,24 +17,17 @@ _ALLOWED_PIL_FORMATS = {
     "WEBP",
 }
 
-
 class OcrImageError(Exception):
-    """Base class for shared pre-OCR image validation failures - never
-    raised by RapidOCR itself, only by validate_ocr_image() below."""
-
+    pass
 
 class OcrImageTooLargeError(OcrImageError):
-    """File size or decoded pixel count exceeds the configured OCR
-    resource bounds (MAX_OCR_IMAGE_BYTES / MAX_OCR_IMAGE_PIXELS)."""
-
+    pass
 
 class InvalidOcrImageError(OcrImageError):
-    """Not a real, decodable image in a supported format."""
-
+    pass
 
 class OcrProcessingError(Exception):
-    """RapidOCR failed after the image passed Devflo's validation gates."""
-
+    pass
 
 def _get_ocr_engine():
     global _ocr
@@ -48,13 +38,7 @@ def _get_ocr_engine():
         _ocr = RapidOCR()
     return _ocr
 
-
 def validate_ocr_image(file_path: str | Path) -> None:
-    """Shared resource-limit + integrity gate that must run before ANY
-    RapidOCR call (see _run_ocr below, the sole caller-independent entry
-    point) - RapidOCR itself must never be the first place Devflo discovers
-    an oversized or absurdly-dense image. Runs no OCR itself; returns
-    normally only when the image is safe to hand to RapidOCR."""
     path = Path(file_path)
 
     if not path.is_file():
@@ -93,16 +77,7 @@ def validate_ocr_image(file_path: str | Path) -> None:
             "Image exceeds the maximum decoded pixel count"
         )
 
-
 def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
-    """Single shared entry point into the RapidOCR engine: each result is
-    RapidOCR's own (box, text, confidence) triple. The public extraction
-    function below reads from this same call - there is no second/parallel
-    OCR path.
-    validate_ocr_image() runs here too (defense-in-depth) even though
-    upload handling (app/api/analysis.py) already validates before dispatch,
-    so there is no RapidOCR path, present or future, that can bypass the
-    resource-limit gate."""
     path = Path(file_path)
 
     if path.suffix.lower() not in _ALLOWED_IMAGE_EXTENSIONS:
@@ -128,16 +103,7 @@ def _run_ocr(file_path: str) -> list[tuple[str, float | None]]:
     except Exception as error:
         raise OcrProcessingError("Image OCR could not be completed") from error
 
-
 def extract_text_from_image_with_confidence(file_path: str) -> tuple[str, float | None]:
-    """Return normalized OCR text plus the real RapidOCR confidence -
-    never invented/defaulted. Multiple OCR-detected lines are
-    combined into one diagnostic record further down the existing pipeline
-    (diagnostic_adapters._stream_image_events already treats one image as
-    one event, unchanged here), so their per-line confidences are reduced
-    to the arithmetic mean: one noisy line shouldn't make an otherwise
-    reliable image look globally unreliable. Returns (text, None) when
-    RapidOCR found no line with a usable confidence score."""
     lines = _run_ocr(file_path)
     text = "\n".join(line_text for line_text, _confidence in lines)
     confidences = [confidence for _text, confidence in lines if confidence is not None]

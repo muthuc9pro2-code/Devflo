@@ -12,21 +12,7 @@ from time import perf_counter
 
 logger = logging.getLogger(__name__)
 
-
 def _stable_evidence_key(evidence: Evidence) -> tuple:
-    """Composite stable/logical tie-break key for an Evidence row -
-    deterministic across runs, commit order, and worker scheduling; NEVER
-    Evidence.id or input/insertion order. first_line_number (derived once
-    at upload time from artifact.position * _GLOBAL_LINE_NUMBER_STRIDE
-    plus that artifact's own line number) dominates; fingerprint/
-    correlation_key/source_file narrow the - already rare - residual tie
-    further with deterministic empty-string normalization for None. Two
-    rows tying on every one of these are, for any practical purpose,
-    indistinguishable content: which one a caller treats as "first" has no
-    semantic meaning either way, so this is as far as tie-breaking needs
-    to go. Evidence.id may still be used as a plain identifier elsewhere
-    (persistence lookups, node ids) - just never as a semantic ordering
-    signal, which is exactly what this replaces at every call site below."""
     return (
         evidence.first_line_number,
         evidence.fingerprint or "",
@@ -34,10 +20,7 @@ def _stable_evidence_key(evidence: Evidence) -> tuple:
         evidence.source_file or "",
     )
 
-
 def _stable_node_key(node: "CorrelationNode") -> tuple:
-    """The same complete logical tie-break convention as
-    _stable_evidence_key, including correlation_key for exact line ties."""
     first_line_number = getattr(node, "first_line_number", None)
 
     return (
@@ -85,11 +68,6 @@ class CorrelationNode:
     last_seen: datetime | None
     occurrence_count: int = 1
     evidence_ids: list[int] = field(default_factory=list)
-    # Provenance only - build_correlation_nodes() creates exactly one node
-    # per evidence row (evidence_ids is always a single-element list), so
-    # this is unambiguous. Never read by matching/scoring; not correlated
-    # on. Exists so payload/context consumers can show and explain which
-    # uploaded artifact a piece of evidence came from.
     artifact_id: int | None = None
     correlation_key: str | None = None
     trace_id: str | None = None
@@ -113,9 +91,6 @@ class CorrelationNode:
     representative_line: str | None = None
     identity_match_type: str | None = None
     identity_strength: float | None = None
-    # Bounded, non-canonical structured fields carried straight through
-    # from Evidence.diagnostic_attributes (see diagnostic_adapters.py) -
-    # provenance only, never itself a matching/correlation signal.
     diagnostic_attributes: dict | None = None
 
 @dataclass(frozen=True, slots=True)
@@ -130,49 +105,14 @@ class CorrelationEdge:
     score: float
     delta_ms: float | None
     signals: list[CorrelationSignal] = field(default_factory=list)
-    # "explicit_parent_child" (exact parent.span_id == child.parent_span_id
-    # match - the strongest, definitionally-certain DIRECTED relationship:
-    # trace topology and direction are proven, physical failure causation
-    # is NOT) vs "inferred_propagation" (a strictly positive time delta
-    # between two otherwise-correlated records - directional, but a
-    # deterministic hypothesis, never proven physical causation either).
-    # None for associations (this same dataclass shape is reused there;
-    # associations are never directional so relationship_type/
-    # direction_confidence do not apply).
     relationship_type: str | None = None
-    # How confident Devflo is in the DIRECTION claim itself (parent/child,
-    # earlier/later), as opposed to `score` (how confident the two records
-    # are related AT ALL) - never a claim about physical causation either
-    # way. 1.0 for explicit_parent_child (topology/direction is
-    # definitionally certain); temporal_score(delta_ms) for
-    # inferred_propagation - the same decay function scoring already uses,
-    # reused rather than inventing a new confidence number: two records 5ms
-    # apart support a directional propagation hypothesis far more than the
-    # same pair 5 seconds apart.
     direction_confidence: float | None = None
 
 @dataclass(slots=True)
 class CorrelationComponent:
     nodes: list[CorrelationNode] = field(default_factory=list)
-    # Directed relationships only (an explicit parent-span match, or a real
-    # strictly-positive time delta between two otherwise-correlated
-    # records) - the ONLY edges build_graph_stats/root_cause_score/
-    # classify_node_role ever read, so incoming/outgoing/downstream counts
-    # and root/propagation/victim roles are always derived from real
-    # directed structure, never from association order. Neither edge kind
-    # is proof of physical causation on its own - see relationship_type
-    # above.
     edges: list[CorrelationEdge] = field(default_factory=list)
-    # Non-directional "same incident" relationships: two records correlate
-    # (shared trace/request/resolved identity, or a structural+temporal
-    # match) but no real signal establishes which one came first - equal
-    # timestamps, or a timestamp missing on either side. Used only for
-    # component membership (see build_correlation_components) and for a
-    # bounded LLM context - never for graph stats/roles/root-cause ranking,
-    # so association-only evidence can never masquerade as directed
-    # root/propagation/victim structure.
     associations: list[CorrelationEdge] = field(default_factory=list)
-
 
 @dataclass(slots=True)
 class CorrelationResult:
@@ -187,20 +127,11 @@ class NodeGraphStats:
     incoming_strength: float = 0.0
     outgoing_strength: float = 0.0
 
-
 @dataclass(slots=True)
 class RootCauseCandidate:
     node_id: str
     score: float
     graph_stats: NodeGraphStats
-    # Structural label derived directly from graph_stats/component size
-    # above - not a new heuristic, not a certainty claim about what "the"
-    # root cause is. score already ranks candidates; role is a
-    # human-readable summary of the same DAG position that ranking uses:
-    # no upstream edge but has downstream edges ("root"), has an upstream
-    # edge but no downstream edges ("victim"), both ("propagation"), or no
-    # edges connecting it to anything else in its component ("uncorrelated"
-    # - includes true singleton components).
     role: str = "uncorrelated"
 
 @dataclass(slots=True)
@@ -216,7 +147,6 @@ def _shared_value(
 ) -> bool:
     return left is not None and left == right
 
-
 def _pair_strength(
     left_format: str | None,
     right_format: str | None,
@@ -231,7 +161,6 @@ def _pair_strength(
     return SignalStrength(
         min(left_strength.value, right_strength.value)
     )
-
 
 def _append_shared_signal(
     matches: list[CorrelationSignalMatch],
@@ -258,13 +187,7 @@ def _append_shared_signal(
             )
         )
 
-
 def _shared_source_location(left: Evidence, right: Evidence) -> bool:
-    """True only when both records have a source_matches entry pointing at
-    the identical file+line - never merely "both have some source match".
-    Every source_matches entry already comes from source_index.py's
-    _match_frame(), which returns None rather than guess on an ambiguous
-    candidate, so no additional confidence filtering is needed here."""
     left_locations = {
         (match.get("relative_path"), match.get("line_number"))
         for match in (left.source_matches or [])
@@ -279,7 +202,6 @@ def _shared_source_location(left: Evidence, right: Evidence) -> bool:
         for match in (right.source_matches or [])
     )
 
-
 def match_correlation_signals(
     left: Evidence,
     right: Evidence,
@@ -289,15 +211,6 @@ def match_correlation_signals(
     shared_checks = (
         (CorrelationSignal.TRACE_ID, left.trace_id, right.trace_id),
         (CorrelationSignal.REQUEST_ID, left.request_id, right.request_id),
-        # A real equal span_id is a genuine identity/correlation signal -
-        # configured with format weights in FORMAT_SIGNAL_PRIORITY but
-        # never actually emitted here. This alone can never become an
-        # explicit_parent_child direction:
-        # only an exact parent.span_id == child.parent_span_id match
-        # (match_parent_span/build_correlation_edge) is treated that way -
-        # resolve_pair() (build_correlation_edges) decides
-        # inferred_propagation direction purely from a real positive time
-        # delta, never from which signal matched.
         (CorrelationSignal.SPAN_ID, left.span_id, right.span_id),
         (CorrelationSignal.SERVICE, left.service, right.service),
         (CorrelationSignal.MODULE, left.module, right.module),
@@ -335,12 +248,6 @@ def match_correlation_signals(
             right.resolved_identity,
         )
 
-    # A real, unambiguous match to the SAME source-code location on both
-    # sides - source_index.py's _match_frame() already never
-    # fabricates/guesses an ambiguous match, so every entry actually in
-    # source_matches is already trustworthy; this only checks whether two
-    # records' matches converge on the identical file+line, never merely
-    # "both came from source code in general".
     if _shared_source_location(left, right):
         strength = _pair_strength(
             left.source_format,
@@ -411,23 +318,11 @@ def match_parent_span(
 class CorrelationIndexes:
     trace_ids: dict[str, list[Evidence]] = field(default_factory=dict)
     request_ids: dict[str, list[Evidence]] = field(default_factory=dict)
-    # A list, not a single Evidence, so two different rows that happen to
-    # share the same span_id (retried/duplicate emissions, or a genuine
-    # collision) are both considered - previously the last one indexed
-    # silently shadowed any earlier one for parent-span lookups.
     span_ids: dict[str, list[Evidence]] = field(default_factory=dict)
     resolved_identities: dict[str, list[Evidence]] = field(default_factory=dict)
 
-
 @dataclass(slots=True)
 class CorrelationPreparation:
-    """One prepared correlation pass shared by routing and graph building.
-
-    Building relationships is the expensive candidate traversal.  The
-    finalizer prepares it once, the router only asks whether any genuine
-    relationship exists, and run_correlation() consumes the exact same
-    directed/association lists instead of rescanning candidates.
-    """
 
     indexes: CorrelationIndexes
     directed_edges: list[CorrelationEdge]
@@ -436,7 +331,6 @@ class CorrelationPreparation:
     @property
     def has_relationships(self) -> bool:
         return bool(self.directed_edges or self.associations)
-
 
 def _append_index(
     index: dict[str, list[Evidence]],
@@ -447,7 +341,6 @@ def _append_index(
         return
 
     index.setdefault(key, []).append(evidence)
-
 
 def build_correlation_indexes(
     evidence_rows: list[Evidence],
@@ -470,16 +363,6 @@ def find_parent_span_candidate(
     child: Evidence,
     indexes: CorrelationIndexes,
 ) -> Evidence | None:
-    """If multiple rows sharing this span_id are all compatible parents
-    (a real possibility - span_id collisions are rare but not impossible),
-    the winner must not depend on indexes.span_ids' own list order (itself
-    downstream of DB query/commit-race order across concurrently-
-    processing artifact workers). first_line_number - the stable logical
-    key, derived once at upload time from
-    artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that artifact's
-    own line number - both closes that non-determinism and matches the
-    natural reading of "parent": whichever compatible candidate occurred
-    earliest."""
     if child.parent_span_id is None:
         return None
 
@@ -497,64 +380,19 @@ def find_parent_span_candidate(
 
 _IDENTITY_GROUP_MIN_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
 
-
 def _identity_group_sort_key(evidence: Evidence):
-    """Stable (first_seen, *_stable_evidence_key) ordering for a
-    shared-identity group - deterministic regardless of naive/aware
-    timestamps or input list order, and regardless of whether first_seen
-    is even known (falls back to the earliest possible sentinel, then the
-    stable evidence key).
-
-    The stable key - never evidence.id - is the tie-break: artifacts are
-    processed by independent, concurrently-racing Celery workers
-    (app.tasks.analysis's per-artifact group/chord), so the DB-assigned
-    autoincrement id an Evidence row happens to get reflects commit-race
-    order, not anything about the underlying diagnostic data."""
     first_seen = evidence.first_seen
     if first_seen is not None and first_seen.tzinfo is None:
         first_seen = first_seen.replace(tzinfo=timezone.utc)
     return (first_seen or _IDENTITY_GROUP_MIN_TIMESTAMP, *_stable_evidence_key(evidence))
 
-
 def iter_identity_candidate_pairs(indexes: CorrelationIndexes):
-    """Bounded replacement for the previous per-source full-group scan: a
-    shared identity (trace_id/request_id/resolved_identity/span_id) group
-    of size N used to cost O(N^2) candidate pairs to discover (a single
-    5000-row shared trace could imply ~12.5M pairs) - unnecessary for an
-    investigation graph, whose real goals are: the group stays one
-    connected component, near-in-time relationships stay linked, and work
-    is deterministically bounded.
-
-    Each group is scanned once, in stable (first_seen, id) order:
-    - at or under IDENTITY_FULL_PAIRWISE_MAX_GROUP_SIZE, every pair in the
-      group is still yielded (today's behavior, unchanged for small/normal
-      incidents);
-    - above it, each row is paired only with its next
-      IDENTITY_CANDIDATE_MAX_NEIGHBORS rows in that stable order, bounding
-      candidate-pair generation to O(n*K). Every row still shares a
-      neighbor with the row before and after it in the ordering, so the
-      whole group remains transitively connected as one component even
-      though not every pair within it is individually scored.
-
-    Deterministic and input-order-invariant: only intra-group temporal/id
-    order decides pairing, never the order evidence_rows/indexes were
-    built from. Explicit parent-span relationships never go through this
-    path at all (see find_parent_span_candidate, called separately and
-    unconditionally before this iterator in build_correlation_edges/
-    has_genuine_correlatable_structure), so they can never be affected by
-    the neighbor bound below.
-    """
     seen_pairs: set[frozenset[int]] = set()
 
     for index in (
         indexes.trace_ids,
         indexes.request_ids,
         indexes.resolved_identities,
-        # A real equal span_id - never a directed relationship
-        # on its own (see match_correlation_signals), but a genuine
-        # identity-tier candidate like trace_id/request_id, so it must
-        # actually be discoverable as a candidate pair, not just scoreable
-        # if it happened to already be one.
         indexes.span_ids,
     ):
         for group in index.values():
@@ -629,13 +467,6 @@ def score_candidate_pair(
 
     return score, delta_ms, matches
 
-# Same structural-relatedness definition has_structural_match() already
-# uses downstream (deliberately excludes HTTP_STATUS - see that function -
-# and TRACE_ID/REQUEST_ID/RESOLVED_IDENTITY, which never reach this path at
-# all: iter_temporal_candidates() below excludes any pair already sharing
-# one of those before the adaptive window is even considered). Named once
-# here so the temporal-fallback window and has_structural_match's own
-# filter can never silently drift apart from each other.
 _STRUCTURAL_SIGNALS = frozenset({
     CorrelationSignal.SERVICE,
     CorrelationSignal.MODULE,
@@ -645,39 +476,19 @@ _STRUCTURAL_SIGNALS = frozenset({
     CorrelationSignal.ENDPOINT,
     CorrelationSignal.EXCEPTION,
     CorrelationSignal.FINGERPRINT,
-    # A genuine same-file+line source match is real structural
-    # relatedness, never fabricated (see _shared_source_location) - SPAN_ID
-    # is deliberately NOT included here, it is treated as an identity-tier
-    # signal (see iter_identity_candidate_pairs) like trace_id/request_id.
     CorrelationSignal.SOURCE,
 })
 
-# Small, explicit, deterministic tiers for the temporal FALLBACK window
-# only - identity-based matching (trace_id/request_id/resolved_identity/
-# parent_span) never goes through this path (see the exclusion checks in
-# iter_temporal_candidates below) and is completely unaffected. These reuse
-# the existing SignalStrength tier boundaries (FORMAT_SIGNAL_PRIORITY's own
-# VERY_HIGH/HIGH/MEDIUM/LOW, already format-calibrated by _pair_strength)
-# instead of inventing a second scoring scale - they just map the
-# strongest real structural signal a candidate pair shares onto a time
-# budget instead of a match-score multiplier. Not learned/tunable.
-_TEMPORAL_WINDOW_STRONG_MS = 5000.0  # VERY_HIGH/HIGH strongest structural signal
-_TEMPORAL_WINDOW_MEDIUM_MS = 2500.0  # MEDIUM strongest structural signal
-_TEMPORAL_WINDOW_WEAK_MS = 1000.0    # LOW strongest structural signal
-_TEMPORAL_WINDOW_NONE_MS = 0.0       # no structural signal at all - reject outright
-
+_TEMPORAL_WINDOW_STRONG_MS = 5000.0
+_TEMPORAL_WINDOW_MEDIUM_MS = 2500.0
+_TEMPORAL_WINDOW_WEAK_MS = 1000.0
+_TEMPORAL_WINDOW_NONE_MS = 0.0
 
 def _adaptive_temporal_window_ms(
     candidate: Evidence,
     evidence: Evidence,
     max_window_ms: float,
 ) -> float:
-    """How much timestamp separation this specific pair may tolerate as a
-    temporal-fallback candidate. Reuses match_correlation_signals() (the
-    same function has_structural_match()/score_candidate_pair() already
-    call) purely to read the strongest REAL structural signal strength the
-    pair already shares - it does not itself decide correlation, and its
-    result never exceeds max_window_ms (the existing absolute cap)."""
     matches = match_correlation_signals(candidate, evidence)
 
     strongest = max(
@@ -700,17 +511,10 @@ def _adaptive_temporal_window_ms(
 
     return min(window_ms, max_window_ms)
 
-
 def iter_temporal_candidates(
     evidence_rows: list[Evidence],
     window_ms: float = 5000.0,
 ):
-    # Tie-broken by first_line_number (never left implicit, which would
-    # silently fall back to evidence_rows's own incoming order - itself
-    # DB-query/commit-race order across concurrently-processing artifact
-    # workers) so two evidence rows sharing an exact timestamp (common
-    # with second-granularity log timestamps or a bulk-imported burst)
-    # sort identically regardless of run-to-run scheduling.
     ordered = sorted(
         (
             evidence
@@ -733,15 +537,6 @@ def iter_temporal_candidates(
 
             left += 1
 
-        # left/right bound the search space by the fixed max window, but
-        # that alone is only O(n) amortized when events are temporally
-        # sparse - a dense burst (many events within one window) would
-        # otherwise degrade toward an all-pairs O(n^2) scan (see
-        # TEMPORAL_CANDIDATE_MAX_NEIGHBORS). Capping to the nearest K
-        # candidates keeps total work O(n * K) regardless of density.
-        # Within that bounded range, each individual pair additionally has
-        # to clear its OWN adaptive window below - a strictly narrower,
-        # per-pair filter layered on top, never a wider one.
         window_start = max(left, right - TEMPORAL_CANDIDATE_MAX_NEIGHBORS)
         for index in range(window_start, right):
             candidate = ordered[index]
@@ -790,17 +585,6 @@ def has_structural_match(
     left: Evidence,
     right: Evidence,
 ) -> bool:
-    """Gate for the temporal-fallback path only (real trace/request/parent-
-    span identity never reaches this - iter_temporal_candidates excludes
-    any pair already sharing one). Same-artifact pairs (one uploaded file,
-    genuinely one log stream) may correlate on a single structural signal -
-    that shared provenance is already real evidence. Cross-artifact pairs
-    need at least two independent structural signals: two different
-    uploaded files merely sharing one service name, or one HTTP status
-    (never counted as structural to begin with), is not enough evidence
-    that they describe the same incident - see e.g. same fingerprint +
-    compatible service, or same exception + compatible service/module.
-    """
     matches = match_correlation_signals(left, right)
     structural_signal_count = sum(
         1 for match in matches if match.signal in _STRUCTURAL_SIGNALS
@@ -845,11 +629,6 @@ def build_correlation_edge(
         score=score,
         delta_ms=delta_ms,
         signals=[match.signal for match in matches],
-        # This function is only ever called for a verified parent.span_id
-        # == child.parent_span_id match (see the caller below) - an
-        # explicit, proven trace-topology parent/child relationship. That
-        # proves DIRECTION, not physical failure causation (see
-        # CorrelationEdge.relationship_type above).
         relationship_type="explicit_parent_child",
         direction_confidence=1.0,
     )
@@ -858,46 +637,15 @@ def _pair_key(
     left: Evidence,
     right: Evidence,
 ) -> frozenset[int]:
-    # Unordered: the same relationship encountered from either iteration
-    # direction (source=A,target=B or source=B,target=A - both happen,
-    # since identity/temporal candidate search is symmetric) is one
-    # relationship, resolved exactly once.
     return frozenset((left.id, right.id))
 
 def _has_strict_time_direction(delta_ms: float | None) -> bool:
-    """True only when there is a real, strictly positive time separation.
-    Equal timestamps (delta_ms == 0.0) or unknown timestamps (delta_ms is
-    None, i.e. first_seen missing on either side) establish no direction on
-    their own and must never be assigned one by iteration/evidence-ID/
-    artifact/database order - see build_correlation_edges."""
     return delta_ms is not None and delta_ms > 0.0
 
 def _canonical_pair_order(
     left: Evidence,
     right: Evidence,
 ) -> tuple[Evidence, Evidence]:
-    """Deterministic (earlier, later) ordering for a correlated pair, used
-    only to decide which side is scored as "source" for
-    evidence_delta_ms()/temporal support in score_candidate_pair() - this
-    is bookkeeping for a stable, reproducible score/delta_ms, never itself
-    a claim of direction (see _has_strict_time_direction, which is what
-    actually decides inferred_propagation-vs-association). Falls back to
-    the stable evidence key - never evidence.id, which reflects
-    commit-race order across concurrently-processing artifact workers, not
-    anything about the underlying data - when timestamps tie or are
-    missing, so the SAME unordered pair always canonicalizes to the SAME
-    order regardless of which iteration direction - or which shuffled
-    input order - encounters it first; required for correlation to stay
-    invariant to evidence input order. The stable key's leading
-    first_line_number component can only tie for two rows from the exact
-    same artifact and exact same source line, in which case
-    (fingerprint, correlation_key) - the rest of the key - is already
-    guaranteed distinct by Evidence's own DB uniqueness constraint
-    (analysis_id, artifact_id, fingerprint, correlation_key), so this key
-    is effectively a total order over real Evidence rows: the "else"
-    branch below is symmetric in practice, never actually reached on a
-    genuine tie between two distinct rows.
-    """
     left_ts, right_ts = left.first_seen, right.first_seen
 
     if left_ts is not None and right_ts is not None and left_ts != right_ts:
@@ -914,26 +662,6 @@ def build_correlation_edges(
     indexes: CorrelationIndexes,
     temporal_window_ms: float = 5000.0,
 ) -> tuple[list[CorrelationEdge], list[CorrelationEdge]]:
-    """Returns (directed_edges, associations).
-
-    Directed edges carry real directional evidence - either an explicit
-    parent-span relationship (always directional, even at equal
-    timestamps: an exact parent.span_id == child.parent_span_id match with
-    compatible trace identity - relationship_type="explicit_parent_child"),
-    or a strictly positive time delta between two otherwise-correlated
-    records (relationship_type="inferred_propagation"). These alone feed
-    build_graph_stats/root_cause_score/classify_node_role (all read
-    component.edges only). Neither kind is proof of physical failure
-    causation on its own - see CorrelationEdge.relationship_type.
-
-    Associations record the same underlying correlating signal (shared
-    trace_id/request_id/resolved_identity/fingerprint/service/exception/
-    endpoint, or a structural+temporal match) for pairs where no real
-    direction is established: equal timestamps, or a timestamp missing on
-    either side. This is "same incident" evidence, not "A caused B" -
-    Devflo underclaims rather than fabricates causality. Both kinds still
-    connect nodes into the same component (build_correlation_components).
-    """
     directed_edges: list[CorrelationEdge] = []
     associations: list[CorrelationEdge] = []
     seen_pairs: set[frozenset[int]] = set()
@@ -979,12 +707,6 @@ def build_correlation_edges(
             score=score,
             delta_ms=delta_ms,
             signals=[match.signal for match in matches],
-            # A strictly positive delta_ms between two otherwise-correlated
-            # records is a directional HYPOTHESIS (inferred_propagation) -
-            # never proven physical causation, exactly like an explicit
-            # parent-span match proves direction but not causation -
-            # direction_confidence reuses the same temporal decay scoring
-            # already applies, not a new number.
             relationship_type="inferred_propagation" if is_time_ordered else None,
             direction_confidence=temporal_score(delta_ms) if is_time_ordered else None,
         )
@@ -1005,13 +727,11 @@ def build_correlation_edges(
 
     return directed_edges, associations
 
-
 def prepare_correlation(
     evidence_rows: list[Evidence],
     *,
     indexes: CorrelationIndexes | None = None,
 ) -> CorrelationPreparation:
-    """Build indexes and resolve candidate relationships exactly once."""
     if indexes is None:
         indexes = build_correlation_indexes(evidence_rows)
 
@@ -1024,7 +744,6 @@ def prepare_correlation(
         directed_edges=directed_edges,
         associations=associations,
     )
-
 
 def build_correlation_nodes(
     evidence_rows: list[Evidence],
@@ -1075,13 +794,6 @@ def build_correlation_components(
     edges: list[CorrelationEdge],
     associations: list[CorrelationEdge] | None = None,
 ) -> list[CorrelationComponent]:
-    """Connectivity (which nodes end up grouped into the same component) is
-    determined by BOTH directed edges and associations - two records that
-    correlate but establish no direction (e.g. equal timestamps) must still
-    be recognized as part of the same incident. Only `edges` (directed) is
-    ever used for graph stats/roles/root-cause ranking; `associations` is
-    carried on each resulting component purely for display/LLM context.
-    """
     associations = associations or []
     node_by_id = {node.id: node for node in nodes}
     adjacency: dict[str, set[str]] = {
@@ -1120,19 +832,6 @@ def build_correlation_components(
                 if neighbor_id not in visited:
                     stack.append(neighbor_id)
 
-        # Sorted by first_line_number (never left as raw set() iteration
-        # order) so component.nodes has the same order for the same
-        # underlying diagnostic data regardless of Python's per-process
-        # string-hash randomization (no PYTHONHASHSEED is pinned anywhere
-        # in this codebase) and regardless of which node.id string
-        # happened to be assigned to which logical event this run -
-        # first_line_number is derived once at upload time from
-        # artifact.position * _GLOBAL_LINE_NUMBER_STRIDE plus that
-        # artifact's own line number, so it identifies the same logical
-        # event the same way on every run. This directly feeds
-        # rank_root_causes' and _select_primary_component's own
-        # tie-breaking (see their docstrings), which otherwise inherit
-        # whatever order this produced.
         component_nodes = sorted(
             (node_by_id[node_id] for node_id in component_ids),
             key=_stable_node_key,
@@ -1196,12 +895,10 @@ def would_create_cycle(
 def _is_time_ordered(edge: CorrelationEdge) -> bool:
     return edge.delta_ms is not None and edge.delta_ms > 0.0
 
-
 def _edge_endpoint_stable_key(
     node_id: str,
     evidence_by_id: dict[int, Evidence],
 ) -> tuple:
-    """Resolve an edge endpoint to the complete logical Evidence key."""
     try:
         evidence_id = int(node_id.rsplit("-", 1)[-1])
     except (ValueError, IndexError):
@@ -1214,39 +911,10 @@ def _edge_endpoint_stable_key(
 
     return _stable_evidence_key(evidence)
 
-
 def enforce_dag(
     edges: list[CorrelationEdge],
     evidence_by_id: dict[int, Evidence],
 ) -> list[CorrelationEdge]:
-    """A directed cycle needs at least one edge that does NOT strictly
-    advance in time: a chain of strictly-increasing timestamps can never
-    loop back to an earlier one. So every edge with delta_ms > 0 (the vast
-    majority in practice - every inferred_propagation edge) is safe to
-    include unconditionally, skipping the expensive incremental
-    reachability check (would_create_cycle) for it entirely. Only edges
-    without that guarantee (explicit_parent_child edges at an equal/
-    unknown/non-positive delta - the only way a directed edge can lack
-    strictly-positive delta_ms) need real cycle detection, evaluated
-    against the adjacency already built from every time-ordered edge.
-
-    This was a genuine, measured bottleneck: enforce_dag's original
-    "check every edge against the whole graph so far" cost degrades toward
-    O(edges * (nodes + edges)) as edges accumulate - confirmed directly, a
-    few thousand densely-timestamped evidence rows did not finish
-    correlating within 60s before this fix (see
-    TEMPORAL_CANDIDATE_MAX_NEIGHBORS for the matching candidate-count
-    bound). Splitting by provable safety instead of checking every edge
-    is a correctness-preserving optimization, not a new heuristic: the
-    final included/excluded edge set is unchanged except in the one
-    corner case where a lower-scored time-ordered edge would previously
-    have been dropped in favor of a higher-scored but NOT time-ordered one
-    that turned out to conflict with it - time-ordered edges are now
-    always preferred there, which is at least as defensible as pure score.
-    """
-    # Highest relationship score wins first. Exact score ties are resolved
-    # by the COMPLETE stable logical keys of both endpoints, then immutable
-    # edge content - never by incoming edge-list order or Evidence.id.
     def _edge_priority_key(edge: CorrelationEdge) -> tuple:
         return (
             -edge.score,
@@ -1345,14 +1013,6 @@ def build_graph_stats(
         outgoing[edge.source_id].add(edge.target_id)
 
     downstream_cache: dict[str, frozenset[str]] = {}
-    # downstream_count = distinct nodes reachable via outgoing edges.
-    # `edges` is always component.edges - already a DAG (enforce_dag) - so
-    # this is computed once for the whole graph via topological-order DP
-    # (downstream[v] = union of v's children and each child's own already-
-    # resolved downstream set) rather than one full DFS PER node, which
-    # degrades to O(V * (V+E)) on a densely-connected component (measured
-    # directly: the per-node-DFS version took 33s on a 2000-node dense
-    # component that this version completes in a small fraction of that).
     for node_id in reversed(_topological_order(nodes, outgoing)):
         reachable: set[str] = set(outgoing[node_id])
         for child_id in outgoing[node_id]:
@@ -1362,17 +1022,10 @@ def build_graph_stats(
 
     return stats
 
-
 def _topological_order(
     nodes: list[CorrelationNode],
     outgoing: dict[str, set[str]],
 ) -> list[str]:
-    """Kahn's algorithm. Safe to assume the graph is acyclic (it is always
-    built from enforce_dag's output); any node that unexpectedly never
-    reaches in-degree 0 (would only happen if that invariant were somehow
-    violated) is simply omitted rather than raising - build_graph_stats
-    treats a missing entry as "no further downstream" instead of crashing.
-    """
     incoming_count: dict[str, int] = {node.id: 0 for node in nodes}
 
     for targets in outgoing.values():
@@ -1405,13 +1058,6 @@ def root_cause_score(
         return 1.0
 
     root_position = (
-        # No directed edge touches this node at all (it may still sit in a
-        # larger component purely via association - e.g. equal-timestamp
-        # "same incident" evidence) - that is not a root signal, it is the
-        # same "uncorrelated" position classify_node_role already assigns
-        # for this exact condition. Without this, an association-only node
-        # would read as maximally root-like merely for having no incoming
-        # DIRECTED edge, even though it has no outgoing one either.
         0.0
         if stats.incoming_count == 0 and stats.outgoing_count == 0
         else 1.0
@@ -1591,8 +1237,6 @@ def rank_root_causes(
         for node in component.nodes
     ]
 
-    # Highest score wins; exact score ties use the complete stable logical
-    # node key. Stable sort/input order is never itself a semantic rule.
     node_by_id = {
         node.id: node
         for node in component.nodes
@@ -1725,15 +1369,6 @@ FORMAT_SIGNAL_PRIORITY: dict[str, dict[CorrelationSignal, SignalStrength]] = {
         CorrelationSignal.FINGERPRINT: SignalStrength.MEDIUM,
         CorrelationSignal.TEMPORAL: SignalStrength.LOW,
     },
-    # OCR-derived evidence (diagnostic_adapters._stream_image_events) runs
-    # the extracted/normalized text through the exact same
-    # normalize_text_event() classification as "generic" text, so it is
-    # given the identical signal profile - not a new scoring rule, just
-    # registering the format so _pair_strength()'s existing min()-of-both-
-    # sides calibration (unchanged) can engage instead of unconditionally
-    # returning None for every signal. Without this entry, "image"-sourced
-    # evidence could never match any other evidence on ANY signal
-    # (including trace_id), regardless of genuine shared identity.
     "image": {
         CorrelationSignal.SPAN_ID: SignalStrength.VERY_HIGH,
         CorrelationSignal.PARENT_SPAN: SignalStrength.VERY_HIGH,
@@ -1776,13 +1411,6 @@ def has_genuine_correlatable_structure(
     *,
     indexes: CorrelationIndexes | None = None,
 ) -> bool:
-    """Early-exit yes/no check reusing the EXACT relationship semantics
-    build_correlation_edges uses (parent-span, identity-candidate, and
-    bounded temporal+structural matching) - so investigation routing can
-    never drift from what correlation itself would actually find. Stops at
-    the first qualifying relationship; callers here only need a routing
-    decision, never the full graph/scores.
-    """
     if len(evidence_rows) <= 1:
         return False
 
@@ -1805,7 +1433,6 @@ def has_genuine_correlatable_structure(
 
     return False
 
-
 def run_correlation(
     analysis_id: int,
     evidence_rows: list[Evidence],
@@ -1820,10 +1447,6 @@ def run_correlation(
         for evidence in evidence_rows
     }
 
-    # Normal finalization passes a CorrelationPreparation that routing has
-    # already inspected, so candidate generation/scoring is not repeated.
-    # The indexes-only path remains for compatibility with direct callers;
-    # callers that pass neither still get the original self-contained API.
     index_start = perf_counter()
     if preparation is None:
         if indexes is None:
@@ -1844,8 +1467,6 @@ def run_correlation(
         edge_seconds = 0.0
 
     dag_start = perf_counter()
-    # enforce_dag only makes sense for directed edges - associations are
-    # non-directional by definition, so there is no "cycle" for them.
     dag_edges = enforce_dag(edges, evidence_by_id)
     dag_seconds = perf_counter() - dag_start
 

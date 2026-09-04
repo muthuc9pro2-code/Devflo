@@ -1,5 +1,4 @@
 from typing import Annotated
-
 from pydantic import BaseModel, ConfigDict, EmailStr, StringConstraints
 
 RegistrationUsername = Annotated[
@@ -15,12 +14,10 @@ RequestEmail = Annotated[EmailStr, StringConstraints(max_length=254)]
 LoginPassword = Annotated[str, StringConstraints(min_length=1, max_length=128)]
 JwtToken = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 
-
 class UserRegister(BaseModel):
     username: RegistrationUsername
     email: RequestEmail
     password: NewPassword
-
 
 class UserResponse(BaseModel):
     id: int
@@ -30,33 +27,26 @@ class UserResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-
 class UserLogin(BaseModel):
     email: RequestEmail
     password: LoginPassword
 
-
 class LoginResponse(BaseModel):
     message: str
-
 
 class RegisterResponse(BaseModel):
     message: str
     email: EmailStr
 
-
 class ForgotPasswordRequest(BaseModel):
     email: RequestEmail
-
 
 class VerifyEmailRequest(BaseModel):
     token: JwtToken
 
-
 class ResetPasswordRequest(BaseModel):
     token: JwtToken
     new_password: NewPassword
-
 
 class ResetPasswordStatusRequest(BaseModel):
     token: JwtToken

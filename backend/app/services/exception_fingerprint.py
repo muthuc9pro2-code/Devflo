@@ -12,13 +12,11 @@ UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{12}\b"
 )
 
-
 def normalize_exception_message(message: str) -> str:
     message = UUID_PATTERN.sub("<uuid>", message)
     message = NUMBER_PATTERN.sub("<number>", message)
 
     return message.lower().strip()
-
 
 def build_exception_fingerprint(event: ParsedEvent) -> str:
     if event.exception_type is None:
@@ -33,7 +31,6 @@ def build_exception_fingerprint(event: ParsedEvent) -> str:
 
     fingerprint = f"{event.exception_type.lower()}:{normalized_message}"
     return _bounded_fingerprint(fingerprint)
-
 
 def _bounded_fingerprint(value: str) -> str:
     if len(value) <= MAX_FINGERPRINT_LENGTH:

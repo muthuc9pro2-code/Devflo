@@ -1,16 +1,9 @@
-"""Source outcome presentation: distinguishing "source unavailable" from
-"source ready but zero matches" from "source ready and matched" - all
-derived from Evidence's own real, already-persisted source_matches (never
-the overall evidence_count, and never a second/invented matching system).
-"""
 from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.api import analysis as analysis_api
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
@@ -18,10 +11,8 @@ from app.schemas.gemini import GeminiInvestigationResponse
 from app.services.gemini_service import GeminiUnavailableError
 from app.tasks import analysis as analysis_task
 
-
 def _upload(filename: str, content: bytes):
     return SimpleNamespace(filename=filename, content_type="text/plain", file=BytesIO(content))
-
 
 def _db_with_schema(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -30,10 +21,8 @@ def _db_with_schema(monkeypatch):
     monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
     return session_factory
 
-
 def _raise_gemini_unavailable(_context):
     raise GeminiUnavailableError("temporarily unavailable")
-
 
 _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     title="t",
@@ -44,7 +33,6 @@ _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     recommended_actions=[],
     uncertainties=[],
 )
-
 
 def _seed_source_analysis(
     session_factory,
@@ -65,11 +53,6 @@ def _seed_source_analysis(
         status="processing",
         source_kind=source_kind,
         source_reference="irrelevant-for-this-test",
-        # Source preparation already succeeded (this test is about the
-        # presentation layer built from already-persisted Evidence, not
-        # about re-verifying prepare_source()/correlate_event() itself -
-        # those have their own dedicated coverage in
-        # test_source_correlation.py and test_source_resource_limits.py).
         source_status="ready",
         source_failure_reason=None,
     )
@@ -110,12 +93,10 @@ def _seed_source_analysis(
     db.close()
     return analysis_id
 
-
 def _quiet(monkeypatch):
     monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _raise_gemini_unavailable)
     monkeypatch.setattr(analysis_task, "publish_investigation_result", lambda *a, **k: None)
     monkeypatch.setattr(analysis_task, "publish_progress", lambda *a, **k: None)
-
 
 def _capture_gemini_context(monkeypatch):
     captured = {}
@@ -126,7 +107,6 @@ def _capture_gemini_context(monkeypatch):
 
     monkeypatch.setattr(analysis_task, "generate_investigation_explanation", _fake)
     return captured
-
 
 _SOURCE_MATCH = [
     {
@@ -139,10 +119,6 @@ _SOURCE_MATCH = [
         "confidence": "high",
     }
 ]
-
-
-# --- 1: source ZIP + real matches ------------------------------------------
-
 
 def test_source_zip_with_matches_reports_match_count(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
@@ -165,13 +141,9 @@ def test_source_zip_with_matches_reports_match_count(monkeypatch):
 
     source = analysis.result_snapshot["source"]
     assert source["status"] == "ready"
-    assert source["match_count"] == 1  # only one of the two evidence rows matched
+    assert source["match_count"] == 1
     assert source["failure_reason"] is None
     assert "source_context" not in captured["context"]
-
-
-# --- 2/3: source ready but zero matches (ZIP and GitHub) -------------------
-
 
 def test_source_zip_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
@@ -193,14 +165,13 @@ def test_source_zip_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
     db.close()
 
     source = analysis.result_snapshot["source"]
-    assert source["status"] == "ready"  # prepared successfully - NOT "unavailable"
+    assert source["status"] == "ready"
     assert source["match_count"] == 0
     assert source["failure_reason"] is None
     assert captured["context"]["source_context"] == {
         "status": "ready",
         "match_count": 0,
     }
-
 
 def test_correlated_zero_match_source_context_reaches_gemini(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
@@ -231,7 +202,6 @@ def test_correlated_zero_match_source_context_reaches_gemini(monkeypatch):
         "match_count": 0,
     }
 
-
 def test_github_source_with_zero_matches_stays_ready_not_unavailable(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet(monkeypatch)
@@ -250,10 +220,6 @@ def test_github_source_with_zero_matches_stays_ready_not_unavailable(monkeypatch
     source = analysis.result_snapshot["source"]
     assert source["status"] == "ready"
     assert source["match_count"] == 0
-
-
-# --- 4: invalid source ZIP content (not just oversized) --------------------
-
 
 def test_invalid_zip_content_gives_a_specific_safe_reason_and_diagnostics_continue(
     tmp_path, monkeypatch
@@ -281,10 +247,6 @@ def test_invalid_zip_content_gives_a_specific_safe_reason_and_diagnostics_contin
     assert [row["original_filename"] for row in kwargs["artifacts"]] == ["diagnostic.log"]
     task.delay.assert_called_once_with(30)
 
-
-# --- 7: no source supplied --------------------------------------------------
-
-
 def test_no_source_supplied_omits_the_source_key_entirely(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)
     _quiet(monkeypatch)
@@ -294,9 +256,6 @@ def test_no_source_supplied_omits_the_source_key_entirely(monkeypatch):
         source_kind=None,
         evidence_kwargs=[{"service": "worker"}],
     )
-    # Overwrite the source_status the helper sets by default - "no source
-    # was ever requested" means source_kind AND source_status are both
-    # None, matching real upload_file()/create_analysis() behavior.
     db = session_factory()
     analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
     analysis.source_status = None
@@ -311,7 +270,6 @@ def test_no_source_supplied_omits_the_source_key_entirely(monkeypatch):
 
     assert "source" not in analysis.result_snapshot
     assert "source_context" not in captured["context"]
-
 
 def test_unstructured_fallback_carries_ready_zero_match_source_context(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)

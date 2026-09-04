@@ -1,5 +1,3 @@
-"""Public service API with lazy imports for lightweight parser use."""
-
 from importlib import import_module
 from typing import Any
 
@@ -33,7 +31,6 @@ _EXPORTS = {
 }
 
 __all__ = list(_EXPORTS)
-
 
 def __getattr__(name: str) -> Any:
     try:

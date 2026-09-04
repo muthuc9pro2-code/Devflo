@@ -6,11 +6,9 @@ from app.services.correlation_engine import (
     has_genuine_correlatable_structure,
 )
 
-
 class InvestigationPath(str, Enum):
     SIMPLE = "simple"
     CORRELATED = "correlated"
-
 
 def choose_investigation_path(
     evidence_rows: list[Evidence],

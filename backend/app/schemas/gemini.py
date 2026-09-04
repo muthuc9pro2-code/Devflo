@@ -5,14 +5,12 @@ class ProbableRootCause(BaseModel):
     explanation: str
     evidence_ids: list[int] = Field(default_factory=list)
 
-
 class SourceCodeFinding(BaseModel):
     file: str
     line_number: int | None = None
     function: str | None = None
     explanation: str
     evidence_ids: list[int] = Field(default_factory=list)
-
 
 class GeminiInvestigationResponse(BaseModel):
     title: str

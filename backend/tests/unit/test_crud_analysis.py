@@ -1,14 +1,11 @@
 from unittest.mock import Mock
-
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
-
 from app.crud import analysis as crud_analysis
 from app.crud.analysis import ActiveAnalysisLimitReached, create_analysis
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, User
-
 
 def test_create_analysis_bulk_adds_artifacts_in_one_transaction(monkeypatch):
     db = Mock()
@@ -51,7 +48,6 @@ def test_create_analysis_bulk_adds_artifacts_in_one_transaction(monkeypatch):
     assert [row.position for row in rows] == [0, 1]
     db.commit.assert_called_once()
 
-
 def test_create_analysis_rolls_back_on_artifact_failure(monkeypatch):
     db = Mock()
     monkeypatch.setattr(
@@ -69,7 +65,6 @@ def test_create_analysis_rolls_back_on_artifact_failure(monkeypatch):
 
     db.rollback.assert_called_once()
 
-
 def _real_db_with_user():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -84,7 +79,6 @@ def _real_db_with_user():
     db.add(user)
     db.commit()
     return db, user
-
 
 def test_create_analysis_allows_three_nonterminal_analyses_and_ignores_terminal_rows():
     db, user = _real_db_with_user()
@@ -134,7 +128,6 @@ def test_create_analysis_allows_three_nonterminal_analyses_and_ignores_terminal_
     )
     db.close()
 
-
 def test_create_analysis_rejects_fourth_nonterminal_analysis_and_rolls_back():
     db, user = _real_db_with_user()
     db.add_all(
@@ -162,15 +155,7 @@ def test_create_analysis_rejects_fourth_nonterminal_analysis_and_rolls_back():
     assert db.query(Analysis).count() == before
     db.close()
 
-
 def test_duplicate_cleanup_performs_no_database_read_after_commit(tmp_path, monkeypatch):
-    """Duplicate-file cleanup after durable creation must be filesystem-only.
-
-    SQLAlchemy expires ORM instances on commit by default. A stale implementation
-    that reads duplicate.saved_file_path after commit therefore performs an
-    implicit SELECT and can re-enter the upload's pre-durable failure path if
-    the database disappears immediately after commit.
-    """
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)

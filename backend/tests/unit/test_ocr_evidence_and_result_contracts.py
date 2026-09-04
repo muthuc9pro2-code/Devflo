@@ -1,36 +1,8 @@
-"""OCR-into-Evidence unification and the common per-path investigation
-result contract (correlated / simple / zero_evidence).
-
-Two real gaps were found by inspection before writing any of this:
-
-1. Upload-time format detection (detect_artifact_sample, used by
-   app/api/analysis.py) never recognized images, so a real image upload
-   through the normal multi-file flow got detected+stored as "generic" and
-   the OCR pipeline (diagnostic_adapters._stream_image_events, which
-   already existed and already worked) was never reached at process time
-   (_artifact_format() trusts a truthy stored detected_format and skips
-   re-detection). Fixed with a small image short-circuit mirroring the one
-   detect_artifact_stream already had.
-2. correlation_engine.FORMAT_SIGNAL_PRIORITY had no "image" entry, so
-   signal_strength("image", ...) was always None and OCR-derived evidence
-   could never match ANY correlation signal - not even a shared trace_id.
-   Fixed by registering "image" with the same profile as "generic" (OCR
-   text runs through the identical normalize_text_event() classification),
-   which only makes the pre-existing min()-of-both-sides calibration
-   engage for this format - the scoring/matching formula itself,
-   temporal decay, DAG construction, and root-cause weighting are
-   untouched.
-
-The rest of this file covers the generalized per-artifact outcome contract
-and the final SSE result contract for all three investigation outcomes.
-"""
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.schemas.gemini import GeminiInvestigationResponse
@@ -47,14 +19,10 @@ from app.services.investigation_context import (
 )
 from app.tasks import analysis as analysis_task
 
-# Unit tests must never require the real Gemini API/network/
-# quota - this is the same fixed, deterministic result every mocked
-# _finalize_analysis_task run in this file uses instead.
 _FAKE_GEMINI_RESULT = GeminiInvestigationResponse(
     title="t", summary="s", probable_root_causes=[], what_happened=[],
     source_code_findings=[], recommended_actions=[], uncertainties=[],
 )
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -75,17 +43,10 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
 def _artifact_row(artifact_id: int, filename: str, fmt: str, status: str = "completed"):
     return SimpleNamespace(id=artifact_id, original_filename=filename, detected_format=fmt, status=status)
 
-
-# --- upload-time image detection fix ---------------------------------------
-
-
 def test_detect_artifact_sample_recognizes_images_by_suffix_and_mime():
-    """Regression test for gap 1: before the fix this returned GENERIC for
-    every image, silently routing uploaded screenshots away from OCR."""
     fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
     assert (
@@ -100,15 +61,10 @@ def test_detect_artifact_sample_recognizes_images_by_suffix_and_mime():
         detect_artifact_sample(fake_png, filename=None, mime_type="image/webp")
         == ArtifactFormat.IMAGE
     )
-    # Text detection is untouched by the fix.
     assert (
         detect_artifact_sample(b"ERROR boom", filename="app.log", mime_type="text/plain")
         == ArtifactFormat.GENERIC
     )
-
-
-# --- 1/2: OCR text enters the EXISTING evidence pipeline, with provenance -
-
 
 def test_ocr_text_flows_through_the_existing_text_normalizer_with_provenance(
     monkeypatch, tmp_path
@@ -137,17 +93,12 @@ def test_ocr_text_flows_through_the_existing_text_normalizer_with_provenance(
     assert len(records) == 1
     event = records[0].event
     assert event is not None
-    # Same normalize_text_event() used by every text format - no
-    # OCR-specific evidence model/extraction path.
     assert event.source_format == "image"
-    assert event.source_file == "terminal.png"  # original image filename preserved
+    assert event.source_file == "terminal.png"
     assert event.level == "ERROR"
     assert event.ocr_confidence == 0.87
 
-
 def test_image_with_no_readable_text_yields_no_fabricated_evidence(monkeypatch, tmp_path):
-    """Requirement: no readable text -> no fabricated evidence (the
-    zero-evidence path handles this generically, same as any other format)."""
     monkeypatch.setattr(
         diagnostic_adapters,
         "extract_text_from_image_with_confidence",
@@ -167,10 +118,6 @@ def test_image_with_no_readable_text_yields_no_fabricated_evidence(monkeypatch, 
 
     assert records == []
 
-
-# --- 3: OCR evidence can take the SIMPLE path -------------------------------
-
-
 def test_ocr_evidence_can_take_simple_path():
     evidence_rows = [
         _evidence(1, artifact_id=1, source_format="image", source_file="terminal.png", service="checkout-ui")
@@ -187,10 +134,6 @@ def test_ocr_evidence_can_take_simple_path():
     assert outcome["evidence_count"] == 1
     assert "message" not in outcome
 
-
-# --- 4: OCR evidence can participate in CORRELATED path ---------------------
-
-
 def test_ocr_evidence_correlates_with_a_real_shared_trace_id():
     base = datetime.now(timezone.utc)
     web = _evidence(1, artifact_id=101, source_format="web_server", trace_id="trace-1", service="checkout-api", first_seen=base)
@@ -206,10 +149,7 @@ def test_ocr_evidence_correlates_with_a_real_shared_trace_id():
     assert len(run.result.components[0].edges) == 1
     assert any(s.value == "trace_id" for s in run.result.components[0].edges[0].signals)
 
-
 def test_ocr_evidence_without_any_shared_signal_stays_its_own_component():
-    """Confirms the fix doesn't manufacture correlation - image evidence
-    with genuinely nothing in common still lands in its own component."""
     base = datetime.now(timezone.utc)
     web = _evidence(1, artifact_id=101, source_format="web_server", service="checkout-api", first_seen=base)
     screenshot = _evidence(
@@ -220,10 +160,6 @@ def test_ocr_evidence_without_any_shared_signal_stays_its_own_component():
     run = run_correlation(analysis_id=1, evidence_rows=[web, screenshot])
 
     assert len(run.result.components) == 2
-
-
-# --- 5/14: source_matches survive through frontend AND Gemini contexts -----
-
 
 def test_source_matches_survive_for_ocr_evidence_across_all_contexts():
     base = datetime.now(timezone.utc)
@@ -271,10 +207,6 @@ def test_source_matches_survive_for_ocr_evidence_across_all_contexts():
     simple_context_item = next(e for e in simple_context["evidence"] if e["artifact_id"] == 102)
     assert simple_context_item["source_matches"] == matches
 
-
-# --- 6: correlated final payload preserves all existing fields -------------
-
-
 def test_correlated_payload_preserves_the_full_existing_field_contract():
     base = datetime.now(timezone.utc)
     rows = [
@@ -309,10 +241,6 @@ def test_correlated_payload_preserves_the_full_existing_field_contract():
         assert "delta_ms" in edge
         assert "signals" in edge
 
-
-# --- 7: simple final payload has no fabricated correlation concepts -------
-
-
 def test_simple_payload_never_fabricates_correlation_concepts():
     import json
 
@@ -326,10 +254,6 @@ def test_simple_payload_never_fabricates_correlation_concepts():
     assert "root_cause_strength" not in text
     assert "propagation" not in text
     assert '"edges"' not in text
-
-
-# --- 8: zero-evidence result has neutral per-artifact outcomes -------------
-
 
 def test_zero_evidence_payload_has_neutral_message_and_artifact_outcomes():
     artifacts = [_artifact_row(1, "nginx.log", "web_server"), _artifact_row(2, "random.log", "generic")]
@@ -345,10 +269,6 @@ def test_zero_evidence_payload_has_neutral_message_and_artifact_outcomes():
         assert outcome["status"] == "processed"
         assert "unrelated" not in outcome["message"].lower()
 
-
-# --- 9/10: per-artifact evidence_count correctness across builders --------
-
-
 def test_simple_payload_per_artifact_counts_and_zero_evidence_artifact():
     rows = [
         _evidence(1, artifact_id=1, service="a"),
@@ -358,7 +278,7 @@ def test_simple_payload_per_artifact_counts_and_zero_evidence_artifact():
     artifacts = [
         _artifact_row(1, "a.log", "generic"),
         _artifact_row(2, "b.log", "generic"),
-        _artifact_row(3, "c.log", "generic"),  # zero evidence
+        _artifact_row(3, "c.log", "generic"),
     ]
 
     payload = build_simple_payload(1, rows, artifacts=artifacts)
@@ -368,10 +288,6 @@ def test_simple_payload_per_artifact_counts_and_zero_evidence_artifact():
     assert outcome_by_id[2]["evidence_count"] == 1
     assert outcome_by_id[3]["evidence_count"] == 0
     assert "message" in outcome_by_id[3]
-
-
-# --- 11: multiple correlation components remain separate -------------------
-
 
 def test_multiple_components_remain_separate_and_never_labeled_unrelated():
     import json
@@ -388,22 +304,13 @@ def test_multiple_components_remain_separate_and_never_labeled_unrelated():
         _artifact_row(103, "batch.png", "image"),
     ]
     run = run_correlation(analysis_id=1, evidence_rows=rows)
-    assert len(run.result.components) == 2  # correlation itself still finds both, never merges them
+    assert len(run.result.components) == 2
 
     payload = build_correlation_payload(run, rows, artifacts=artifacts)
-    # The frontend graph represents the PRIMARY
-    # incident only - the non-primary (isolated) component is excluded
-    # from components[] but still honestly counted, never silently
-    # claimed as returned, and its artifact still gets a real per-artifact
-    # outcome (never "unrelated").
     assert payload["component_count"] == 1
     assert payload["component_count_total"] == 2
     assert payload["excluded_component_count"] == 1
     assert "unrelated" not in json.dumps(payload).lower()
-
-
-# --- 12/13: Gemini context shapes --------------------------------------
-
 
 def test_simple_gemini_context_includes_provenance_and_artifact_outcomes():
     rows = [_evidence(1, artifact_id=1, service="worker", source_format="image", source_file="log.png")]
@@ -416,7 +323,6 @@ def test_simple_gemini_context_includes_provenance_and_artifact_outcomes():
     assert item["source_format"] == "image"
     assert item["source_file"] == "log.png"
     assert context["artifacts"][0]["evidence_count"] == 1
-
 
 def test_correlated_gemini_context_preserves_deterministic_strengths_and_artifacts():
     base = datetime.now(timezone.utc)
@@ -439,10 +345,6 @@ def test_correlated_gemini_context_preserves_deterministic_strengths_and_artifac
     assert context["artifacts"]
     assert {a["artifact_id"] for a in context["artifacts"]} == {101, 102}
 
-
-# --- end-to-end: final SSE result contract for all three paths ------------
-
-
 def _sqlite_session(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -456,7 +358,6 @@ def _sqlite_session(monkeypatch):
     db.add(analysis)
     db.commit()
     return session_factory, db, analysis
-
 
 def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
     session_factory, db, analysis = _sqlite_session(monkeypatch)
@@ -492,27 +393,16 @@ def test_correlated_end_to_end_publishes_investigation_result_once(monkeypatch):
 
     analysis_task._finalize_analysis_task.run([], analysis_id, 0, None)
 
-    # investigation_result is the single authoritative full final payload -
-    # published exactly once, never twice (there used to also be
-    # a duplicate correlation_result event carrying the identical payload).
     assert len(investigation_calls) == 1
     assert investigation_calls[0]["investigation_path"] == "correlated"
     outcome_by_format = {a["source_format"] for a in investigation_calls[0]["artifacts"]}
     assert outcome_by_format == {"web_server", "image"}
 
-
 def test_correlation_result_event_no_longer_exists(monkeypatch):
-    """Regression guard (analysis_events.py): the duplicate
-    correlation_result event (a second full node/edge/evidence graph over
-    SSE for the same finished computation, with no frontend consumer) was
-    removed rather than kept "for compatibility" - this pins that
-    publish_correlation_result is genuinely gone, not merely unused, so it
-    cannot quietly come back."""
     from app.services import analysis_events
 
     assert not hasattr(analysis_events, "publish_correlation_result")
     assert not hasattr(analysis_task, "publish_correlation_result")
-
 
 def test_simple_end_to_end_publishes_investigation_result_only(monkeypatch):
     session_factory, db, analysis = _sqlite_session(monkeypatch)
@@ -543,10 +433,6 @@ def test_simple_end_to_end_publishes_investigation_result_only(monkeypatch):
     assert payload["investigation_path"] == "simple"
     assert "components" not in payload
     assert payload["evidence"][0]["service"] == "worker"
-
-
-# --- 15: no Gemini context built/called for whole-analysis zero evidence --
-
 
 def test_zero_evidence_end_to_end_builds_no_gemini_context(monkeypatch):
     session_factory, db, analysis = _sqlite_session(monkeypatch)

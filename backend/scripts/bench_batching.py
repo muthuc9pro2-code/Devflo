@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import functools
 import logging
 import statistics
@@ -30,7 +29,6 @@ VARIANTS = {
     "large (50MiB/100000)": (50 * 1024 * 1024, 100_000),
 }
 
-
 def _get_or_create_bench_user(db) -> User:
     user = db.query(User).filter(User.username == BENCH_USERNAME).first()
     if user is not None:
@@ -40,7 +38,6 @@ def _get_or_create_bench_user(db) -> User:
     db.commit()
     db.refresh(user)
     return user
-
 
 def _reset_analysis(db, user_id: int, fixture_path: Path) -> int:
     old = db.query(Analysis).filter(Analysis.user_id == user_id).all()
@@ -79,7 +76,6 @@ def _reset_analysis(db, user_id: int, fixture_path: Path) -> int:
     db.commit()
     return analysis.id
 
-
 class _StageCapture(logging.Handler):
     def __init__(self):
         super().__init__(level=logging.INFO)
@@ -92,7 +88,6 @@ class _StageCapture(logging.Handler):
             self.stages["ingestion"] = float(args[-1])
         elif "TOTAL processing time" in msg:
             self.stages["total"] = float(args[-1])
-
 
 def run() -> None:
     db = sessionLocal()
@@ -144,7 +139,6 @@ def run() -> None:
     for fmt in FORMATS:
         row = [f"{statistics.median(results[fmt][v]):.3f}s".ljust(24) for v in VARIANTS]
         print(f"{fmt:<10} " + " ".join(row))
-
 
 if __name__ == "__main__":
     run()

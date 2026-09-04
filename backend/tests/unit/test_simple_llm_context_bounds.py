@@ -1,17 +1,5 @@
-"""build_simple_llm_context() must not grow unbounded.
-
-Bounded-memory ingestion (a 1 GiB input processed with bounded memory) is
-worthless if every retained Evidence row is later dumped into a single
-Gemini request for the SIMPLE (uncorrelated) investigation path. These
-tests prove build_simple_llm_context()/select_bounded_evidence()
-enforce explicit, deterministic bounds (SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
-SIMPLE_LLM_MAX_CONTEXT_BYTES in processing_config.py) - never an AI-based
-ranking, never a second root-cause engine - while the final frontend/
-database payload (build_simple_payload) stays unbounded/unaffected.
-"""
 import json
 from datetime import datetime, timedelta, timezone
-
 from app.core.processing_config import (
     SIMPLE_LLM_MAX_CONTEXT_BYTES,
     SIMPLE_LLM_MAX_EVIDENCE_RECORDS,
@@ -22,7 +10,6 @@ from app.services.investigation_context import (
     build_simple_llm_context,
     build_simple_payload,
 )
-
 
 def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults = {
@@ -43,11 +30,7 @@ def _evidence(evidence_id: int, **kwargs) -> Evidence:
     defaults.update(kwargs)
     return Evidence(**defaults)
 
-
 def test_large_synthetic_evidence_list_produces_bounded_llm_context():
-    """The literal required regression: a large synthetic evidence list
-    (well beyond SIMPLE_LLM_MAX_EVIDENCE_RECORDS) must not grow the Gemini
-    context past the configured record bound."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(i, first_seen=base + timedelta(seconds=i))
@@ -61,16 +44,10 @@ def test_large_synthetic_evidence_list_produces_bounded_llm_context():
     assert context["evidence_count_included"] == len(context["evidence"])
     assert context["evidence_count_included"] < context["evidence_count_total"]
 
-    # Serialized size stays in the same ballpark as the configured byte
-    # budget - not merely "smaller than before" but genuinely capped.
     serialized_bytes = len(json.dumps(context, default=str).encode("utf-8"))
     assert serialized_bytes < SIMPLE_LLM_MAX_CONTEXT_BYTES * 2
 
-
 def test_full_frontend_payload_is_never_truncated_only_the_llm_context_is():
-    """build_simple_payload (the real frontend/database result) must keep
-    every retained evidence row regardless of how build_simple_llm_context
-    bounds what reaches Gemini."""
     base = datetime.now(timezone.utc)
     rows = [
         _evidence(i, first_seen=base + timedelta(seconds=i))
@@ -81,7 +58,6 @@ def test_full_frontend_payload_is_never_truncated_only_the_llm_context_is():
 
     assert len(payload["evidence"]) == len(rows)
     assert payload["evidence_count"] == len(rows)
-
 
 def test_selection_prioritizes_source_matches_then_severity_then_occurrence():
     base = datetime.now(timezone.utc)
@@ -100,17 +76,9 @@ def test_selection_prioritizes_source_matches_then_severity_then_occurrence():
     )
 
     selected_ids = {e.id for e in selected}
-    # The real source-code match ranks highest of all (a deterministic,
-    # already-computed signal); CRITICAL severity is the next strongest
-    # remaining signal - the plain WARNING and the high-occurrence-but-
-    # lower-severity record are dropped first under a tight record cap.
     assert selected_ids == {2, 3}
 
-
 def test_selection_respects_the_byte_budget_even_under_the_record_limit():
-    """A handful of oversized records (e.g. huge source-match snippets)
-    must be bounded by total bytes even when there are far fewer of them
-    than max_records."""
     base = datetime.now(timezone.utc)
     huge_snippet = "x" * 10_000
     rows = [
@@ -127,10 +95,7 @@ def test_selection_respects_the_byte_budget_even_under_the_record_limit():
 
     assert 0 < len(selected) < len(rows)
 
-
 def test_a_single_oversized_record_is_still_included_not_dropped_to_empty():
-    """The byte budget must never empty the context entirely just because
-    the very first/highest-priority record alone exceeds it."""
     oversized = _evidence(
         1,
         source_matches=[{"relative_path": "a.py", "snippet": "x" * 50_000}],
@@ -142,11 +107,7 @@ def test_a_single_oversized_record_is_still_included_not_dropped_to_empty():
 
     assert selected == [oversized]
 
-
 def test_artifact_diversity_prevents_one_artifact_from_dominating():
-    """One artifact with many low-priority rows must not crowd out a
-    different artifact's evidence under a tight record cap - selection
-    round-robins across artifacts."""
     base = datetime.now(timezone.utc)
     noisy_artifact = [
         _evidence(i, artifact_id=1, severity="WARNING", first_seen=base + timedelta(seconds=i))
@@ -163,7 +124,6 @@ def test_artifact_diversity_prevents_one_artifact_from_dominating():
     )
 
     assert any(e.artifact_id == 2 for e in selected)
-
 
 def test_selection_is_deterministic_regardless_of_input_order():
     import random
@@ -187,10 +147,7 @@ def test_selection_is_deterministic_regardless_of_input_order():
     assert selected_ids(shuffled) == baseline
     assert selected_ids(list(reversed(rows))) == baseline
 
-
 def test_small_evidence_list_is_returned_unchanged():
-    """No truncation/reordering overhead when the whole list already fits
-    comfortably within both bounds."""
     rows = [_evidence(1), _evidence(2)]
 
     context = build_simple_llm_context(analysis_id=1, evidence_rows=rows)

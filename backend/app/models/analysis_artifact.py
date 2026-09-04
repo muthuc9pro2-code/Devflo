@@ -12,7 +12,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
-
 class AnalysisArtifact(Base):
     __tablename__ = "analysis_artifacts"
     __table_args__ = (

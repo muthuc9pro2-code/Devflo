@@ -101,20 +101,17 @@ _STANDALONE_SECRET_PATTERNS = (
     ),
 )
 
-
 def _identifier_tokens(name: str) -> tuple[str, ...]:
     separated = _IDENTIFIER_ACRONYM_BOUNDARY.sub(" ", str(name))
     separated = _IDENTIFIER_CAMEL_BOUNDARY.sub(" ", separated)
     separated = _IDENTIFIER_SEPARATOR.sub(" ", separated)
     return tuple(token.lower() for token in separated.split() if token)
 
-
 def _is_sensitive_name(name: str) -> bool:
     tokens = _identifier_tokens(name)
     if not tokens:
         return False
     token_set = set(tokens)
-    # Metadata ABOUT credentials is useful and not itself secret.
     if token_set & _SENSITIVE_METADATA_TOKENS:
         return False
     collapsed = "".join(tokens)
@@ -141,7 +138,6 @@ def _is_sensitive_name(name: str) -> bool:
         return True
     return False
 
-
 def _is_sensitive_query_name(name: str) -> bool:
     tokens = _identifier_tokens(name)
     return (
@@ -151,29 +147,24 @@ def _is_sensitive_query_name(name: str) -> bool:
         or tokens == ("sig",)
     )
 
-
 def _redacted_value(value: str) -> str:
     if len(value) >= 2 and value[0] in {'"', "'", "`"} and value[-1] == value[0]:
         return f"{value[0]}{_REDACTED}{value[0]}"
     return _REDACTED
-
 
 def _redact_keyed_value(match: re.Match) -> str:
     if not _is_sensitive_name(match.group("key")):
         return match.group(0)
     return f'{match.group("prefix")}{_redacted_value(match.group("value"))}'
 
-
 def _redact_query_parameter(match: re.Match) -> str:
     if not _is_sensitive_query_name(match.group("key")):
         return match.group(0)
     return f'{match.group("prefix")}{_REDACTED}'
 
-
 def _redact_private_key_block(match: re.Match) -> str:
     label = match.group("label")
     return f"-----BEGIN {label}-----\n{_REDACTED}\n-----END {label}-----"
-
 
 def _redact_high_confidence_secret_shapes(text: str) -> str:
     redacted = _PRIVATE_KEY_BLOCK.sub(_redact_private_key_block, text)
@@ -184,7 +175,6 @@ def _redact_high_confidence_secret_shapes(text: str) -> str:
         redacted = pattern.sub(_REDACTED, redacted)
     return redacted
 
-
 def _redact_text_for_gemini(text: str) -> str:
     redacted = _QUOTED_KEY_VALUE.sub(_redact_keyed_value, text)
     redacted = _SENSITIVE_HEADER.sub(
@@ -194,7 +184,6 @@ def _redact_text_for_gemini(text: str) -> str:
     redacted = _ASSIGNMENT_VALUE.sub(_redact_keyed_value, redacted)
     return _redact_high_confidence_secret_shapes(redacted)
 
-
 def _is_config_like_source_path(source_path: str | None) -> bool:
     if not source_path:
         return False
@@ -202,7 +191,6 @@ def _is_config_like_source_path(source_path: str | None) -> bool:
     if name == ".env" or name.startswith(".env."):
         return True
     return Path(name).suffix.lower() in _CONFIG_LIKE_SOURCE_SUFFIXES
-
 
 def _source_config_rhs_is_reference(value: str) -> bool:
     candidate = value.strip()
@@ -214,13 +202,11 @@ def _source_config_rhs_is_reference(value: str) -> bool:
         return True
     return candidate.lower() in {"none", "null", "true", "false"}
 
-
 def _redact_source_triple_literal(match: re.Match) -> str:
     if not _is_sensitive_name(match.group("key")):
         return match.group(0)
     quote = match.group("quote")
     return f'{match.group("prefix")}{quote}{_REDACTED}{quote}'
-
 
 def _line_ending(line: str) -> str:
     if line.endswith("\r\n"):
@@ -229,10 +215,8 @@ def _line_ending(line: str) -> str:
         return "\n"
     return ""
 
-
 def _leading_indent(line: str) -> int:
     return len(line) - len(line.lstrip(" \t"))
-
 
 def _has_unescaped_closing_quote(text: str, quote: str, *, start: int) -> bool:
     escaped = False
@@ -247,14 +231,11 @@ def _has_unescaped_closing_quote(text: str, quote: str, *, start: int) -> bool:
             return True
     return False
 
-
 def _config_value_end(
     lines: list[str], start_index: int, value: str, base_indent: int
 ) -> int:
-    """Return the final physical line owned by one config value."""
     stripped = value.strip()
 
-    # TOML/Python-style triple-quoted value.
     for marker in ('"""', "'''"):
         if not stripped.startswith(marker):
             continue
@@ -263,11 +244,8 @@ def _config_value_end(
         for index in range(start_index + 1, len(lines)):
             if marker in lines[index]:
                 return index
-        # Unterminated literal: safest outbound behavior is to remove the
-        # rest of this snippet.
         return len(lines) - 1
 
-    # .env / config quoted multiline literal.
     if stripped[:1] in {'"', "'", "`"}:
         quote = stripped[0]
         if not _has_unescaped_closing_quote(stripped, quote, start=1):
@@ -276,13 +254,6 @@ def _config_value_end(
                     return index
             return len(lines) - 1
 
-    # YAML:
-    #
-    # SECRET_KEY: |
-    #   first
-    #   second
-    #
-    # and folded '>' equivalents.
     yaml_marker = stripped.split("#", 1)[0].strip()
     if _YAML_BLOCK_SCALAR.fullmatch(yaml_marker):
         end = start_index
@@ -296,7 +267,6 @@ def _config_value_end(
             end = index
         return end
 
-    # Java properties / shell-style continuation.
     if stripped.endswith("\\"):
         end = start_index
         for index in range(start_index + 1, len(lines)):
@@ -305,13 +275,6 @@ def _config_value_end(
                 break
         return end
 
-    # INI continuation or YAML nested value:
-    #
-    # SECRET_KEY:
-    #   primary: ...
-    #   secondary: ...
-    #
-    # If a sensitive key owns an indented block, remove the block.
     end = start_index
     for index in range(start_index + 1, len(lines)):
         candidate = lines[index].rstrip("\r\n")
@@ -323,9 +286,7 @@ def _config_value_end(
         end = index
     return end
 
-
 def _redact_config_like_source(text: str) -> str:
-    """Redact complete logical values from config-like source snippets."""
     lines = text.splitlines(keepends=True)
     output: list[str] = []
     index = 0
@@ -339,47 +300,22 @@ def _redact_config_like_source(text: str) -> str:
         value = match.group("value")
         end_index = _config_value_end(lines, index, value, _leading_indent(line))
         if not value.strip():
-            # SECRET_KEY=
-            #
-            # has no credential value. SECRET_KEY:
-            #   actual: value
-            #
-            # does, because it owns an indented block.
             if end_index == index:
                 output.append(line)
                 index += 1
                 continue
         elif _source_config_rhs_is_reference(value):
-            # Examples:
-            #
-            # SECRET_KEY=${SECRET_KEY}
-            # GEMINI_API_KEY="$GEMINI_API_KEY"
-            #
-            # These are references, not credential values.
             output.append(line)
             index += 1
             continue
-        # Deliberately discard the entire RHS, including comments.
-        #
-        # Trying to preserve '# comment' without parsing the complete quote
-        # grammar can leak:
-        #
-        # SECRET_KEY="abc#def"
-        #
-        # as '#def'.
         output.append(f'{match.group("prefix")}{_REDACTED}{match.group("newline")}')
-        # Keep physical line count so the snippet remains structurally
-        # useful without retaining any continuation bytes.
         for skipped in lines[index + 1: end_index + 1]:
             output.append(_line_ending(skipped))
         index = end_index + 1
     return "".join(output)
 
-
 def _redact_source_text_for_gemini(text: str, *, source_path: str | None = None) -> str:
-    """Redact hardcoded source/config credentials without hiding references."""
     redacted = _QUOTED_KEY_VALUE.sub(_redact_keyed_value, text)
-    # Must happen before the ordinary one-line literal matcher.
     redacted = _SOURCE_TRIPLE_LITERAL_ASSIGNMENT.sub(
         _redact_source_triple_literal, redacted
     )
@@ -389,7 +325,6 @@ def _redact_source_text_for_gemini(text: str, *, source_path: str | None = None)
         redacted = _SOURCE_LITERAL_ASSIGNMENT.sub(_redact_keyed_value, redacted)
     return _redact_high_confidence_secret_shapes(redacted)
 
-
 def _redact_context_for_gemini(
     value,
     *,
@@ -397,12 +332,6 @@ def _redact_context_for_gemini(
     in_source_matches: bool = False,
     source_path: str | None = None,
 ):
-    """Return a redacted copy of outbound Gemini context.
-
-    This deliberately targets obvious credentials/tokens/URL secrets only.
-    It is not a general PII scrubber, and the deterministic context/result is
-    never modified.
-    """
     if key is not None and _is_sensitive_name(str(key)):
         if value is None:
             return None
@@ -443,41 +372,20 @@ def _redact_context_for_gemini(
         return _redact_text_for_gemini(value)
     return value
 
-
 def _redacted_json_default(value) -> str:
     return _redact_text_for_gemini(str(value))
 
-
 class GeminiUnavailableError(RuntimeError):
-    """Gemini's explanation layer did not return a usable result after
-    bounded retries (or hit a non-retryable failure). Callers must treat
-    this as "no explanation available", never as a deterministic-pipeline
-    failure - the caller's already-computed deterministic result must
-    still be persisted/completed. Raised for every expected Gemini/provider
-    failure mode: transient 5xx/429 exhausted after retry, a non-retryable
-    4xx, an unexpected transport/SDK exception from the external call, or a
-    malformed/schema-invalid response body."""
-
+    pass
 
 def _client_error_status_code(exc: genai_errors.ClientError) -> int | None:
-    """google-genai's ClientError/APIError exposes the HTTP status as
-    `.code` (see errors.APIError.__init__) - `.status_code` is checked too
-    defensively, in case a differently-shaped exception (or a future SDK
-    version) surfaces it under that name instead."""
     for attribute in ("code", "status_code"):
         value = getattr(exc, attribute, None)
         if value is not None:
             return value
     return None
 
-
 def _log_retry_attempt(attempt: int, exc: Exception) -> None:
-    """Shared log+backoff for a bounded retry attempt that is NOT yet
-    exhausted - never raises. Each except clause below decides for itself
-    when the fixed _MAX_ATTEMPTS budget is exhausted and raises
-    GeminiUnavailableError directly, so that decision (and the resulting
-    `raise`) stays visible at each retryable-failure call site rather than
-    hidden behind a shared helper."""
     logger.warning(
         "Gemini request attempt %s/%s failed (%s); retrying in %.1fs",
         attempt,
@@ -609,7 +517,6 @@ to Devflo's deterministic findings.
 """
 
 class _LazyGeminiClient:
-    """Construct the optional SDK client only when an explanation is needed."""
 
     def __init__(self) -> None:
         self._resolved_client = None
@@ -627,10 +534,7 @@ class _LazyGeminiClient:
 
     @property
     def models(self):
-        # Kept as a property so existing call sites and tests can target the
-        # SDK's models facade while client construction remains lazy.
         return self.get().models
-
 
 _client = _LazyGeminiClient()
 

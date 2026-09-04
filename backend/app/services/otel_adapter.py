@@ -8,6 +8,7 @@ from app.core.processing_config import JSON_STREAM_BUFFER_BYTES, MAX_DIAGNOSTIC_
 from app.utils.bounded_json import BoundedJsonStream
 from .artifact_detector import ArtifactFormat
 from .diagnostic_parser import normalize_otel_severity, normalize_text_event
+
 if TYPE_CHECKING:
     from .diagnostic_adapters import ArtifactEvent
 logger = logging.getLogger(__name__)

@@ -1,5 +1,4 @@
 from datetime import UTC, datetime
-
 from sqlalchemy.orm import Session
 from app.core.security import password_hash, verify_password
 from app.models.user import User

@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import random
 import sys
 from io import BytesIO
@@ -12,7 +10,6 @@ from app.utils.bounded_json import (
     BoundedJsonStream,
     OversizedJsonScalarError,
 )
-
 
 class _ReferenceBoundedJsonStream:
 
@@ -62,7 +59,6 @@ class _ReferenceBoundedJsonStream:
         if size > self._max_scalar_bytes:
             raise OversizedJsonScalarError(f"...{self._max_scalar_bytes} bytes")
 
-
 def _drive(cls, data: bytes, max_scalar_bytes: int, chunk_sizes: list[int]):
     stream = cls(BytesIO(data), max_scalar_bytes=max_scalar_bytes)
     consumed = b""
@@ -78,14 +74,12 @@ def _drive(cls, data: bytes, max_scalar_bytes: int, chunk_sizes: list[int]):
     except OversizedJsonScalarError:
         return consumed, True, offset
 
-
 def _random_chunk_plan(rng: random.Random) -> list[int]:
     sizes = []
     remaining_reads = rng.randint(20, 60)
     for _ in range(remaining_reads):
         sizes.append(rng.choice([1, 2, 3, 5, 8, 13, 21, 64, 128, 4096, 65536]))
     return sizes
-
 
 ADVERSARIAL_CASES = [
     b'{"a": "' + b"x" * 500 + b'"}',
@@ -104,7 +98,6 @@ ADVERSARIAL_CASES = [
     (b'{"k' + str(i).encode() + b'": "' + bytes([65 + (i % 26)]) * 30 + b'"}' for i in range(0)),
 ]
 ADVERSARIAL_CASES = [c for c in ADVERSARIAL_CASES if isinstance(c, (bytes, bytearray))]
-
 
 def main() -> int:
     rng = random.Random(1234567)
@@ -138,7 +131,6 @@ def main() -> int:
 
     print(f"\ntrials={trials} mismatches={mismatches}")
     return 1 if mismatches else 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

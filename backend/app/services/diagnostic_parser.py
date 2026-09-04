@@ -5,6 +5,7 @@ from functools import lru_cache
 from typing import Any
 from .event_filter import IMPORTANT_LEVELS
 from .log_praser import ParsedEvent, StackFrame
+
 TIMESTAMP_PATTERN = re.compile('\\b\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,9})?(?:Z|[+-]\\d{2}:?\\d{2})?\\b')
 LOG_LEVEL_PATTERN = re.compile('(?<![A-Za-z])(TRACE|DEBUG|INFO|NOTICE|WARNING|WARN|ERROR|ERR|SEVERE|FATAL|CRITICAL|ALERT|EMERG(?:ENCY)?)(?![A-Za-z])', re.IGNORECASE)
 TRACE_ID_PATTERN = re.compile('\\b(?:trace[_-]?id|traceid)[\\s=:' + '"\'' + ']+([A-Za-z0-9_-]+)', re.IGNORECASE)
@@ -19,23 +20,11 @@ EXCEPTION_PATTERN = re.compile('\\b([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Fa
 PYTHON_FRAME_PATTERN = re.compile('^\\s*File "([^"]+)", line (\\d+), in (.+)$', re.MULTILINE)
 JAVA_FRAME_PATTERN = re.compile('^\\s*at\\s+(?:(.+?)\\()?([^():]+):(\\d+)\\)?$', re.MULTILINE)
 NODE_FRAME_PATTERN = re.compile('^\\s*at\\s+(?:(.+?)\\s+\\()?([^():]+):(\\d+):\\d+\\)?$', re.MULTILINE)
-# Conservative, language-agnostic "path/to/file.ext:LINE[:COLUMN]" or
-# .NET-style "file.ext:line LINE" fallback - covers common diagnostics from
-# Go, Rust, Ruby, .NET, C/C++ and other runtimes that don't use any of the
-# three explicit conventions above, without building a parser per language.
-# Deliberately loose (e.g. "host.example.com:8080" can match syntactically)
-# - this only ever produces a StackFrame CANDIDATE; source_index.py's
-# _match_frame() still has to resolve the path unambiguously against the
-# real indexed source tree before Devflo claims an actual source match, so
-# a loose regex here can never fabricate one on its own.
 GENERIC_SOURCE_LOCATION_PATTERN = re.compile(
     r'(?P<path>[\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,9})'
     r':(?:line\s+)?(?P<line>\d+)(?::(?P<column>\d+))?',
     re.IGNORECASE,
 )
-# Fast substring-scale pre-check for _classify_text's _STACK feature gate -
-# "does this text even contain a '.ext:digit'-shaped substring anywhere",
-# cheaper than running the full named-group pattern above on every record.
 _LOOSE_SOURCE_LOCATION_HINT = re.compile(r'\.[A-Za-z]\w{0,9}:\d')
 LEVEL_ALIASES = {'WARN': 'WARNING', 'WARNING': 'WARNING', 'ERR': 'ERROR', 'ERROR': 'ERROR', 'SEVERE': 'CRITICAL', 'FATAL': 'CRITICAL', 'CRITICAL': 'CRITICAL', 'ALERT': 'CRITICAL', 'EMERG': 'CRITICAL', 'EMERGENCY': 'CRITICAL', 'NOTICE': 'INFO'}
 FIELD_ALIASES = {'traceid': 'trace_id', 'spanid': 'span_id', 'parentspanid': 'parent_span_id', 'requestid': 'request_id', 'correlationid': 'request_id', 'xrequestid': 'request_id', 'service': 'service', 'servicename': 'service', 'app': 'service', 'component': 'service', 'module': 'module', 'logger': 'module', 'host': 'host', 'hostname': 'host', 'node': 'host', 'container': 'container', 'containerid': 'container', 'containername': 'container', 'pod': 'pod', 'podname': 'pod', 'status': 'http_status', 'statuscode': 'http_status', 'httpstatus': 'http_status', 'endpoint': 'endpoint', 'route': 'endpoint', 'path': 'endpoint', 'url': 'endpoint'}
@@ -46,9 +35,6 @@ _LEVEL_MARKERS = ('trace', 'debug', 'info', 'notice', 'warn', 'error', 'err', 's
 _FIELDS, _SPACE_FIELDS, _LEVEL, _EXCEPTION, _HTTP, _FATAL, _TIMESTAMP, _STACK, _SLOW = (1 << bit for bit in range(9))
 _NON_ALNUM_PATTERN = re.compile('[^a-z0-9]')
 _ALL_CANONICAL_FIELD_KEYS = frozenset(FIELD_ALIASES.values())
-# Folds a matched key to the same form FIELD_ALIASES is keyed on (lowercase,
-# '_'/'-' stripped) in a single str.translate() pass instead of
-# .lower().replace('_', '').replace('-', '') (three full-string passes).
 _KEY_FOLD_TABLE = {ord(c): ord(c.lower()) for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'}
 _KEY_FOLD_TABLE[ord('_')] = None
 _KEY_FOLD_TABLE[ord('-')] = None
@@ -204,30 +190,6 @@ _SPACED_OPERATOR_RE = re.compile('[=:]\\s|\\s[=:]')
 _HTTP_VERBS = frozenset({'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'})
 
 def fast_path_prefixed_event(raw_text: str, line_number: int, *, source_file: str | None=None, source_format: str | None=None) -> ParsedEvent | None:
-    """True single-pass tokenizer for single-line 'TIMESTAMP LEVEL key=value ...' records.
-
-    Recognizes the timestamp/level prefix structurally (two short anchored
-    matches instead of the two full-text TIMESTAMP_PATTERN/LOG_LEVEL_PATTERN
-    searches normalize_text_event() pays for), then walks the remainder
-    ONCE - split into whitespace-delimited tokens - extracting every field,
-    the exception marker, and the HTTP-verb-derived endpoint in that same
-    traversal. That replaces _classify_text() (a full-line .lower() plus
-    ~50 substring checks) and _extract_diagnostic_fields()'s two whole-line
-    regex passes entirely for this shape.
-
-    Each candidate token is still handed to the real
-    DIAGNOSTIC_FIELD_PATTERN/SPACE_DIAGNOSTIC_FIELD_PATTERN plus the shared
-    _store_diagnostic_field() helper - just scoped to that one short token
-    instead of the whole line - so the character-class-level extraction
-    semantics stay byte-for-byte identical to the full parser; only the
-    traversal that finds candidates changes.
-
-    Only ever called where defaults would be empty, so this only needs to
-    reproduce normalize_text_event(raw_text, line_number, defaults={}).
-
-    Returns None whenever equivalence isn't cheaply guaranteed; callers must
-    fall back to normalize_text_event in that case.
-    """
     if '\n' in raw_text:
         return None
 
@@ -457,28 +419,6 @@ def normalize_structured_event(data: Mapping[str, Any], line_number: int, *, sou
     return event
 
 def structured_event_may_be_important(data: Mapping[str, Any], *, inherited: Mapping[str, Any] | None=None) -> bool:
-    """Cheap pre-check mirroring normalize_structured_event()'s level
-    resolution, so a definitely-unimportant structured record (e.g. an
-    ordinary status=200 access-log-style JSON entry) doesn't have to pay for
-    building its full ~15-alias defaults dict and running normalize_text_event
-    on its message just to be discarded a moment later.
-
-    Only returns False when the record is PROVABLY unimportant: none of the
-    real signals below fired, AND an explicit level/severity field (when
-    present) resolves to something non-important. A producer's own level
-    label is not trusted blindly - a record explicitly labeled "INFO" that
-    still carries a real exception/error type, an "stderr" stream, an
-    error-shaped status/state string, or an HTTP 4xx/5xx status is exactly
-    the "producer mislabeled a real failure" case is_evidence_worthy()
-    (event_filter.py) exists to catch, so those signals are checked before
-    ever trusting an unimportant explicit level (previously: an explicit
-    level short-circuited every other check, so
-    {"level":"INFO","exception":{"type":"ConnectionError", ...}} was
-    treated as provably unimportant and never even reached the full
-    parser). Any other shape - no explicit level, no usable status, or an
-    exception already implying ERROR - returns True and the record gets
-    fully parsed, exactly like today.
-    """
     inherited = inherited or {}
     key_cache: dict[int, dict[str, Any]] = {}
 

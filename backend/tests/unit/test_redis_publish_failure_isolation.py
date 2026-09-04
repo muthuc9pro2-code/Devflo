@@ -1,32 +1,13 @@
-"""SSE failure isolation: a Redis/transport failure inside
-publish_analysis_event() must never propagate into callers. Devflo's
-deterministic result is always persisted (result_snapshot + status=
-"completed") BEFORE any publish is attempted (persist-before-publish, see
-_finalize_analysis_task) - a live-notification failure after that point
-must not turn an already-successful, already-persisted analysis into a
-"failed" one.
-
-These tests mock the underlying redis_client.publish transport itself
-(never the high-level publish_progress/publish_investigation_result/
-publish_artifact_outcome wrappers), so the actual isolation code inside
-publish_analysis_event() is what's exercised.
-"""
 from datetime import datetime, timezone
 from unittest.mock import Mock
-
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, Evidence, User
 from app.services import analysis_events
 from app.tasks import analysis as analysis_task
-
-
-# --- 1: the low-level Redis exception never escapes publish_analysis_event -
-
 
 def test_publish_analysis_event_swallows_redis_connection_error(monkeypatch):
     monkeypatch.setattr(
@@ -36,8 +17,6 @@ def test_publish_analysis_event_swallows_redis_connection_error(monkeypatch):
     )
 
     analysis_events.publish_analysis_event(1, "progress", {"stage": "ingestion"})
-    # No exception means the failure was contained - that IS the assertion.
-
 
 def test_publish_analysis_event_logs_the_analysis_id_and_event(monkeypatch, caplog):
     monkeypatch.setattr(
@@ -54,10 +33,6 @@ def test_publish_analysis_event_logs_the_analysis_id_and_event(monkeypatch, capl
         for record in caplog.records
     )
 
-
-# --- 2/3/4: every existing wrapper inherits the isolation automatically --
-
-
 def test_publish_progress_does_not_raise_on_redis_failure(monkeypatch):
     monkeypatch.setattr(
         analysis_events.redis_client,
@@ -66,7 +41,6 @@ def test_publish_progress_does_not_raise_on_redis_failure(monkeypatch):
     )
 
     analysis_events.publish_progress(1, "ingestion", "in progress", progress=42)
-
 
 def test_publish_artifact_outcome_does_not_raise_on_redis_failure(monkeypatch):
     monkeypatch.setattr(
@@ -77,7 +51,6 @@ def test_publish_artifact_outcome_does_not_raise_on_redis_failure(monkeypatch):
 
     analysis_events.publish_artifact_outcome(1, {"status": "unsupported"})
 
-
 def test_publish_investigation_result_does_not_raise_on_redis_failure(monkeypatch):
     monkeypatch.setattr(
         analysis_events.redis_client,
@@ -87,14 +60,7 @@ def test_publish_investigation_result_does_not_raise_on_redis_failure(monkeypatc
 
     analysis_events.publish_investigation_result(1, {"investigation_path": "simple"})
 
-
-# --- deterministic computation/DB exceptions are NOT caught here ---------
-
-
 def test_publish_analysis_event_does_not_swallow_non_redis_exceptions(monkeypatch):
-    """This isolation is scoped to REDIS/transport failures only - a bug in
-    Devflo's own code (e.g. a TypeError from a bad call site) must still
-    surface normally, not be silently absorbed alongside Redis errors."""
     monkeypatch.setattr(
         analysis_events.redis_client,
         "publish",
@@ -104,18 +70,12 @@ def test_publish_analysis_event_does_not_swallow_non_redis_exceptions(monkeypatc
     with pytest.raises(TypeError):
         analysis_events.publish_analysis_event(1, "progress", {})
 
-
-# --- finalize regression: a persisted "completed" result survives a ------
-# --- Redis publish failure at the final investigation_result step --------
-
-
 def _db_with_schema(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     monkeypatch.setattr(analysis_task, "sessionLocal", session_factory)
     return session_factory
-
 
 def _seed_analysis(session_factory, *, evidence_rows_kwargs: list[dict]) -> int:
     db = session_factory()
@@ -162,16 +122,7 @@ def _seed_analysis(session_factory, *, evidence_rows_kwargs: list[dict]) -> int:
     db.close()
     return analysis_id
 
-
 def test_finalize_survives_a_real_redis_publish_failure_at_the_final_event(monkeypatch):
-    """End-to-end regression for the exact scenario this fix targets:
-    result_snapshot persisted, status="completed", db.commit() - then the
-    live publish_investigation_result() call hits a real Redis transport
-    failure. That failure must not reach _finalize_analysis_task's outer
-    except block and must not cause _mark_analysis_failed(). Only the
-    underlying redis_client.publish transport is mocked - publish_progress/
-    publish_investigation_result run for real, so the actual isolation
-    code in publish_analysis_event() is exercised end-to-end."""
     session_factory = _db_with_schema(monkeypatch)
     analysis_id = _seed_analysis(
         session_factory,
@@ -183,9 +134,6 @@ def test_finalize_survives_a_real_redis_publish_failure_at_the_final_event(monke
         "publish",
         Mock(side_effect=RedisConnectionError("connection refused")),
     )
-    # generate_investigation_explanation is not part of this fix; keep the
-    # Gemini path out of scope by making it unavailable (already-covered
-    # behavior in test_ai_analysis_persistence.py).
     from app.services.gemini_service import GeminiUnavailableError
 
     monkeypatch.setattr(
@@ -202,7 +150,6 @@ def test_finalize_survives_a_real_redis_publish_failure_at_the_final_event(monke
     assert analysis.result_snapshot is not None
     assert analysis.result_snapshot["investigation_path"] == "simple"
     db.close()
-
 
 def test_finalize_correlated_path_survives_a_real_redis_publish_failure(monkeypatch):
     session_factory = _db_with_schema(monkeypatch)

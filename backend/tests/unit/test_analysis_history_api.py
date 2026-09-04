@@ -1,39 +1,22 @@
-"""History API tests (GET /analysis/history, GET /analysis/{id}).
-
-Persist-before-publish ordering and legacy analyses without a
-result_snapshot are covered directly against
-reconstruct_current_investigation_result / _finalize_analysis_task in
-test_result_snapshot.py, not duplicated here.
-
-Endpoint functions are called directly (db/current_user/response passed in
-explicitly) rather than through a FastAPI TestClient - the same pattern the
-rest of this suite already uses for SSE/task-layer testing, and it keeps
-these tests fast and independent of auth-dependency wiring.
-"""
 from datetime import datetime, timedelta, timezone
-
 import pytest
 from fastapi import HTTPException, Response
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.api import analysis as analysis_api
 from app.db.database import Base
 from app.models import Analysis, AnalysisArtifact, User
-
 
 def _session():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)()
 
-
 def _user(db, name="alice") -> User:
     user = User(username=name, email=f"{name}@example.com", hashed_password="x", is_verified=True)
     db.add(user)
     db.commit()
     return user
-
 
 def _analysis(db, user, *, created_at, status="completed", **kwargs) -> Analysis:
     defaults = dict(
@@ -46,7 +29,6 @@ def _analysis(db, user, *, created_at, status="completed", **kwargs) -> Analysis
     db.commit()
     return analysis
 
-
 def _artifact(db, analysis, position=0) -> AnalysisArtifact:
     artifact = AnalysisArtifact(
         analysis_id=analysis.id, position=position, original_filename=f"f{position}.log",
@@ -56,10 +38,6 @@ def _artifact(db, analysis, position=0) -> AnalysisArtifact:
     db.add(artifact)
     db.commit()
     return artifact
-
-
-# --- Ownership scoping -------------------------------------------------------
-
 
 def test_history_only_returns_the_current_users_own_analyses():
     db = _session()
@@ -74,7 +52,6 @@ def test_history_only_returns_the_current_users_own_analyses():
     assert len(page.items) == 1
     assert page.items[0].analysis_id == alice_analysis.id
 
-
 def test_user_cannot_fetch_another_users_analysis_by_id():
     db = _session()
     alice = _user(db, "alice")
@@ -88,10 +65,7 @@ def test_user_cannot_fetch_another_users_analysis_by_id():
 
     assert error.value.status_code == 404
 
-
 def test_fetching_a_nonexistent_analysis_id_also_404s():
-    """A missing id and another user's real id must be indistinguishable -
-    both plain 404, never a different error that would leak existence."""
     db = _session()
     alice = _user(db, "alice")
 
@@ -99,10 +73,6 @@ def test_fetching_a_nonexistent_analysis_id_also_404s():
         analysis_api.get_analysis_detail(analysis_id=999999, db=db, current_user=alice)
 
     assert error.value.status_code == 404
-
-
-# --- Newest-first ---------------------------------------------------------
-
 
 def test_history_is_ordered_newest_first():
     db = _session()
@@ -116,10 +86,6 @@ def test_history_is_ordered_newest_first():
 
     assert [item.analysis_id for item in page.items] == [newest.id, middle.id, oldest.id]
 
-
-# --- Pagination is deterministic and bounded --------------------------------
-
-
 def test_history_pagination_is_deterministic_and_bounded():
     db = _session()
     alice = _user(db)
@@ -127,11 +93,11 @@ def test_history_pagination_is_deterministic_and_bounded():
     analyses = [
         _analysis(db, alice, created_at=base + timedelta(seconds=i)) for i in range(5)
     ]
-    expected_order = [a.id for a in reversed(analyses)]  # newest first
+    expected_order = [a.id for a in reversed(analyses)]
 
     seen: list[int] = []
     cursor = None
-    for _ in range(10):  # generous upper bound on pages, loop exits via break
+    for _ in range(10):
         page = analysis_api.get_analysis_history(
             db=db, current_user=alice, response=Response(), limit=2, cursor=cursor
         )
@@ -141,8 +107,7 @@ def test_history_pagination_is_deterministic_and_bounded():
             break
         cursor = page.next_cursor
 
-    assert seen == expected_order  # every analysis exactly once, in order
-
+    assert seen == expected_order
 
 def test_history_limit_is_clamped_to_the_configured_maximum():
     db = _session()
@@ -155,8 +120,7 @@ def test_history_limit_is_clamped_to_the_configured_maximum():
         db=db, current_user=alice, response=Response(), limit=10_000
     )
 
-    assert len(page.items) == 3  # not an error, just bounded by what exists
-
+    assert len(page.items) == 3
 
 def test_invalid_history_cursor_is_rejected():
     db = _session()
@@ -168,10 +132,6 @@ def test_invalid_history_cursor_is_rejected():
         )
 
     assert error.value.status_code == 400
-
-
-# --- History list is cheap ---------------------------------------------------
-
 
 def test_history_list_never_touches_correlation_or_gemini(monkeypatch):
     def _must_not_run_correlation(**kwargs):
@@ -194,11 +154,7 @@ def test_history_list_never_touches_correlation_or_gemini(monkeypatch):
 
     page = analysis_api.get_analysis_history(db=db, current_user=alice, response=Response())
 
-    assert len(page.items) == 1  # returned successfully without touching either
-
-
-# --- Completed detail uses the persisted snapshot -----------------------------
-
+    assert len(page.items) == 1
 
 def test_completed_detail_returns_the_persisted_result_snapshot():
     db = _session()
@@ -221,7 +177,6 @@ def test_completed_detail_returns_the_persisted_result_snapshot():
     body = json.loads(response.body)
     assert body["status"] == "completed"
     assert body["investigation_result"] == snapshot
-
 
 def test_completed_detail_never_calls_gemini_or_reruns_correlation_when_snapshot_exists(monkeypatch):
     from app.tasks import analysis as analysis_task
@@ -249,10 +204,6 @@ def test_completed_detail_never_calls_gemini_or_reruns_correlation_when_snapshot
 
     assert response.status_code == 200
 
-
-# --- In-progress / completed progress contract --------------------------------
-
-
 def test_in_progress_detail_reports_persisted_byte_progress():
     db = _session()
     alice = _user(db)
@@ -273,8 +224,7 @@ def test_in_progress_detail_reports_persisted_byte_progress():
     import json
     body = json.loads(response.body)
     assert body["status"] == "processing"
-    assert body["progress"] == 53  # scenario 11: a 53% persisted analysis returns 53%
-
+    assert body["progress"] == 53
 
 def test_completed_detail_reports_progress_99_never_100():
     db = _session()
@@ -293,10 +243,6 @@ def test_completed_detail_reports_progress_99_never_100():
     body = json.loads(response.body)
     assert body["progress"] == 99
     assert body["progress"] != 100
-
-
-# --- SIMPLE/CORRELATED history restoration -------------------------------
-
 
 def test_simple_history_restores_the_exact_stored_response():
     db = _session()
@@ -322,7 +268,6 @@ def test_simple_history_restores_the_exact_stored_response():
     import json
     body = json.loads(response.body)["investigation_result"]
     assert body == snapshot
-
 
 def test_correlated_history_restores_the_exact_stored_graph_and_timeline():
     db = _session()
@@ -352,10 +297,6 @@ def test_correlated_history_restores_the_exact_stored_graph_and_timeline():
     body = json.loads(response.body)["investigation_result"]
     assert body == snapshot
 
-
-# --- No internal fields leaked ------------------------------------------------
-
-
 def test_history_list_does_not_expose_saved_file_path_or_source_reference():
     db = _session()
     alice = _user(db)
@@ -370,7 +311,6 @@ def test_history_list_does_not_expose_saved_file_path_or_source_reference():
 
     assert "super-secret-internal-path" not in dumped
     assert "private/repo.git" not in dumped
-
 
 def test_detail_response_does_not_expose_saved_file_path_or_source_reference():
     db = _session()
@@ -390,10 +330,6 @@ def test_detail_response_does_not_expose_saved_file_path_or_source_reference():
     body_text = response.body.decode("utf-8")
     assert "super-secret-internal-path" not in body_text
     assert "private/repo.git" not in body_text
-
-
-# --- Cache-Control -----------------------------------------------------
-
 
 def test_history_and_detail_responses_disable_caching():
     db = _session()

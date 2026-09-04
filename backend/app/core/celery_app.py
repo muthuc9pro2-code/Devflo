@@ -29,7 +29,3 @@ celery_app.conf.update(
     },
     timezone="UTC"
 )
-
-
-
-

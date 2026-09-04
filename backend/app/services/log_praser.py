@@ -1,9 +1,3 @@
-"""Canonical Devflo event types and the compatible generic log entry point.
-
-The filename is intentionally retained as ``log_praser.py`` for import
-compatibility.
-"""
-
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -19,7 +13,7 @@ _COMPAT_PATTERN_NAMES = (
     "EXCEPTION_PATTERN",
 )
 
-__all__ = [  # noqa: F822 - legacy names are resolved by module __getattr__.
+__all__ = [
     "EXCEPTION_PATTERN",
     "HTTP_STATUS_PATTERN",
     "LOG_LEVEL_PATTERN",
@@ -33,13 +27,11 @@ __all__ = [  # noqa: F822 - legacy names are resolved by module __getattr__.
     "parse_log_line",
 ]
 
-
 @dataclass(slots=True)
 class StackFrame:
     file: str | None = None
     line: int | None = None
     function: str | None = None
-
 
 @dataclass(slots=True)
 class ParsedEvent:
@@ -69,9 +61,7 @@ class ParsedEvent:
     ocr_confidence: float | None = None
     diagnostic_attributes: dict[str, Any] | None = None
 
-
 def parse_log_line(line: str, line_number: int) -> ParsedEvent:
-    """Parse an ordinary diagnostic line into the canonical event shape."""
 
     from .diagnostic_parser import TIMESTAMP_PATTERN, normalize_text_event
 
@@ -83,9 +73,7 @@ def parse_log_line(line: str, line_number: int) -> ParsedEvent:
     event.timestamp = timestamp_match.group(0) if timestamp_match else None
     return event
 
-
 def __getattr__(name: str) -> Any:
-    """Lazily preserve the original parser-pattern import surface."""
 
     if name not in _COMPAT_PATTERN_NAMES:
         raise AttributeError(name)
@@ -95,7 +83,6 @@ def __getattr__(name: str) -> Any:
     value = getattr(diagnostic_parser, name)
     globals()[name] = value
     return value
-
 
 def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_COMPAT_PATTERN_NAMES))

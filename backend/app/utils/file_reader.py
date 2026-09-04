@@ -1,10 +1,8 @@
 from collections.abc import Iterator
-
 from app.core.processing_config import (
     FILE_READ_CHUNK_BYTES,
     MAX_DIAGNOSTIC_RECORD_BYTES,
 )
-
 
 def stream_text_lines(
     file_path: str,
@@ -12,11 +10,6 @@ def stream_text_lines(
     read_chunk_bytes: int = FILE_READ_CHUNK_BYTES,
     max_line_bytes: int = MAX_DIAGNOSTIC_RECORD_BYTES,
 ) -> Iterator[tuple[str, int]]:
-    """Yield decoded lines and exact byte checkpoints using bounded reads.
-
-    A pathological newline-free record is emitted in bounded fragments instead
-    of allowing ``readline()`` to allocate the remainder of the artifact.
-    """
 
     if read_chunk_bytes <= 0 or max_line_bytes <= 0:
         raise ValueError("Reader limits must be positive")
@@ -59,8 +52,6 @@ def stream_text_lines(
                     current_offset,
                 )
 
-            # Compact at most once per source read. Deleting for every short
-            # line turns a single chunk with many records into quadratic work.
             if consumed:
                 del buffer[:consumed]
 

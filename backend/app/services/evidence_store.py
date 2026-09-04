@@ -7,7 +7,6 @@ from app.core.processing_config import MAX_REPRESENTATIVE_LINE_BYTES
 from app.models import AnalysisArtifact, Evidence
 from .diagnostic_parser import parse_timestamp
 
-
 def persist_evidence_batch(
     db: Session,
     analysis_id: int,
@@ -245,7 +244,6 @@ def persist_evidence_batch(
 
     db.execute(statement, rows)
 
-
 def _bounded_representative_line(value: str) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) <= MAX_REPRESENTATIVE_LINE_BYTES:
@@ -255,17 +253,14 @@ def _bounded_representative_line(value: str) -> str:
         errors="ignore",
     )
 
-
 def _correlation_key(trace_id: str, request_id: str, span_id: str) -> str:
     value = f"{trace_id}|{request_id}|{span_id}"
     return sha256(value.encode("utf-8")).hexdigest()
-
 
 def _bounded_text(value: str | None, max_characters: int) -> str | None:
     if value is None:
         return None
     return value[:max_characters]
-
 
 def _first_present(events, attribute: str):
     for event in events:
@@ -274,13 +269,11 @@ def _first_present(events, attribute: str):
             return value
     return None
 
-
 def _first_truthy(events, attribute: str):
     for event in events:
         if value := getattr(event, attribute, None):
             return value
     return None
-
 
 def _legacy_analysis_artifact_id(db: Session, analysis_id: int) -> int:
     row = (

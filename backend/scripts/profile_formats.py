@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-
 import argparse
 import statistics
 import sys
@@ -31,7 +29,6 @@ FORMAT_FIXTURES = {
     "opentelemetry": "opentelemetry_10mib.json",
 }
 
-
 def run_once(fixture_path: Path, artifact_format: ArtifactFormat) -> dict:
     t0 = time.perf_counter()
     records = list(
@@ -58,7 +55,6 @@ def run_once(fixture_path: Path, artifact_format: ArtifactFormat) -> dict:
         "bytes": fixture_path.stat().st_size,
     }
 
-
 def bench(formats: list[str], iterations: int) -> None:
     for name in formats:
         fixture_name = FORMAT_FIXTURES[name]
@@ -78,7 +74,6 @@ def bench(formats: list[str], iterations: int) -> None:
             f"total_median={statistics.median(total_s):.3f}s "
             f"(n={iterations}, all={[f'{v:.2f}' for v in total_s]})"
         )
-
 
 def profile_one(name: str) -> None:
     import cProfile
@@ -105,7 +100,6 @@ def profile_one(name: str) -> None:
     print(f"{name}: records={len(records)} normalized={normalized}")
     stats = pstats.Stats(profiler).sort_stats("cumulative")
     stats.print_stats(30)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

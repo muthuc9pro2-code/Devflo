@@ -7,7 +7,6 @@ from app.core.processing_config import (
 MAX_BATCH_BYTES = INGESTION_RAW_BATCH_BYTES
 MAX_BATCH_ITEMS = INGESTION_RAW_BATCH_ITEMS
 
-
 def _item_size_bytes(item: object) -> int:
     configured_size = getattr(item, "batch_size_bytes", None)
 
@@ -18,7 +17,6 @@ def _item_size_bytes(item: object) -> int:
         return len(item[0].encode("utf-8"))
 
     raise TypeError("Batch items must expose batch_size_bytes or start with text")
-
 
 def create_batches[BatchItem](
     items: Iterable[BatchItem],

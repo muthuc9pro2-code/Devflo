@@ -24,7 +24,6 @@ async_redis_client = redis_asyncio.Redis.from_url(
 def analysis_event_channel(analysis_id: int) -> str:
     return f"analysis:{analysis_id}:events"
 
-
 def publish_analysis_event(
     analysis_id: int,
     event: str,
@@ -53,7 +52,6 @@ def publish_analysis_event(
             exc_info=True,
         )
 
-
 def publish_progress(
     analysis_id: int,
     stage: str,
@@ -74,7 +72,6 @@ def publish_progress(
         data=data,
     )
 
-
 def publish_investigation_result(
     analysis_id: int,
     payload: dict[str, Any],
@@ -84,7 +81,6 @@ def publish_investigation_result(
         event="investigation_result",
         data=payload,
     )
-
 
 def publish_artifact_outcome(
     analysis_id: int,
